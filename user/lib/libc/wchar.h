@@ -12,19 +12,19 @@
 #define LIBC_WCHAR_H
 
 #include <stddef.h>
-#include <time.h>       /* struct tm (wcsftime) */
-#include <stdarg.h>     /* va_list (v*wprintf) */
+#include <time.h>   /* struct tm (wcsftime) */
+#include <stdarg.h> /* va_list (v*wprintf) */
 
 /* ====================================================================
  * Types (C11 §7.29.1)
  * ==================================================================== */
 
 /* wchar_t is provided by GCC's <stddef.h>. */
-typedef unsigned int    wint_t;
+typedef unsigned int wint_t;
 
 typedef struct {
-    char    __buf[8];   /* pending multibyte bytes */
-    size_t  __len;      /* valid bytes stored in __buf */
+    char   __buf[8]; /* pending multibyte bytes */
+    size_t __len;    /* valid bytes stored in __buf */
 } mbstate_t;
 
 /* ====================================================================
@@ -32,7 +32,7 @@ typedef struct {
  * ==================================================================== */
 
 #ifndef WEOF
-#define WEOF  ((wint_t)-1)
+#define WEOF ((wint_t) - 1)
 #endif
 
 /* ====================================================================
@@ -49,10 +49,10 @@ size_t   wcsxfrm(wchar_t *dest, const wchar_t *src, size_t n);
  * Wide-string length / comparison (C11 §7.29.4)
  * ==================================================================== */
 
-size_t   wcslen(const wchar_t *s);
-int      wcscmp(const wchar_t *a, const wchar_t *b);
-int      wcsncmp(const wchar_t *a, const wchar_t *b, size_t n);
-int      wcscoll(const wchar_t *a, const wchar_t *b);
+size_t wcslen(const wchar_t *s);
+int    wcscmp(const wchar_t *a, const wchar_t *b);
+int    wcsncmp(const wchar_t *a, const wchar_t *b, size_t n);
+int    wcscoll(const wchar_t *a, const wchar_t *b);
 
 /* ====================================================================
  * Wide-string searching (C11 §7.29.4)
@@ -119,18 +119,17 @@ wint_t   ungetwc(wint_t c, void *stream);
  * Multibyte <-> wchar conversion (C11 §7.29.6) — declarations only
  * ==================================================================== */
 
-int     mbsinit(const mbstate_t *ps);
-size_t  mbrlen(const char *s, size_t n, mbstate_t *ps);
-size_t  mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps);
-size_t  wcrtomb(char *s, wchar_t wc, mbstate_t *ps);
-size_t  mbsrtowcs(wchar_t *dest, const char **src, size_t len, mbstate_t *ps);
-size_t  wcsrtombs(char *dest, const wchar_t **src, size_t len, mbstate_t *ps);
+int    mbsinit(const mbstate_t *ps);
+size_t mbrlen(const char *s, size_t n, mbstate_t *ps);
+size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps);
+size_t wcrtomb(char *s, wchar_t wc, mbstate_t *ps);
+size_t mbsrtowcs(wchar_t *dest, const char **src, size_t len, mbstate_t *ps);
+size_t wcsrtombs(char *dest, const wchar_t **src, size_t len, mbstate_t *ps);
 
 /* ====================================================================
  * Time formatting (C11 §7.29.5.1) — declaration only
  * ==================================================================== */
 
-size_t  wcsftime(wchar_t *s, size_t max, const wchar_t *fmt,
-                 const struct tm *t);
+size_t wcsftime(wchar_t *s, size_t max, const wchar_t *fmt, const struct tm *t);
 
 #endif /* LIBC_WCHAR_H */

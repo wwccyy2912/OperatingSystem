@@ -35,21 +35,21 @@
 typedef struct process process_t;
 
 /* ---- Signal numbers (small POSIX subset) ---- */
-#define SIGKILL     9    /* uncatchable, unignorable terminate */
-#define SIGUSR1     10
-#define SIGSEGV     11
-#define SIGUSR2     12
-#define SIGPIPE     13
-#define SIGALRM     14
-#define SIGTERM     15
-#define SIGSTOP     19   /* reserved: cannot be caught/ignored */
+#define SIGKILL 9 /* uncatchable, unignorable terminate */
+#define SIGUSR1 10
+#define SIGSEGV 11
+#define SIGUSR2 12
+#define SIGPIPE 13
+#define SIGALRM 14
+#define SIGTERM 15
+#define SIGSTOP 19 /* reserved: cannot be caught/ignored */
 
 /* ---- Handler sentinels ---- */
-#define SIG_DFL     0    /* default action */
-#define SIG_IGN     1    /* ignore */
+#define SIG_DFL 0 /* default action */
+#define SIG_IGN 1 /* ignore */
 
 /* Number of signal slots (1..63 valid, 0 unused) */
-#define NSIG        64
+#define NSIG 64
 
 /*
  * sigframe_t - user-context snapshot saved on the user stack when a
@@ -75,15 +75,15 @@ typedef struct process process_t;
  * Total: 15*8 + 4*8 = 152 bytes.
  */
 typedef struct {
-        u64 gprs[15];   /* r15,r14,r13,r12,r11,r10,r9,r8,rbp,rdi,rsi,rdx,rcx,rbx,rax */
-        u64 rip;        /* interrupted instruction pointer */
-        u64 rflags;     /* interrupted RFLAGS */
-        u64 rsp;        /* interrupted user stack pointer */
-        u64 signum;     /* signal number delivered */
+    u64 gprs[15]; /* r15,r14,r13,r12,r11,r10,r9,r8,rbp,rdi,rsi,rdx,rcx,rbx,rax */
+    u64 rip;      /* interrupted instruction pointer */
+    u64 rflags;   /* interrupted RFLAGS */
+    u64 rsp;      /* interrupted user stack pointer */
+    u64 signum;   /* signal number delivered */
 } sigframe_t;
 
 /* Total bytes the sigframe + restorer slot occupy below orig_rsp */
-#define SIGFRAME_TOTAL   (sizeof(sigframe_t) + 8)
+#define SIGFRAME_TOTAL (sizeof(sigframe_t) + 8)
 
 /*
  * Delivery checkpoints.  Called with the CURRENT kernel frame on the
@@ -96,7 +96,7 @@ typedef struct {
  * nothing was delivered (caller resumes the original context).
  * A default-action termination (or SIGKILL) never returns.
  */
-bool signal_check_syscall(u64 *frame);        /* syscall_entry.S frame (SF_* layout) */
+bool signal_check_syscall(u64 *frame);                 /* syscall_entry.S frame (SF_* layout) */
 bool signal_check_interrupt(interrupt_frame_t *frame); /* isr_common_stub frame */
 
 /*

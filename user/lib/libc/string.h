@@ -23,10 +23,10 @@ int    strncmp(const char *a, const char *b, size_t n);
  * String copying / concatenation
  * ==================================================================== */
 
-char  *strcpy(char *dest, const char *src);
-char  *strncpy(char *dest, const char *src, size_t n);
-char  *strcat(char *dest, const char *src);
-char  *strncat(char *dest, const char *src, size_t n);
+char *strcpy(char *dest, const char *src);
+char *strncpy(char *dest, const char *src, size_t n);
+char *strcat(char *dest, const char *src);
+char *strncat(char *dest, const char *src, size_t n);
 
 /* ====================================================================
  * String searching
@@ -43,19 +43,19 @@ size_t strcspn(const char *s, const char *reject);
  * String utilities
  * ==================================================================== */
 
-char  *strdup(const char *s);          /* calls malloc() */
-char  *strerror(int errnum);           /* returns static string */
-char  *strtok(char *str, const char *delim);       /* uses internal state */
-char  *strtok_r(char *str, const char *delim, char **saveptr);
+char *strdup(const char *s);                /* calls malloc() */
+char *strerror(int errnum);                 /* returns static string */
+char *strtok(char *str, const char *delim); /* uses internal state */
+char *strtok_r(char *str, const char *delim, char **saveptr);
 
 /* ====================================================================
  * Memory operations
  * ==================================================================== */
 
-void  *memset(void *dest, int c, size_t n);
-void  *memcpy(void *dest, const void *src, size_t n);
-void  *memmove(void *dest, const void *src, size_t n);
-int    memcmp(const void *a, const void *b, size_t n);
-void  *memchr(const void *s, int c, size_t n);
+void *memset(void *dest, int c, size_t n);
+void *memcpy(void *dest, const void *src, size_t n);
+void *memmove(void *dest, const void *src, size_t n);
+int   memcmp(const void *a, const void *b, size_t n);
+void *memchr(const void *s, int c, size_t n);
 
 #endif /* LIBC_STRING_H */

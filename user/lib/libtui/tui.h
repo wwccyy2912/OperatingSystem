@@ -24,13 +24,13 @@
 #define TUI_PORT_NAME "term"
 
 /* TUI operation codes (must match term.c TERM_OP_*) */
-#define TUI_OP_WRITE 1       /* render text at cursor */
-#define TUI_OP_CLEAR 2       /* clear screen + reset cursor */
-#define TUI_OP_STATUS 3      /* render status bar */
-#define TUI_OP_BOX 4         /* render box border + title */
+#define TUI_OP_WRITE       1 /* render text at cursor */
+#define TUI_OP_CLEAR       2 /* clear screen + reset cursor */
+#define TUI_OP_STATUS      3 /* render status bar */
+#define TUI_OP_BOX         4 /* render box border + title */
 #define TUI_OP_RENDER_LINE 5 /* render line at (x,y) */
-#define TUI_OP_SET_CURSOR 6  /* set cursor position */
-#define TUI_OP_GET_CURSOR 7  /* query cursor position */
+#define TUI_OP_SET_CURSOR  6 /* set cursor position */
+#define TUI_OP_GET_CURSOR  7 /* query cursor position */
 
 #define TUI_MAX_TEXT 256 /* max payload per operation */
 
@@ -77,8 +77,7 @@ int tui_render_status(const char *prefix, const char *msg);
  * title may be NULL for no title bar.
  * Returns 0 on success, negative error on failure.
  */
-int tui_render_box(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                   const char *title);
+int tui_render_box(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const char *title);
 
 /* ====================================================================
  * Text rendering without cursor change

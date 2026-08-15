@@ -18,16 +18,16 @@
 #include <stdint.h>
 
 typedef struct {
-        uint64_t vaddr;       /* target virtual address in the new address space */
-        uint64_t filesz;      /* bytes to copy from blob[src_offset..] (may be 0) */
-        uint64_t memsz;       /* total bytes to map; memsz >= filesz, tail zeroed */
-        uint64_t prot;        /* PROT_NONE | PROT_READ | PROT_WRITE | PROT_EXEC */
-        uint64_t src_offset;  /* offset of this segment's data within the blob */
+    uint64_t vaddr;      /* target virtual address in the new address space */
+    uint64_t filesz;     /* bytes to copy from blob[src_offset..] (may be 0) */
+    uint64_t memsz;      /* total bytes to map; memsz >= filesz, tail zeroed */
+    uint64_t prot;       /* PROT_NONE | PROT_READ | PROT_WRITE | PROT_EXEC */
+    uint64_t src_offset; /* offset of this segment's data within the blob */
 } proc_seg_desc_t;
 
 typedef struct {
-        uint64_t entry;       /* entry point (RIP) for the new process */
-        uint64_t seg_count;   /* number of proc_seg_desc_t entries */
+    uint64_t entry;     /* entry point (RIP) for the new process */
+    uint64_t seg_count; /* number of proc_seg_desc_t entries */
 } proc_image_desc_t;
 
 #endif /* KERNEL_PROC_IMAGE_H */

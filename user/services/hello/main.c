@@ -26,7 +26,7 @@
 #include <libc/stdio.h>
 #include <libos/syscalls.h>
 
-static volatile int s_usr1_count = 0;   /* SIGUSR1 deliveries seen */
+static volatile int s_usr1_count = 0; /* SIGUSR1 deliveries seen */
 
 /*
  * Signal handler for SIGUSR1.  Runs on the signal trampoline stack
@@ -34,78 +34,72 @@ static volatile int s_usr1_count = 0;   /* SIGUSR1 deliveries seen */
  * return).  printf is safe here: it only makes a debug_log syscall and
  * uses its own stack buffer.
  */
-static void sigusr1_handler(int signum)
-{
-        (void)signum;
-        s_usr1_count++;
-        printf("hello: SIGUSR1 handler ran (delivery #%d)\n", s_usr1_count);
-        sleep(50);
+static void sigusr1_handler(int signum) {
+    (void)signum;
+    s_usr1_count++;
+    printf("hello: SIGUSR1 handler ran (delivery #%d)\n", s_usr1_count);
+    sleep(50);
 }
 
-int main(void)
-{
-        int pid = get_pid();
-        printf("hello: spawned process running (pid=%d)\n", pid);
-        sleep(50);
+int main(void) {
+    int pid = get_pid();
+    printf("hello: spawned process running (pid=%d)\n", pid);
+    sleep(50);
 
-        /* 1. Register a handler: signal() returns the previous handler,
+    /* 1. Register a handler: signal() returns the previous handler,
      *    which must be SIG_DFL (0) since nothing was set before. */
-        sighandler_t prev = signal(SIGUSR1, sigusr1_handler);
-        printf("hello: signal(SIGUSR1) -> prev=0x%x (expect 0x0)\n",
-           (unsigned int)(uintptr_t)prev);
-        sleep(50);
+    sighandler_t prev = signal(SIGUSR1, sigusr1_handler);
+    printf("hello: signal(SIGUSR1) -> prev=0x%x (expect 0x0)\n", (unsigned int)(uintptr_t)prev);
+    sleep(50);
 
-        /* 2. Self-kill: the pending bit is latched; the handler runs at
+    /* 2. Self-kill: the pending bit is latched; the handler runs at
      *    the next delivery checkpoint (the kill syscall's own return
      *    path).  __restore_rt then restores the interrupted context,
      *    so the kill() call below returns normally. */
-        int ret = kill(pid, SIGUSR1);
-        printf("hello: kill(self, SIGUSR1) -> %d (expect 0), count=%d (expect 1)\n",
-           ret, s_usr1_count);
-        sleep(50);
+    int ret = kill(pid, SIGUSR1);
+    printf("hello: kill(self, SIGUSR1) -> %d (expect 0), count=%d (expect 1)\n", ret, s_usr1_count);
+    sleep(50);
 
-        /* 3. Deliver again: a registered handler stays installed, so the
+    /* 3. Deliver again: a registered handler stays installed, so the
      *    count must reach 2. */
-        ret = kill(pid, SIGUSR1);
-        printf("hello: kill #2 -> %d, count=%d (expect 2)\n", ret, s_usr1_count);
-        sleep(50);
+    ret = kill(pid, SIGUSR1);
+    printf("hello: kill #2 -> %d, count=%d (expect 2)\n", ret, s_usr1_count);
+    sleep(50);
 
-        /* 4. SIG_IGN: the bit is never latched, so the count must stay 2. */
-        signal(SIGUSR1, SIG_IGN);
-        ret = kill(pid, SIGUSR1);
-        printf("hello: kill after SIG_IGN -> %d, count=%d (expect 2)\n",
-           ret, s_usr1_count);
-        sleep(50);
+    /* 4. SIG_IGN: the bit is never latched, so the count must stay 2. */
+    signal(SIGUSR1, SIG_IGN);
+    ret = kill(pid, SIGUSR1);
+    printf("hello: kill after SIG_IGN -> %d, count=%d (expect 2)\n", ret, s_usr1_count);
+    sleep(50);
 
-        /* 5. SIG_DFL: SIGUSR1's default action is ignore, so the process
+    /* 5. SIG_DFL: SIGUSR1's default action is ignore, so the process
      *    must survive and the count stays 2. */
-        signal(SIGUSR1, SIG_DFL);
-        ret = kill(pid, SIGUSR1);
-        printf("hello: kill after SIG_DFL -> %d, count=%d (expect 2)\n",
-           ret, s_usr1_count);
-        sleep(50);
+    signal(SIGUSR1, SIG_DFL);
+    ret = kill(pid, SIGUSR1);
+    printf("hello: kill after SIG_DFL -> %d, count=%d (expect 2)\n", ret, s_usr1_count);
+    sleep(50);
 
-        /* 6. Re-register and confirm a final delivery. */
-        signal(SIGUSR1, sigusr1_handler);
-        kill(pid, SIGUSR1);
-        printf("hello: final delivery -> count=%d (expect 3)\n", s_usr1_count);
-        sleep(50);
+    /* 6. Re-register and confirm a final delivery. */
+    signal(SIGUSR1, sigusr1_handler);
+    kill(pid, SIGUSR1);
+    printf("hello: final delivery -> count=%d (expect 3)\n", s_usr1_count);
+    sleep(50);
 
-        if (s_usr1_count == 3)
-                printf("hello: signal self-test PASSED\n");
-        else
-                printf("hello: signal self-test FAILED (count=%d)\n", s_usr1_count);
-        sleep(50);
+    if (s_usr1_count == 3)
+        printf("hello: signal self-test PASSED\n");
+    else
+        printf("hello: signal self-test FAILED (count=%d)\n", s_usr1_count);
+    sleep(50);
 
-        /* 7. Default action = terminate: SIGTERM with SIG_DFL must kill us
+    /* 7. Default action = terminate: SIGTERM with SIG_DFL must kill us
      *    (exit code 128+15=143) via signal_kill_process + the checkpoint.
      *    Nothing after this line ever runs. */
-        signal(SIGTERM, SIG_DFL);
-        printf("hello: sending SIGTERM (SIG_DFL) to self - expect termination\n");
-        sleep(50);
-        kill(pid, SIGTERM);
-        printf("hello: ERROR - survived SIGTERM!\n");
+    signal(SIGTERM, SIG_DFL);
+    printf("hello: sending SIGTERM (SIG_DFL) to self - expect termination\n");
+    sleep(50);
+    kill(pid, SIGTERM);
+    printf("hello: ERROR - survived SIGTERM!\n");
 
-        printf("hello: exiting\n");
-        return 0;
+    printf("hello: exiting\n");
+    return 0;
 }

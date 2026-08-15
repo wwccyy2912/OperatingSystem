@@ -17,11 +17,11 @@
 
 /* Framebuffer info (filled by fb_init) */
 typedef struct {
-        u64  addr;          /* Virtual address of mapped framebuffer */
-        u32  width;         /* Width in pixels */
-        u32  height;        /* Height in pixels */
-        u32  pitch;         /* Bytes per scanline */
-        u8   bpp;           /* Bits per pixel */
+    u64 addr;   /* Virtual address of mapped framebuffer */
+    u32 width;  /* Width in pixels */
+    u32 height; /* Height in pixels */
+    u32 pitch;  /* Bytes per scanline */
+    u8  bpp;    /* Bits per pixel */
 } fb_info_t;
 
 /*
@@ -34,28 +34,28 @@ typedef struct {
  * struct in user/lib/libos/syscalls.h.
  */
 typedef struct {
-        u64  phys_addr;     /* Physical address of the framebuffer */
-        u32  width;         /* Width in pixels (logical px in VGA text mode) */
-        u32  height;        /* Height in pixels (logical px in VGA text mode) */
-        u32  pitch;         /* Bytes per scanline (linear mode only) */
-        u8   bpp;           /* Bits per pixel (linear mode only) */
-        u8   vga_text;      /* 1 = VGA text mode (0xB8000), 0 = linear RGB */
+    u64 phys_addr; /* Physical address of the framebuffer */
+    u32 width;     /* Width in pixels (logical px in VGA text mode) */
+    u32 height;    /* Height in pixels (logical px in VGA text mode) */
+    u32 pitch;     /* Bytes per scanline (linear mode only) */
+    u8  bpp;       /* Bits per pixel (linear mode only) */
+    u8  vga_text;  /* 1 = VGA text mode (0xB8000), 0 = linear RGB */
 } fb_user_info_t;
 
 /* Common 32-bit RGB colors */
-#define FB_BLACK        0x00000000
-#define FB_WHITE        0x00FFFFFF
-#define FB_RED          0x00FF0000
-#define FB_GREEN        0x0000FF00
-#define FB_BLUE         0x000000FF
-#define FB_CYAN         0x0000FFFF
-#define FB_MAGENTA      0x00FF00FF
-#define FB_YELLOW       0x00FFFF00
-#define FB_ORANGE       0x00FFA500
-#define FB_GRAY         0x00808080
-#define FB_DARK_BLUE    0x00000080
-#define FB_LIGHT_GRAY   0x00C0C0C0
-#define FB_DARK_GRAY    0x00404040
+#define FB_BLACK      0x00000000
+#define FB_WHITE      0x00FFFFFF
+#define FB_RED        0x00FF0000
+#define FB_GREEN      0x0000FF00
+#define FB_BLUE       0x000000FF
+#define FB_CYAN       0x0000FFFF
+#define FB_MAGENTA    0x00FF00FF
+#define FB_YELLOW     0x00FFFF00
+#define FB_ORANGE     0x00FFA500
+#define FB_GRAY       0x00808080
+#define FB_DARK_BLUE  0x00000080
+#define FB_LIGHT_GRAY 0x00C0C0C0
+#define FB_DARK_GRAY  0x00404040
 
 /**
  * Initialize the framebuffer from Multiboot2 info.

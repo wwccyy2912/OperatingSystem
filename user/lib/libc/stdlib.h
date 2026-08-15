@@ -20,21 +20,21 @@
  * Numeric conversion
  * ==================================================================== */
 
-int    atoi(const char *s);
-long   atol(const char *s);
+int       atoi(const char *s);
+long      atol(const char *s);
 long long atoll(const char *s);
 
-long           strtol(const char *s, char **endptr, int base);
-unsigned long  strtoul(const char *s, char **endptr, int base);
-long long      strtoll(const char *s, char **endptr, int base);
+long               strtol(const char *s, char **endptr, int base);
+unsigned long      strtoul(const char *s, char **endptr, int base);
+long long          strtoll(const char *s, char **endptr, int base);
 unsigned long long strtoull(const char *s, char **endptr, int base);
 
 /* ====================================================================
  * Absolute value
  * ==================================================================== */
 
-int   abs(int x);
-long  labs(long x);
+int       abs(int x);
+long      labs(long x);
 long long llabs(long long x);
 
 /* ====================================================================
@@ -48,11 +48,13 @@ void srand(unsigned int seed);
  * Searching / sorting
  * ==================================================================== */
 
-void *bsearch(const void *key, const void *base, size_t nmemb,
-                            size_t size, int (*compar)(const void *, const void *));
+void *bsearch(const void *key,
+              const void *base,
+              size_t      nmemb,
+              size_t      size,
+              int (*compar)(const void *, const void *));
 
-void qsort(void *base, size_t nmemb, size_t size,
-           int (*compar)(const void *, const void *));
+void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *));
 
 /* ====================================================================
  * Process termination (C11 §7.22.4)
@@ -63,8 +65,8 @@ void qsort(void *base, size_t nmemb, size_t size,
 _Noreturn void abort(void);
 _Noreturn void exit(int status);
 _Noreturn void _Exit(int status);
-int atexit(void (*func)(void));
-int at_quick_exit(void (*func)(void));
+int            atexit(void (*func)(void));
+int            at_quick_exit(void (*func)(void));
 _Noreturn void quick_exit(int status);
 
 /* ====================================================================

@@ -21,16 +21,16 @@
 #define PCI_MAX_BARS 6
 
 typedef struct {
-        uint32_t bus;
-        uint32_t dev;
-        uint32_t func;
-        uint16_t vendor_id;
-        uint16_t device_id;
-        uint16_t class_code;   /* (base_class << 8) | subclass_class */
-        uint8_t  prog_if;
-        uint8_t  revision_id;
-        uint32_t bar[PCI_MAX_BARS];  /* 0 = absent (IO/legacy or unimplemented) */
-        uint8_t  irq_line;
+    uint32_t bus;
+    uint32_t dev;
+    uint32_t func;
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint16_t class_code; /* (base_class << 8) | subclass_class */
+    uint8_t  prog_if;
+    uint8_t  revision_id;
+    uint32_t bar[PCI_MAX_BARS]; /* 0 = absent (IO/legacy or unimplemented) */
+    uint8_t  irq_line;
 } pci_device_info_t;
 
 /* Kernel-internal (not syscalls): query the cached enumeration snapshot.

@@ -21,8 +21,8 @@
 #include <kernel/rng.h>
 #include <kernel/panic.h>
 
-__attribute__((used))
-unsigned long __stack_chk_guard = 0xDEADBEEF0BADF00DUL;  /* pre-PRNG sentinel */
+__attribute__((used)) unsigned long __stack_chk_guard =
+    0xDEADBEEF0BADF00DUL; /* pre-PRNG sentinel */
 
 /*
  * Randomize the canary from the boot PRNG.  Called once by kernel_main
@@ -30,12 +30,11 @@ unsigned long __stack_chk_guard = 0xDEADBEEF0BADF00DUL;  /* pre-PRNG sentinel */
  * may remain live across the change (kernel_main itself never returns,
  * so its own frame is never checked).
  */
-void stack_chk_randomize(void)
-{
-        u64 g = rng_u64() & ~0xFFULL;   /* low byte NUL — stops string overflows */
-        if (g == 0)
-                g = 0x9E3779B97F4A7C00ULL;  /* nonzero fallback */
-        __stack_chk_guard = g;
+void stack_chk_randomize(void) {
+    u64 g = rng_u64() & ~0xFFULL; /* low byte NUL — stops string overflows */
+    if (g == 0)
+        g = 0x9E3779B97F4A7C00ULL; /* nonzero fallback */
+    __stack_chk_guard = g;
 }
 
 /*
@@ -43,15 +42,11 @@ void stack_chk_randomize(void)
  * A corrupted stack frame means the return address is untrustworthy --
  * halt instead of attempting to unwind.
  */
-__attribute__((noreturn, no_stack_protector))
-void __stack_chk_fail(void)
-{
-        panic("STACK SMASHING DETECTED: kernel stack canary mismatch");
+__attribute__((noreturn, no_stack_protector)) void __stack_chk_fail(void) {
+    panic("STACK SMASHING DETECTED: kernel stack canary mismatch");
 }
 
 /* Some GCC configurations emit calls to the local variant instead. */
-__attribute__((noreturn, no_stack_protector))
-void __stack_chk_fail_local(void)
-{
-        __stack_chk_fail();
+__attribute__((noreturn, no_stack_protector)) void __stack_chk_fail_local(void) {
+    __stack_chk_fail();
 }

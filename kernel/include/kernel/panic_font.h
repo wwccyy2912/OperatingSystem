@@ -1,5 +1,6 @@
 /*
  * panic_font.h - 8x16 VGA font for kernel panic rendering (95 glyphs, 0x20..0x7E)
+ * Copyright (c) 2026 OpSys Project
  *
  * Snapshot of the canonical copy in user/services/term/font.h.  P0 removed
  * the kernel's drawing stack (framebuffer.c 543->170); the panic path keeps

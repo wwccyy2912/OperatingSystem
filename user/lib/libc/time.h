@@ -16,33 +16,33 @@
  * Types (C11 §7.27.1)
  * ==================================================================== */
 
-typedef long long           time_t;         /* epoch seconds */
-typedef unsigned long long  clock_t;        /* processor time in ticks */
+typedef long long          time_t;  /* epoch seconds */
+typedef unsigned long long clock_t; /* processor time in ticks */
 
 struct tm {
-        int     tm_sec;     /* seconds after the minute [0, 60] */
-        int     tm_min;     /* minutes after the hour [0, 59] */
-        int     tm_hour;    /* hours since midnight [0, 23] */
-        int     tm_mday;    /* day of the month [1, 31] */
-        int     tm_mon;     /* months since January [0, 11] */
-        int     tm_year;    /* years since 1900 */
-        int     tm_wday;    /* days since Sunday [0, 6] */
-        int     tm_yday;    /* days since January 1 [0, 365] */
-        int     tm_isdst;   /* daylight saving time flag (<0 = unknown) */
+    int tm_sec;   /* seconds after the minute [0, 60] */
+    int tm_min;   /* minutes after the hour [0, 59] */
+    int tm_hour;  /* hours since midnight [0, 23] */
+    int tm_mday;  /* day of the month [1, 31] */
+    int tm_mon;   /* months since January [0, 11] */
+    int tm_year;  /* years since 1900 */
+    int tm_wday;  /* days since Sunday [0, 6] */
+    int tm_yday;  /* days since January 1 [0, 365] */
+    int tm_isdst; /* daylight saving time flag (<0 = unknown) */
 };
 
 /* C11 §7.27.1: timer and signal support */
 struct timespec {
-        time_t  tv_sec;     /* seconds */
-        long    tv_nsec;    /* nanoseconds [0, 999999999] */
+    time_t tv_sec;  /* seconds */
+    long   tv_nsec; /* nanoseconds [0, 999999999] */
 };
 
 /* ====================================================================
  * Constants
  * ==================================================================== */
 
-#define CLOCKS_PER_SEC  1000U   /* kernel tick rate (1 kHz) */
-#define TIME_UTC        1       /* timespec_get base */
+#define CLOCKS_PER_SEC 1000U /* kernel tick rate (1 kHz) */
+#define TIME_UTC       1     /* timespec_get base */
 
 /* ====================================================================
  * Functions (C11 §7.27.2-7.27.3)

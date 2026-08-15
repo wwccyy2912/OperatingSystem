@@ -25,7 +25,7 @@
 /* Upper bound on PT_LOAD segments we accept (the service ELFs built by
  * scripts/user.ld have 4).  Must fit the caller's proc_seg_desc_t
  * buffer. */
-#define ELF_MAX_LOAD_SEGS   8
+#define ELF_MAX_LOAD_SEGS 8
 
 /**
  * elf_parse - Parse an ELF64 blob into a process-image descriptor.
@@ -49,8 +49,10 @@
  * @return 0 on success (desc_out->seg_count segments written), or a
  *         negative errno (ERR_INVAL for malformed/oversized ELF).
  */
-int elf_parse(const void *elf, unsigned long size,
-                            proc_image_desc_t *desc_out, proc_seg_desc_t *segs,
-                            unsigned long max_segs);
+int elf_parse(const void        *elf,
+              unsigned long      size,
+              proc_image_desc_t *desc_out,
+              proc_seg_desc_t   *segs,
+              unsigned long      max_segs);
 
 #endif /* LIBOS_ELF_PARSE_H */

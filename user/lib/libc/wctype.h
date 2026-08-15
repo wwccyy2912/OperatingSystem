@@ -10,19 +10,19 @@
 #ifndef LIBC_WCTYPE_H
 #define LIBC_WCTYPE_H
 
-#include <wchar.h>      /* wint_t, WEOF */
+#include <wchar.h> /* wint_t, WEOF */
 
 /* ====================================================================
  * Types (C11 §7.30.1)
  * ==================================================================== */
 
-typedef int     wctype_t;
-typedef int     wctrans_t;
+typedef int wctype_t;
+typedef int wctrans_t;
 
 /* WEOF is provided by <wchar.h>; redefine defensively in case
  * <wchar.h> has not already been included. */
 #ifndef WEOF
-#define WEOF  ((wint_t)-1)
+#define WEOF ((wint_t) - 1)
 #endif
 
 /* ====================================================================
@@ -42,16 +42,16 @@ int iswspace(wint_t wc);
 int iswupper(wint_t wc);
 int iswxdigit(wint_t wc);
 
-int       iswctype(wint_t wc, wctype_t desc);
-wctype_t  wctype(const char *property);
+int      iswctype(wint_t wc, wctype_t desc);
+wctype_t wctype(const char *property);
 
 /* ====================================================================
  * Case mapping (C11 §7.30.3)
  * ==================================================================== */
 
-wint_t     towlower(wint_t wc);
-wint_t     towupper(wint_t wc);
-wint_t     towctrans(wint_t wc, wctrans_t desc);
-wctrans_t  wctrans(const char *property);
+wint_t    towlower(wint_t wc);
+wint_t    towupper(wint_t wc);
+wint_t    towctrans(wint_t wc, wctrans_t desc);
+wctrans_t wctrans(const char *property);
 
 #endif /* LIBC_WCTYPE_H */

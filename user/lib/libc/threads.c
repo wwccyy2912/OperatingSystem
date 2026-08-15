@@ -35,10 +35,10 @@
  * ==================================================================== */
 
 struct thrd_state {
-    _Atomic int  done;     /* 0 = running, 1 = finished */
-    int          result;  /* thread return value (valid when done) */
-    thrd_start_t func;    /* user entry (set by thrd_create) */
-    void        *arg;     /* user argument (set by thrd_create) */
+    _Atomic int  done;   /* 0 = running, 1 = finished */
+    int          result; /* thread return value (valid when done) */
+    thrd_start_t func;   /* user entry (set by thrd_create) */
+    void        *arg;    /* user argument (set by thrd_create) */
 };
 
 /*
@@ -46,19 +46,17 @@ struct thrd_state {
  * this trampoline bridges the signature mismatch and records the
  * result before the thread exits.
  */
-static void thrd_entry_wrapper(void *p)
-{
-    struct thrd_state *st = (struct thrd_state *)p;
-    int res = st->func(st->arg);
-    st->result = res;
+static void thrd_entry_wrapper(void *p) {
+    struct thrd_state *st  = (struct thrd_state *)p;
+    int                res = st->func(st->arg);
+    st->result             = res;
     atomic_store(&st->done, 1);
     thread_exit(res);
 }
 
 /* Convert a (relative) timespec to kernel ticks.  The tick rate is
  * 1 kHz (CLOCKS_PER_SEC == 1000), so 1 tick == 1 ms. */
-static int timespec_to_ticks(const struct timespec *ts)
-{
+static int timespec_to_ticks(const struct timespec *ts) {
     return (int)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
 }
 
@@ -66,8 +64,7 @@ static int timespec_to_ticks(const struct timespec *ts)
  * Threads (C11 §7.26.3)
  * ==================================================================== */
 
-int thrd_create(thrd_t *thr, thrd_start_t func, void *arg)
-{
+int thrd_create(thrd_t *thr, thrd_start_t func, void *arg) {
     struct thrd_state *st = malloc(sizeof(*st));
     if (!st)
         return thrd_nomem;
@@ -86,21 +83,18 @@ int thrd_create(thrd_t *thr, thrd_start_t func, void *arg)
     return thrd_success;
 }
 
-int thrd_equal(thrd_t thr0, thrd_t thr1)
-{
+int thrd_equal(thrd_t thr0, thrd_t thr1) {
     return thr0.tid == thr1.tid;
 }
 
-thrd_t thrd_current(void)
-{
+thrd_t thrd_current(void) {
     thrd_t self;
     self.tid = 0;
     self.st  = NULL;
     return self;
 }
 
-int thrd_sleep(const struct timespec *duration, struct timespec *remaining)
-{
+int thrd_sleep(const struct timespec *duration, struct timespec *remaining) {
     if (!duration)
         return -2;
 
@@ -116,21 +110,18 @@ int thrd_sleep(const struct timespec *duration, struct timespec *remaining)
     return 0;
 }
 
-void thrd_yield(void)
-{
+void thrd_yield(void) {
     thread_yield();
 }
 
-_Noreturn void thrd_exit(int res)
-{
+_Noreturn void thrd_exit(int res) {
     /* thread_exit() enters the kernel and never returns; the header
      * declares it plain void, so tell the optimizer the same. */
     thread_exit(res);
     __builtin_unreachable();
 }
 
-int thrd_detach(thrd_t thr)
-{
+int thrd_detach(thrd_t thr) {
     /* No kernel join handle to release; the completion state is left
      * for the wrapper to update.  The state is intentionally not
      * freed here — the spawned thread still writes to it before
@@ -139,8 +130,7 @@ int thrd_detach(thrd_t thr)
     return thrd_success;
 }
 
-int thrd_join(thrd_t thr, int *res)
-{
+int thrd_join(thrd_t thr, int *res) {
     /* Without a kernel join syscall, poll the completion flag and
      * yield between checks.  Once `done` is observed, the wrapper has
      * finished writing `result` (the seq_cst store/load pair orders
@@ -159,8 +149,7 @@ int thrd_join(thrd_t thr, int *res)
  * Mutexes (C11 §7.26.4)
  * ==================================================================== */
 
-int mtx_init(mtx_t *mtx, int type)
-{
+int mtx_init(mtx_t *mtx, int type) {
     atomic_init(&mtx->flag, 0);
     mtx->type      = type;
     mtx->recursion = 0;
@@ -168,13 +157,11 @@ int mtx_init(mtx_t *mtx, int type)
     return thrd_success;
 }
 
-int mtx_lock(mtx_t *mtx)
-{
+int mtx_lock(mtx_t *mtx) {
     uint64_t self = thrd_current().tid;
 
     /* Recursive fast-path: same owner re-locking. */
-    if ((mtx->type & mtx_recursive) && atomic_load(&mtx->flag) == 1
-        && mtx->owner == self) {
+    if ((mtx->type & mtx_recursive) && atomic_load(&mtx->flag) == 1 && mtx->owner == self) {
         mtx->recursion++;
         return thrd_success;
     }
@@ -186,12 +173,10 @@ int mtx_lock(mtx_t *mtx)
     return thrd_success;
 }
 
-int mtx_trylock(mtx_t *mtx)
-{
+int mtx_trylock(mtx_t *mtx) {
     uint64_t self = thrd_current().tid;
 
-    if ((mtx->type & mtx_recursive) && atomic_load(&mtx->flag) == 1
-        && mtx->owner == self) {
+    if ((mtx->type & mtx_recursive) && atomic_load(&mtx->flag) == 1 && mtx->owner == self) {
         mtx->recursion++;
         return thrd_success;
     }
@@ -202,8 +187,7 @@ int mtx_trylock(mtx_t *mtx)
     return thrd_success;
 }
 
-int mtx_unlock(mtx_t *mtx)
-{
+int mtx_unlock(mtx_t *mtx) {
     if (mtx->type & mtx_recursive) {
         if (mtx->recursion > 1) {
             mtx->recursion--;
@@ -216,8 +200,7 @@ int mtx_unlock(mtx_t *mtx)
     return thrd_success;
 }
 
-int mtx_timedlock(mtx_t *mtx, const struct timespec *ts)
-{
+int mtx_timedlock(mtx_t *mtx, const struct timespec *ts) {
     if (!ts)
         return thrd_error;
 
@@ -232,8 +215,7 @@ int mtx_timedlock(mtx_t *mtx, const struct timespec *ts)
     }
 }
 
-void mtx_destroy(mtx_t *mtx)
-{
+void mtx_destroy(mtx_t *mtx) {
     (void)mtx;
 }
 
@@ -245,30 +227,26 @@ void mtx_destroy(mtx_t *mtx)
  * by the waiter count).  Spurious wakeups are permitted by C11.
  * ==================================================================== */
 
-int cnd_init(cnd_t *cnd)
-{
+int cnd_init(cnd_t *cnd) {
     atomic_init(&cnd->waiters, 0);
     atomic_init(&cnd->generation, 0);
     return thrd_success;
 }
 
-int cnd_signal(cnd_t *cnd)
-{
+int cnd_signal(cnd_t *cnd) {
     if (atomic_load(&cnd->waiters) > 0)
         atomic_fetch_add(&cnd->generation, 1);
     return thrd_success;
 }
 
-int cnd_broadcast(cnd_t *cnd)
-{
+int cnd_broadcast(cnd_t *cnd) {
     int w = atomic_load(&cnd->waiters);
     if (w > 0)
         atomic_fetch_add(&cnd->generation, w);
     return thrd_success;
 }
 
-int cnd_wait(cnd_t *cnd, mtx_t *mtx)
-{
+int cnd_wait(cnd_t *cnd, mtx_t *mtx) {
     atomic_fetch_add(&cnd->waiters, 1);
     int gen = atomic_load(&cnd->generation);
     mtx_unlock(mtx);
@@ -278,8 +256,7 @@ int cnd_wait(cnd_t *cnd, mtx_t *mtx)
     return mtx_lock(mtx);
 }
 
-int cnd_timedwait(cnd_t *cnd, mtx_t *mtx, const struct timespec *ts)
-{
+int cnd_timedwait(cnd_t *cnd, mtx_t *mtx, const struct timespec *ts) {
     if (!ts)
         return thrd_error;
 
@@ -302,8 +279,7 @@ int cnd_timedwait(cnd_t *cnd, mtx_t *mtx, const struct timespec *ts)
     return rc;
 }
 
-void cnd_destroy(cnd_t *cnd)
-{
+void cnd_destroy(cnd_t *cnd) {
     (void)cnd;
 }
 
@@ -311,8 +287,7 @@ void cnd_destroy(cnd_t *cnd)
  * Once (C11 §7.26.6)
  * ==================================================================== */
 
-void call_once(once_flag *flag, void (*func)(void))
-{
+void call_once(once_flag *flag, void (*func)(void)) {
     int expected = 0;
     /* Transition 0 -> 1: the winner runs func. */
     if (atomic_compare_exchange_strong(&flag->state, &expected, 1)) {
@@ -343,37 +318,33 @@ struct tss_slot {
 
 static struct tss_slot g_tss[TSS_SLOTS];
 
-int tss_create(tss_t *key, tss_dtor_t dtor)
-{
+int tss_create(tss_t *key, tss_dtor_t dtor) {
     for (int i = 0; i < TSS_SLOTS; i++) {
         int expected = 0;
         if (atomic_compare_exchange_strong(&g_tss[i].used, &expected, 1)) {
             g_tss[i].dtor  = dtor;
             g_tss[i].value = NULL;
-            *key = (tss_t)i;
+            *key           = (tss_t)i;
             return thrd_success;
         }
     }
     return thrd_nomem;
 }
 
-void *tss_get(tss_t key)
-{
+void *tss_get(tss_t key) {
     if (key < 0 || key >= TSS_SLOTS)
         return NULL;
     return g_tss[key].value;
 }
 
-int tss_set(tss_t key, void *val)
-{
+int tss_set(tss_t key, void *val) {
     if (key < 0 || key >= TSS_SLOTS)
         return thrd_error;
     g_tss[key].value = val;
     return thrd_success;
 }
 
-void tss_delete(tss_t key)
-{
+void tss_delete(tss_t key) {
     if (key < 0 || key >= TSS_SLOTS)
         return;
     g_tss[key].used  = 0;

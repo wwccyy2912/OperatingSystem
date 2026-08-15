@@ -15,12 +15,12 @@
 
 /* Wall-clock time as read from the CMOS RTC */
 typedef struct {
-        u16 year;    /* full year, e.g. 2026 */
-        u8  month;   /* 1-12 */
-        u8  day;     /* 1-31 */
-        u8  hour;    /* 0-23 */
-        u8  minute;  /* 0-59 */
-        u8  second;  /* 0-59 */
+    u16 year;   /* full year, e.g. 2026 */
+    u8  month;  /* 1-12 */
+    u8  day;    /* 1-31 */
+    u8  hour;   /* 0-23 */
+    u8  minute; /* 0-59 */
+    u8  second; /* 0-59 */
 } rtc_time_t;
 
 /**

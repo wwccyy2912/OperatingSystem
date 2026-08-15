@@ -21,17 +21,17 @@
 
 #include <stdatomic.h>
 #include <stdint.h>
-#include <time.h>      /* struct timespec */
+#include <time.h> /* struct timespec */
 
 /* ====================================================================
  * Macros (C11 §7.26.1)
  * ==================================================================== */
 
 #ifndef thread_local
-#define thread_local        _Thread_local
+#define thread_local _Thread_local
 #endif
 
-#define ONCE_FLAG_INIT      { 0 }
+#define ONCE_FLAG_INIT      {0}
 #define TSS_DTOR_ITERATIONS 4
 
 /* ====================================================================
@@ -46,18 +46,18 @@
  */
 struct thrd_state;
 typedef struct {
-    uint64_t            tid;   /* kernel thread id */
-    struct thrd_state  *st;    /* heap-allocated done/result state */
+    uint64_t           tid; /* kernel thread id */
+    struct thrd_state *st;  /* heap-allocated done/result state */
 } thrd_t;
 
 typedef int (*thrd_start_t)(void *);
 
 /* Mutex: spinlock with optional recursion. */
 typedef struct {
-    _Atomic int flag;       /* 0 = unlocked, 1 = locked */
-    int          type;      /* mtx_plain | mtx_timed | mtx_try | mtx_recursive */
-    int          recursion; /* re-lock count (recursive mutexes) */
-    uint64_t     owner;     /* owning thread tid (recursive mutexes) */
+    _Atomic int flag;      /* 0 = unlocked, 1 = locked */
+    int         type;      /* mtx_plain | mtx_timed | mtx_try | mtx_recursive */
+    int         recursion; /* re-lock count (recursive mutexes) */
+    uint64_t    owner;     /* owning thread tid (recursive mutexes) */
 } mtx_t;
 
 /* Condition variable: counter-based, woken via thread_yield polling. */
@@ -67,7 +67,7 @@ typedef struct {
 } cnd_t;
 
 typedef struct {
-    _Atomic int state;      /* 0 = not called, 1 = in progress, 2 = done */
+    _Atomic int state; /* 0 = not called, 1 = in progress, 2 = done */
 } once_flag;
 
 typedef int tss_t;
@@ -96,15 +96,14 @@ enum {
  * Threads (C11 §7.26.3)
  * ==================================================================== */
 
-int    thrd_create(thrd_t *thr, thrd_start_t func, void *arg);
-int    thrd_equal(thrd_t thr0, thrd_t thr1);
-thrd_t thrd_current(void);
-int    thrd_sleep(const struct timespec *duration,
-                  struct timespec *remaining);
-void   thrd_yield(void);
+int            thrd_create(thrd_t *thr, thrd_start_t func, void *arg);
+int            thrd_equal(thrd_t thr0, thrd_t thr1);
+thrd_t         thrd_current(void);
+int            thrd_sleep(const struct timespec *duration, struct timespec *remaining);
+void           thrd_yield(void);
 _Noreturn void thrd_exit(int res);
-int    thrd_detach(thrd_t thr);
-int    thrd_join(thrd_t thr, int *res);
+int            thrd_detach(thrd_t thr);
+int            thrd_join(thrd_t thr, int *res);
 
 /* ====================================================================
  * Mutexes (C11 §7.26.4)

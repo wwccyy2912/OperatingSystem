@@ -57,9 +57,9 @@ u64 rng_range(u64 limit);
  * Clear of the ELF image, the fixed test mappings (0x10000000-0x30000000)
  * and the per-process heap region ([heap_base, heap_base+256 MB)).
  */
-#define ASLR_STACK_BASE      0x90000000ULL
-#define ASLR_STACK_END       0x100000000ULL
-#define ASLR_STACK_BLOCK     (MAX_THREADS * PAGE_SIZE)   /* 4 MB at 1024 */
+#define ASLR_STACK_BASE  0x90000000ULL
+#define ASLR_STACK_END   0x100000000ULL
+#define ASLR_STACK_BLOCK (MAX_THREADS * PAGE_SIZE) /* 4 MB at 1024 */
 
 /**
  * Random ASLR_STACK_BLOCK-aligned base for a process's user thread stacks.
@@ -87,9 +87,9 @@ u64 aslr_boot_stack(void);
  * least 128 MB of room.  The kernel stores the base per process
  * (process_t.heap_base) and hands it to user-space via SYS_GET_HEAP_BASE.
  */
-#define ASLR_HEAP_BASE_MIN   0x70000000ULL
-#define ASLR_HEAP_BASE_MAX   0x78000000ULL   /* exclusive */
-#define ASLR_HEAP_ALIGN      0x10000ULL      /* 64 KB */
+#define ASLR_HEAP_BASE_MIN 0x70000000ULL
+#define ASLR_HEAP_BASE_MAX 0x78000000ULL /* exclusive */
+#define ASLR_HEAP_ALIGN    0x10000ULL    /* 64 KB */
 
 /**
  * Random 64 KB-aligned heap base for a new process.
@@ -108,8 +108,8 @@ u64 aslr_heap_base(void);
  * would rebase p_vaddr in the user-space parser, not here.  Unused
  * today (all blobs are ET_EXEC linked at 0x400000).
  */
-#define ASLR_ELF_BASE_MIN    0x40000000ULL
-#define ASLR_ELF_BASE_MAX    0x70000000ULL   /* exclusive */
+#define ASLR_ELF_BASE_MIN 0x40000000ULL
+#define ASLR_ELF_BASE_MAX 0x70000000ULL /* exclusive */
 
 /**
  * Random page-aligned PIE load base (option A reservation).

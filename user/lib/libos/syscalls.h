@@ -34,25 +34,25 @@
 #define ERR_FAULT       (-7)
 #define ERR_OVERFLOW    (-8)
 #define ERR_DENIED      (-9)
-#define ERR_INTERRUPTED (-10)   /* blocking wait aborted by a signal kill */
+#define ERR_INTERRUPTED (-10) /* blocking wait aborted by a signal kill */
 
 /* Memory protection flags */
-#define PROT_NONE   0x00
-#define PROT_READ   0x01
-#define PROT_WRITE  0x02
-#define PROT_EXEC   0x04
+#define PROT_NONE  0x00
+#define PROT_READ  0x01
+#define PROT_WRITE 0x02
+#define PROT_EXEC  0x04
 
 /* Capability types (must match kernel cap.h) */
-#define CAP_TYPE_NONE       0
-#define CAP_TYPE_THREAD     1
-#define CAP_TYPE_PORT       2
-#define CAP_TYPE_MEM        3
-#define CAP_TYPE_IRQ        4
-#define CAP_TYPE_IO_PORT    5
-#define CAP_TYPE_PCI_DEV    6
-#define CAP_TYPE_SERVICE    7
-#define CAP_TYPE_KERNEL     8
-#define CAP_TYPE_DAC_OVERRIDE  9
+#define CAP_TYPE_NONE         0
+#define CAP_TYPE_THREAD       1
+#define CAP_TYPE_PORT         2
+#define CAP_TYPE_MEM          3
+#define CAP_TYPE_IRQ          4
+#define CAP_TYPE_IO_PORT      5
+#define CAP_TYPE_PCI_DEV      6
+#define CAP_TYPE_SERVICE      7
+#define CAP_TYPE_KERNEL       8
+#define CAP_TYPE_DAC_OVERRIDE 9
 
 /* Capability rights */
 #define RIGHT_READ  (1 << 0)
@@ -62,31 +62,27 @@
 #define RIGHT_ALL   (RIGHT_READ | RIGHT_WRITE | RIGHT_EXEC | RIGHT_GRANT)
 
 /* Null handles */
-#define CAP_NULL    0UL
-#define PORT_NULL   0UL
+#define CAP_NULL  0UL
+#define PORT_NULL 0UL
 
 /**
  * Raw syscall instruction.
  * All syscalls route through this single entry point.
  */
-static inline long sys_call(long num, long a1, long a2, long a3,
-                                                        long a4, long a5)
-{
-        long ret;
-        /* The kernel's INT 0x80 ABI reads args 1-3 from RDI/RSI/RDX and
+static inline long sys_call(long num, long a1, long a2, long a3, long a4, long a5) {
+    long ret;
+    /* The kernel's INT 0x80 ABI reads args 1-3 from RDI/RSI/RDX and
      * args 4-5 from R10/R8 (kernel/arch/x86_64/syscall_entry.S:14-15,
      * 171-172).  Plain "r" constraints let GCC pick any register for
      * a4/a5, so 5-arg syscalls like ipc_call() could deliver garbage
      * in arg4/arg5.  Pin the tail args to the exact ABI registers. */
-        register long a4_reg __asm__("r10") = a4;
-        register long a5_reg __asm__("r8")  = a5;
-        __asm__ volatile (
-                "int $0x80"
-                : "=a"(ret)
-                : "a"(num), "D"(a1), "S"(a2), "d"(a3), "r"(a4_reg), "r"(a5_reg)
-                : "memory", "rcx", "r11"
-        );
-        return ret;
+    register long a4_reg __asm__("r10") = a4;
+    register long a5_reg __asm__("r8")  = a5;
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "a"(num), "D"(a1), "S"(a2), "d"(a3), "r"(a4_reg), "r"(a5_reg)
+                     : "memory", "rcx", "r11");
+    return ret;
 }
 
 /* --- Debug / Serial I/O --- */
@@ -102,21 +98,20 @@ int cap_revoke(int handle);
 /* --- IPC --- */
 int ipc_send(int port, const void *msg, int len);
 int ipc_recv(int port, void *buf, int *len, int *tok);
-int ipc_call(int port, const void *req, int req_len,
-             void *resp, int *resp_len);
+int ipc_call(int port, const void *req, int req_len, void *resp, int *resp_len);
 int ipc_port_create(void);
 int ipc_reply(int token, const void *resp, int resp_len);
 
 /* --- Memory --- */
 void *map_memory(int cap, int offset, int size, int prot);
-int unmap_memory(void *addr, int size);
+int   unmap_memory(void *addr, int size);
 
 /* --- Thread management --- */
-int thread_create(void (*entry)(void *), void *arg, int priority);
+int  thread_create(void (*entry)(void *), void *arg, int priority);
 void thread_exit(int code);
 void thread_yield(void);
-int thread_set_affinity(int tid, int cpu);
-int thread_join(int tid, int *exit_code);
+int  thread_set_affinity(int tid, int cpu);
+int  thread_join(int tid, int *exit_code);
 
 /* --- Time --- */
 int get_time(void);
@@ -124,12 +119,12 @@ int sleep(int ticks);
 
 /* Wall-clock time (layout must match kernel/include/kernel/rtc.h) */
 typedef struct {
-        unsigned short year;    /* full year, e.g. 2026 */
-        unsigned char  month;   /* 1-12 */
-        unsigned char  day;     /* 1-31 */
-        unsigned char  hour;    /* 0-23 */
-        unsigned char  minute;  /* 0-59 */
-        unsigned char  second;  /* 0-59 */
+    unsigned short year;   /* full year, e.g. 2026 */
+    unsigned char  month;  /* 1-12 */
+    unsigned char  day;    /* 1-31 */
+    unsigned char  hour;   /* 0-23 */
+    unsigned char  minute; /* 0-59 */
+    unsigned char  second; /* 0-59 */
 } rtc_time_t;
 
 /* --- RTC wall clock --- */
@@ -160,7 +155,7 @@ int io_write8(unsigned short port, unsigned char val);
 
 /* --- System power --- */
 int sys_reboot(void);
-int sys_panic(void);    /* TEMP test hook: trigger a kernel panic */
+int sys_panic(void); /* TEMP test hook: trigger a kernel panic */
 
 /* --- Init protocol --- */
 int get_free_pages(void);
@@ -181,12 +176,12 @@ int process_wait(int pid, int *exit_code);
  * (kernel/include/kernel/proc_info.h).  Fixed 84-byte record.
  */
 typedef struct {
-        int         pid;           /* process ID */
-        uint32_t    state;         /* proc_state_t value (0-4) */
-        uint32_t    thread_count;  /* live threads */
-        int         exit_code;     /* exit code (valid when state == ZOMBIE) */
-        uint32_t    main_tid;      /* main thread ID */
-        char        name[64];      /* NUL-terminated process name */
+    int      pid;          /* process ID */
+    uint32_t state;        /* proc_state_t value (0-4) */
+    uint32_t thread_count; /* live threads */
+    int      exit_code;    /* exit code (valid when state == ZOMBIE) */
+    uint32_t main_tid;     /* main thread ID */
+    char     name[64];     /* NUL-terminated process name */
 } proc_info_t;
 
 /* Fill buf with up to max_entries proc_info_t entries.  Returns
@@ -201,10 +196,10 @@ int process_list(proc_info_t *buf, int max_entries);
  * pid + name + 128-bit kernel-issued App Subject (uuid).
  */
 typedef struct {
-        int         pid;        /* process ID */
-        char        name[64];   /* NUL-terminated process name */
-        uint64_t    uuid_hi;    /* kernel-issued app UUID, high 64 bits */
-        uint64_t    uuid_lo;    /* kernel-issued app UUID, low 64 bits */
+    int      pid;      /* process ID */
+    char     name[64]; /* NUL-terminated process name */
+    uint64_t uuid_hi;  /* kernel-issued app UUID, high 64 bits */
+    uint64_t uuid_lo;  /* kernel-issued app UUID, low 64 bits */
 } proc_ident_t;
 
 /* Resolve a subject_id to its kernel-issued identity
@@ -235,17 +230,17 @@ int mutex_destroy(int handle);
  * they can be passed to/returned from signal() directly. */
 typedef void (*sighandler_t)(int signum);
 
-#define SIGKILL     9    /* uncatchable, unignorable terminate */
-#define SIGUSR1     10
-#define SIGSEGV     11
-#define SIGUSR2     12
-#define SIGPIPE     13
-#define SIGALRM     14
-#define SIGTERM     15
-#define SIGSTOP     19   /* reserved: cannot be caught/ignored */
-#define SIG_DFL     ((sighandler_t)0)   /* default action (terminate or ignore) */
-#define SIG_IGN     ((sighandler_t)1)   /* ignore */
-#define NSIG        64
+#define SIGKILL 9 /* uncatchable, unignorable terminate */
+#define SIGUSR1 10
+#define SIGSEGV 11
+#define SIGUSR2 12
+#define SIGPIPE 13
+#define SIGALRM 14
+#define SIGTERM 15
+#define SIGSTOP 19                /* reserved: cannot be caught/ignored */
+#define SIG_DFL ((sighandler_t)0) /* default action (terminate or ignore) */
+#define SIG_IGN ((sighandler_t)1) /* ignore */
+#define NSIG    64
 
 /* Register a handler for signum.  Returns the previous handler
  * (SIG_DFL if never set), or a negative error code. */
@@ -297,8 +292,7 @@ int pci_get_device(int index, pci_device_info_t *out);
  *   sys_blk_write (disk, lba, count, buf) — write from buf.
  *   sys_blk_info (disk, out) — fill blk_info_t {sectors, sector_size}. */
 int64_t sys_blk_read(uint64_t disk, uint64_t lba, uint64_t count, void *buf);
-int64_t sys_blk_write(uint64_t disk, uint64_t lba, uint64_t count,
-                                            const void *buf);
+int64_t sys_blk_write(uint64_t disk, uint64_t lba, uint64_t count, const void *buf);
 int64_t sys_blk_info(uint64_t disk, blk_info_t *out);
 
 /*
@@ -310,12 +304,12 @@ int64_t sys_blk_info(uint64_t disk, blk_info_t *out);
  * size clamped to the real framebuffer size).
  */
 typedef struct {
-        uint64_t    phys_addr;  /* Physical address of the framebuffer */
-        uint32_t    width;      /* Width in pixels (logical px in VGA text mode) */
-        uint32_t    height;     /* Height in pixels (logical px in VGA text mode) */
-        uint32_t    pitch;      /* Bytes per scanline (linear mode only) */
-        uint8_t     bpp;        /* Bits per pixel (linear mode only) */
-        uint8_t     vga_text;   /* 1 = VGA text mode (0xB8000), 0 = linear RGB */
+    uint64_t phys_addr; /* Physical address of the framebuffer */
+    uint32_t width;     /* Width in pixels (logical px in VGA text mode) */
+    uint32_t height;    /* Height in pixels (logical px in VGA text mode) */
+    uint32_t pitch;     /* Bytes per scanline (linear mode only) */
+    uint8_t  bpp;       /* Bits per pixel (linear mode only) */
+    uint8_t  vga_text;  /* 1 = VGA text mode (0xB8000), 0 = linear RGB */
 } fb_user_info_t;
 
 /* Fetch the user-facing framebuffer descriptor.  Returns 0 on success,
@@ -344,8 +338,8 @@ uint64_t get_subject(void);
  * 0 = permanent), quota (remaining uses, 0 = unlimited), scope_hash
  * (0 = unrestricted).  The holding subject is the caller.  Returns a
  * handle > 0, or a negative error (ERR_NOMEM table full). */
-int cap_create_atom(atom_id_t atom, int rights, uint64_t expiry_ticks,
-                                        uint32_t quota, uint64_t scope_hash);
+int cap_create_atom(
+    atom_id_t atom, int rights, uint64_t expiry_ticks, uint32_t quota, uint64_t scope_hash);
 
 /* Consume one quota unit of a caller-owned capability (SYS_CAP_CONSUME).
  * Includes lazy expiry: an expired entry is revoked in place and
@@ -365,8 +359,8 @@ int cap_revoke_by_atom(uint64_t subject, atom_id_t atom, uint64_t scope_hash);
  * cap in ITS table (entry.subject = target).  Returns a handle > 0,
  * ERR_NOENT (no live process holds the subject), ERR_INVAL (bad
  * atom/rights), or ERR_NOMEM (target table full). */
-int cap_grant_to_subject(uint64_t subject, atom_id_t atom, int rights,
-                         uint64_t expiry_ticks, uint32_t quota);
+int cap_grant_to_subject(
+    uint64_t subject, atom_id_t atom, int rights, uint64_t expiry_ticks, uint32_t quota);
 
 /* P1 地基: read-only atom-holding query (SYS_CAP_HAS_ATOM).  Returns 1
  * when the process holding `subject` has a live atom cap for `atom`,
@@ -380,7 +374,6 @@ int cap_has_atom(uint64_t subject, atom_id_t atom);
 /* Receive with sender identity (SYS_IPC_RECV_FROM): identical to
  * ipc_recv() plus, when sender_subject is non-NULL, the kernel-filled
  * unforgeable sender subject is written to it. */
-int ipc_recv_from(int port, void *buf, int *len, int *tok,
-                                    uint64_t *sender_subject);
+int ipc_recv_from(int port, void *buf, int *len, int *tok, uint64_t *sender_subject);
 
 #endif /* LIBOS_SYSCALLS_H */

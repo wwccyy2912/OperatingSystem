@@ -1,1 +1,25 @@
+# Build artifacts
+build/
+kernel.elf
+*.o
+*.d
+*.pyc
+
+# Python cache
+__pycache__/
+
+# IDE / editor configs
+.idea/
+.vscode/
+compile_commands.json
+
+# Tool session data
+.omo/
+
+# Backup files
+*.bak
+*.orig
+*~
+
+# Disk images
 disk.img

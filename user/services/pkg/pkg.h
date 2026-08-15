@@ -36,28 +36,28 @@
 #include <stdint.h>
 
 /* Fixed-width types (same convention as perm.h) */
-typedef uint8_t     u8;
-typedef uint32_t    u32;
-typedef int32_t     i32;
-typedef uint64_t    u64;
+typedef uint8_t  u8;
+typedef uint32_t u32;
+typedef int32_t  i32;
+typedef uint64_t u64;
 
-#define PKG_PORT_NAME    "pkg"       /* service port */
+#define PKG_PORT_NAME "pkg" /* service port */
 
 /* Bounds (docs/ops_format.md §2/§3) */
-#define PKG_NAME_MAX       64        /* app_id / blob name (incl NUL) */
-#define PKG_PERMS_MAX     256        /* comma-separated atom names     */
-#define PKG_MANIFEST_MAX  512        /* manifest text length           */
-#define PKG_MAX_APPS       8         /* installed app listing cap      */
-#define PKG_MAX_ATOMS      8         /* permissions per manifest       */
-#define PKG_PENDING_MAX    4         /* concurrent run handshakes      */
+#define PKG_NAME_MAX     64  /* app_id / blob name (incl NUL) */
+#define PKG_PERMS_MAX    256 /* comma-separated atom names     */
+#define PKG_MANIFEST_MAX 512 /* manifest text length           */
+#define PKG_MAX_APPS     8   /* installed app listing cap      */
+#define PKG_MAX_ATOMS    8   /* permissions per manifest       */
+#define PKG_PENDING_MAX  4   /* concurrent run handshakes      */
 
 /* Op codes (req[0]) */
 enum {
-        PKG_OP_INSTALL   = 1,   /* shell → pkg: install kernel blob     */
-        PKG_OP_LIST      = 2,   /* shell → pkg: enumerate installed     */
-        PKG_OP_RUN       = 3,   /* shell → pkg: spawn app → pid         */
-        PKG_OP_REMOVE    = 4,   /* shell → pkg: delete installed app    */
-        PKG_OP_APP_READY = 5,   /* app → pkg: ready; sign manifest atoms */
+    PKG_OP_INSTALL   = 1, /* shell → pkg: install kernel blob     */
+    PKG_OP_LIST      = 2, /* shell → pkg: enumerate installed     */
+    PKG_OP_RUN       = 3, /* shell → pkg: spawn app → pid         */
+    PKG_OP_REMOVE    = 4, /* shell → pkg: delete installed app    */
+    PKG_OP_APP_READY = 5, /* app → pkg: ready; sign manifest atoms */
 };
 
 /* ====================================================================
@@ -71,13 +71,13 @@ enum {
  * ==================================================================== */
 
 typedef struct {
-        u32  op;             /* = PKG_OP_INSTALL */
-        char name[PKG_NAME_MAX];   /* kernel blob name (app_id) */
-        char perms[PKG_PERMS_MAX]; /* comma-separated atom names, "" = none */
+    u32  op;                   /* = PKG_OP_INSTALL */
+    char name[PKG_NAME_MAX];   /* kernel blob name (app_id) */
+    char perms[PKG_PERMS_MAX]; /* comma-separated atom names, "" = none */
 } pkg_req_install_t;
 
 typedef struct {
-        i32  ret;
+    i32 ret;
 } pkg_resp_install_t;
 
 /* ====================================================================
@@ -85,13 +85,13 @@ typedef struct {
  * ==================================================================== */
 
 typedef struct {
-        u32  op;             /* = PKG_OP_LIST */
+    u32 op; /* = PKG_OP_LIST */
 } pkg_req_list_t;
 
 typedef struct {
-        i32  ret;
-        u32  count;                  /* apps listed */
-        char apps[PKG_MAX_APPS][PKG_NAME_MAX];
+    i32  ret;
+    u32  count; /* apps listed */
+    char apps[PKG_MAX_APPS][PKG_NAME_MAX];
 } pkg_resp_list_t;
 
 /* ====================================================================
@@ -104,13 +104,13 @@ typedef struct {
  * ==================================================================== */
 
 typedef struct {
-        u32  op;             /* = PKG_OP_RUN */
-        char app_id[PKG_NAME_MAX];
+    u32  op; /* = PKG_OP_RUN */
+    char app_id[PKG_NAME_MAX];
 } pkg_req_run_t;
 
 typedef struct {
-        i32  ret;
-        i32  pid;            /* spawned pid on success */
+    i32 ret;
+    i32 pid; /* spawned pid on success */
 } pkg_resp_run_t;
 
 /* ====================================================================
@@ -118,12 +118,12 @@ typedef struct {
  * ==================================================================== */
 
 typedef struct {
-        u32  op;             /* = PKG_OP_REMOVE */
-        char app_id[PKG_NAME_MAX];
+    u32  op; /* = PKG_OP_REMOVE */
+    char app_id[PKG_NAME_MAX];
 } pkg_req_remove_t;
 
 typedef struct {
-        i32  ret;
+    i32 ret;
 } pkg_resp_remove_t;
 
 /* ====================================================================
@@ -139,12 +139,12 @@ typedef struct {
  * ==================================================================== */
 
 typedef struct {
-        u32  op;             /* = PKG_OP_APP_READY */
-        char app_id[PKG_NAME_MAX]; /* the app's own app_id */
+    u32  op;                   /* = PKG_OP_APP_READY */
+    char app_id[PKG_NAME_MAX]; /* the app's own app_id */
 } pkg_req_app_ready_t;
 
 typedef struct {
-        i32  ret;
+    i32 ret;
 } pkg_resp_app_ready_t;
 
 #endif /* USER_SERVICES_PKG_PKG_H */

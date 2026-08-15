@@ -19,7 +19,7 @@
  * ==================================================================== */
 
 /* complex expands to the _Complex keyword (a type specifier). */
-#define complex         _Complex
+#define complex _Complex
 
 /* imaginary expands to the _Imaginary keyword only when the compiler
  * actually supports imaginary types; otherwise the macro is left
@@ -27,22 +27,22 @@
  * __STDC_IEC_559_COMPLEX__ on most targets, so `imaginary` is usually
  * absent — code should prefer `_Complex`. */
 #ifdef __STDC_IEC_559_COMPLEX__
-#  define imaginary     _Imaginary
+#define imaginary _Imaginary
 #endif
 
 /* The imaginary unit, as a compile-time constant.  Using
  * __builtin_complex keeps the value an exact +1.0i and lets the
  * compiler fold it. */
-#define _Complex_I      __builtin_complex(0.0F, 1.0F)
-#define I               _Complex_I
+#define _Complex_I __builtin_complex(0.0F, 1.0F)
+#define I          _Complex_I
 
 /* CMPLX/CMPLXF/CMPLXL constructors (C11 §7.3.9.3) — build a complex
  * value from its real and imaginary parts.  __builtin_complex is used
  * so that an argument of NaN/Inf is preserved in the imaginary part
  * (a plain cast to _Complex would zero it out). */
-#define CMPLX(x, y)     __builtin_complex((double)(x), (double)(y))
-#define CMPLXF(x, y)    __builtin_complex((float)(x), (float)(y))
-#define CMPLXL(x, y)    __builtin_complex((long double)(x), (long double)(y))
+#define CMPLX(x, y)  __builtin_complex((double)(x), (double)(y))
+#define CMPLXF(x, y) __builtin_complex((float)(x), (float)(y))
+#define CMPLXL(x, y) __builtin_complex((long double)(x), (long double)(y))
 
 /* ====================================================================
  * Functions — double complex (C11 §7.3.5-7.3.9)
@@ -69,16 +69,16 @@ double complex cexp(double complex z);
 double complex clog(double complex z);
 
 /* Power and absolute value (§7.3.8) */
-double          cabs(double complex z);
-double complex  cpow(double complex x, double complex z);
-double complex  csqrt(double complex z);
+double         cabs(double complex z);
+double complex cpow(double complex x, double complex z);
+double complex csqrt(double complex z);
 
 /* Manipulation (§7.3.9) — these return real or complex results. */
-double          carg(double complex z);
-double          cimag(double complex z);
-double complex  conj(double complex z);
-double complex  cproj(double complex z);
-double          creal(double complex z);
+double         carg(double complex z);
+double         cimag(double complex z);
+double complex conj(double complex z);
+double complex cproj(double complex z);
+double         creal(double complex z);
 
 /* ====================================================================
  * Functions — float complex
@@ -105,16 +105,16 @@ float complex cexpf(float complex z);
 float complex clogf(float complex z);
 
 /* Power and absolute value */
-float           cabsf(float complex z);
-float complex   cpowf(float complex x, float complex z);
-float complex   csqrtf(float complex z);
+float         cabsf(float complex z);
+float complex cpowf(float complex x, float complex z);
+float complex csqrtf(float complex z);
 
 /* Manipulation */
-float           cargf(float complex z);
-float           cimagf(float complex z);
-float complex   conjf(float complex z);
-float complex   cprojf(float complex z);
-float           crealf(float complex z);
+float         cargf(float complex z);
+float         cimagf(float complex z);
+float complex conjf(float complex z);
+float complex cprojf(float complex z);
+float         crealf(float complex z);
 
 /* ====================================================================
  * Functions — long double complex
@@ -141,15 +141,15 @@ long double complex cexpl(long double complex z);
 long double complex clogl(long double complex z);
 
 /* Power and absolute value */
-long double           cabsl(long double complex z);
-long double complex   cpowl(long double complex x, long double complex z);
-long double complex   csqrtl(long double complex z);
+long double         cabsl(long double complex z);
+long double complex cpowl(long double complex x, long double complex z);
+long double complex csqrtl(long double complex z);
 
 /* Manipulation */
-long double           cargl(long double complex z);
-long double           cimagl(long double complex z);
-long double complex   conjl(long double complex z);
-long double complex   cprojl(long double complex z);
-long double           creall(long double complex z);
+long double         cargl(long double complex z);
+long double         cimagl(long double complex z);
+long double complex conjl(long double complex z);
+long double complex cprojl(long double complex z);
+long double         creall(long double complex z);
 
 #endif /* LIBC_COMPLEX_H */

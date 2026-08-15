@@ -24,15 +24,15 @@
 
 /* Saved register context of a thread, in context_switch.S save order. */
 typedef struct {
-        u64     rsp;       /* Stack pointer */
-        u64     rbx;       /* Callee-saved */
-        u64     rbp;       /* Callee-saved */
-        u64     r12;       /* Callee-saved */
-        u64     r13;       /* Callee-saved */
-        u64     r14;       /* Callee-saved */
-        u64     r15;       /* Callee-saved */
-        u64     rflags;    /* EFLAGS (IF bit set by context_switch on resume) */
-        u64     rip;       /* Next instruction pointer */
+    u64 rsp;    /* Stack pointer */
+    u64 rbx;    /* Callee-saved */
+    u64 rbp;    /* Callee-saved */
+    u64 r12;    /* Callee-saved */
+    u64 r13;    /* Callee-saved */
+    u64 r14;    /* Callee-saved */
+    u64 r15;    /* Callee-saved */
+    u64 rflags; /* EFLAGS (IF bit set by context_switch on resume) */
+    u64 rip;    /* Next instruction pointer */
 } thread_ctx_t;
 
 #endif /* KERNEL_THREAD_CTX_H */

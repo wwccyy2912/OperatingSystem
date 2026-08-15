@@ -15,27 +15,27 @@
 
 /* IPC message header */
 typedef struct {
-        port_t  dest_port;
-        port_t  src_port;
-        u32     msg_type;
-        u32     msg_len;
-        u64     caps[4];        /* Capability handles transferred */
-        u32     cap_count;
+    port_t dest_port;
+    port_t src_port;
+    u32    msg_type;
+    u32    msg_len;
+    u64    caps[4]; /* Capability handles transferred */
+    u32    cap_count;
 } ipc_header_t;
 
 /* IPC message buffer */
 typedef struct {
-        ipc_header_t    header;
-        u8              data[MAX_MSG_SIZE];
+    ipc_header_t header;
+    u8           data[MAX_MSG_SIZE];
 } ipc_msg_t;
 
 /* Port structure */
 typedef struct {
-        port_t      port_id;
-        tid_t       owner_tid;      /* Owning thread */
-        pid_t       owner_pid;      /* Owning process */
-        thread_t   *wait_queue;     /* Threads waiting on this port */
-        bool        in_use;
+    port_t    port_id;
+    tid_t     owner_tid;  /* Owning thread */
+    pid_t     owner_pid;  /* Owning process */
+    thread_t *wait_queue; /* Threads waiting on this port */
+    bool      in_use;
 } port_entry_t;
 
 /**
@@ -88,8 +88,7 @@ error_t ipc_recv(port_t port, void *buf, u32 *len, u32 *tok_ptr);
  * @param sender_subject  Out: sender's process subject (may be NULL).
  * @return OK or error.
  */
-error_t ipc_recv_from(port_t port, void *buf, u32 *len, u32 *tok_ptr,
-                                            subject_id_t *sender_subject);
+error_t ipc_recv_from(port_t port, void *buf, u32 *len, u32 *tok_ptr, subject_id_t *sender_subject);
 
 /**
  * Synchronous call: send request and wait for response.
@@ -100,8 +99,7 @@ error_t ipc_recv_from(port_t port, void *buf, u32 *len, u32 *tok_ptr,
  * @param resp_len In: buffer size, Out: response size.
  * @return OK or error.
  */
-error_t ipc_call(port_t port, const void *req, u32 req_len,
-                 void *resp, u32 *resp_len);
+error_t ipc_call(port_t port, const void *req, u32 req_len, void *resp, u32 *resp_len);
 
 /**
  * Reply to a pending call (send response to caller).

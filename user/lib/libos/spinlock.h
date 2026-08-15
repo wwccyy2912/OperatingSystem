@@ -22,28 +22,25 @@
 #ifndef LIBOS_SPINLOCK_H
 #define LIBOS_SPINLOCK_H
 
-#include <libos/syscalls.h>  /* thread_yield() */
+#include <libos/syscalls.h> /* thread_yield() */
 
 typedef volatile int user_spinlock_t;
 
 /* Try to acquire the lock.  Returns 1 on success, 0 if already held. */
-static inline int spin_trylock(user_spinlock_t *l)
-{
-        return __atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE) == 0;
+static inline int spin_trylock(user_spinlock_t *l) {
+    return __atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE) == 0;
 }
 
 /* Acquire the lock.  Uncontended: one atomic exchange, zero syscalls.
  * Contended: yield to the scheduler so the holder can make progress. */
-static inline void spin_lock(user_spinlock_t *l)
-{
-        while (!spin_trylock(l))
-                thread_yield();
+static inline void spin_lock(user_spinlock_t *l) {
+    while (!spin_trylock(l))
+        thread_yield();
 }
 
 /* Release the lock. */
-static inline void spin_unlock(user_spinlock_t *l)
-{
-        __atomic_store_n(l, 0, __ATOMIC_RELEASE);
+static inline void spin_unlock(user_spinlock_t *l) {
+    __atomic_store_n(l, 0, __ATOMIC_RELEASE);
 }
 
 #endif /* LIBOS_SPINLOCK_H */

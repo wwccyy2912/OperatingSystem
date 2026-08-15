@@ -16,19 +16,17 @@
 
 #include <runtime.h>
 
-void _init(void)
-{
-        for (init_func_t *p = __init_array_start; p < __init_array_end; p++) {
-                if (*p)
-                        (*p)();
-        }
+void _init(void) {
+    for (init_func_t *p = __init_array_start; p < __init_array_end; p++) {
+        if (*p)
+            (*p)();
+    }
 }
 
-void _fini(void)
-{
-        for (init_func_t *p = __fini_array_end; p > __fini_array_start; ) {
-                p--;
-                if (*p)
-                        (*p)();
-        }
+void _fini(void) {
+    for (init_func_t *p = __fini_array_end; p > __fini_array_start;) {
+        p--;
+        if (*p)
+            (*p)();
+    }
 }

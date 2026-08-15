@@ -10,7 +10,7 @@
 #include <stdarg.h>
 
 /* Standard COM1 base address */
-#define SERIAL_COM1_BASE    0x3F8
+#define SERIAL_COM1_BASE 0x3F8
 
 /*
  * Log levels for gated serial output (higher = more verbose).
@@ -20,10 +20,10 @@
  * (exceptions, stack smash, reboot) use the ungated functions below
  * and always print.
  */
-#define SERIAL_LOG_ERROR   0
-#define SERIAL_LOG_WARN    1
-#define SERIAL_LOG_INFO    2
-#define SERIAL_LOG_DEBUG   3
+#define SERIAL_LOG_ERROR 0
+#define SERIAL_LOG_WARN  1
+#define SERIAL_LOG_INFO  2
+#define SERIAL_LOG_DEBUG 3
 
 /**
  * Set the current log level threshold.

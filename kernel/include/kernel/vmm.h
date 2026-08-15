@@ -11,10 +11,10 @@
 #include <kernel/types.h>
 
 /* Kernel virtual address offset (higher-half) */
-#define KERNEL_VIRT_BASE    0xFFFF800000000000ULL
+#define KERNEL_VIRT_BASE 0xFFFF800000000000ULL
 
 /* Upper bound of the user address space (identity-mapped region for v0.1) */
-#define USER_PTR_MAX        0x0000800000000000ULL
+#define USER_PTR_MAX 0x0000800000000000ULL
 
 /*
  * User heap region — MUST match user/runtime/malloc.c (HEAP_USER_SIZE).
@@ -29,32 +29,32 @@
  * faults instead of silently corrupting adjacent user memory.
  * User-space malloc.c fetches its base via SYS_GET_HEAP_BASE.
  */
-#define HEAP_USER_BASE      0x70000000ULL   /* default (minimum) base */
-#define HEAP_USER_SIZE      0x10000000ULL   /* 256 MB region per process */
+#define HEAP_USER_BASE 0x70000000ULL /* default (minimum) base */
+#define HEAP_USER_SIZE 0x10000000ULL /* 256 MB region per process */
 
 /* Kernel CR3 (physical address of kernel PML4).
  * Set during vmm_init(), used by syscall_entry.S to switch page tables. */
 extern u64 vmm_kernel_cr3;
 
 /* Page table entry flags */
-#define PTE_PRESENT     (1ULL << 0)
-#define PTE_WRITABLE    (1ULL << 1)
-#define PTE_USER        (1ULL << 2)
-#define PTE_WRITE_THRU  (1ULL << 3)
-#define PTE_CACHE_DIS   (1ULL << 4)
-#define PTE_ACCESSED    (1ULL << 5)
-#define PTE_DIRTY       (1ULL << 6)
-#define PTE_HUGE        (1ULL << 7)
-#define PTE_GLOBAL      (1ULL << 8)
-#define PTE_NO_EXECUTE  (1ULL << 63)
+#define PTE_PRESENT    (1ULL << 0)
+#define PTE_WRITABLE   (1ULL << 1)
+#define PTE_USER       (1ULL << 2)
+#define PTE_WRITE_THRU (1ULL << 3)
+#define PTE_CACHE_DIS  (1ULL << 4)
+#define PTE_ACCESSED   (1ULL << 5)
+#define PTE_DIRTY      (1ULL << 6)
+#define PTE_HUGE       (1ULL << 7)
+#define PTE_GLOBAL     (1ULL << 8)
+#define PTE_NO_EXECUTE (1ULL << 63)
 
 /* Address space structure */
 typedef struct {
-        u64 pml4_phys;      /* Physical address of PML4 */
-        u64 stack_base;     /* ASLR: per-address-space user stack region base
-                         * (1 MB aligned; thread TID stacks at
-                         * stack_base + tid*PAGE_SIZE).  Random per
-                         * address space — see rng.h aslr_stack_base(). */
+    u64 pml4_phys;  /* Physical address of PML4 */
+    u64 stack_base; /* ASLR: per-address-space user stack region base
+                     * (1 MB aligned; thread TID stacks at
+                     * stack_base + tid*PAGE_SIZE).  Random per
+                     * address space — see rng.h aslr_stack_base(). */
 } addr_space_t;
 
 /**
@@ -114,8 +114,7 @@ void vmm_switch_addr_space(addr_space_t *as);
 /**
  * Map a range of pages.
  */
-error_t vmm_map_range(addr_space_t *as, u64 virt, u64 phys,
-                                            u64 page_count, u64 flags);
+error_t vmm_map_range(addr_space_t *as, u64 virt, u64 phys, u64 page_count, u64 flags);
 
 /**
  * Unmap a range of pages.
@@ -146,7 +145,6 @@ error_t vmm_alloc_and_map(addr_space_t *as, u64 virt, u64 flags);
  *                   will write into the range); if false, Present alone
  *                   suffices (the kernel only reads from the range).
  */
-bool vmm_validate_user_range(addr_space_t *as, u64 ptr, u64 size,
-                             bool need_write);
+bool vmm_validate_user_range(addr_space_t *as, u64 ptr, u64 size, bool need_write);
 
 #endif /* KERNEL_VMM_H */

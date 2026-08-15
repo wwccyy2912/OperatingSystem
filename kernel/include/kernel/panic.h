@@ -19,7 +19,6 @@
  * cli+hlt loop.  Non-fault shutdown paths (last thread exited, reboot)
  * are NOT panics and keep their own halt semantics.
  */
-__attribute__((noreturn))
-void panic(const char *fmt, ...);
+__attribute__((noreturn)) void panic(const char *fmt, ...);
 
 #endif /* KERNEL_PANIC_H */

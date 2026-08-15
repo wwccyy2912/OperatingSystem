@@ -1,5 +1,6 @@
 /*
  * font.h - 8x16 VGA font (95 printable ASCII glyphs, 0x20..0x7E)
+ * Copyright (c) 2026 OpSys Project
  *
  * Extracted from kernel/gfx/framebuffer.c (single source of truth is
  * the kernel copy; keep in sync if the glyphs change).

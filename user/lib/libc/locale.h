@@ -11,7 +11,7 @@
 #ifndef LIBC_LOCALE_H
 #define LIBC_LOCALE_H
 
-#include <stddef.h>     /* NULL */
+#include <stddef.h> /* NULL */
 
 /* ====================================================================
  * Category macros (C11 §7.11.1)
@@ -20,12 +20,12 @@
  * the standard.
  * ==================================================================== */
 
-#define LC_ALL          0
-#define LC_COLLATE      1
-#define LC_CTYPE        2
-#define LC_MONETARY     3
-#define LC_NUMERIC      4
-#define LC_TIME         5
+#define LC_ALL      0
+#define LC_COLLATE  1
+#define LC_CTYPE    2
+#define LC_MONETARY 3
+#define LC_NUMERIC  4
+#define LC_TIME     5
 
 /* ====================================================================
  * struct lconv (C11 §7.11.2.1)
@@ -38,34 +38,34 @@
 
 struct lconv {
     /* Non-monetary numeric formatting */
-    char    *decimal_point;      /* decimal point character ("." in C) */
-    char    *thousands_sep;      /* thousands separator ("" in C)     */
-    char    *grouping;           /* grouping specification ("" in C)   */
+    char *decimal_point; /* decimal point character ("." in C) */
+    char *thousands_sep; /* thousands separator ("" in C)     */
+    char *grouping;      /* grouping specification ("" in C)   */
 
     /* Monetary formatting — international currency */
-    char    *int_curr_symbol;    /* 3-letter ISO symbol + separator    */
+    char *int_curr_symbol; /* 3-letter ISO symbol + separator    */
 
     /* Monetary formatting — local currency */
-    char    *currency_symbol;   /* local currency symbol ("")         */
-    char    *mon_decimal_point; /* monetary decimal point ("")         */
-    char    *mon_thousands_sep; /* monetary thousands separator ("")  */
-    char    *mon_grouping;      /* monetary grouping spec ("")         */
-    char    *positive_sign;     /* non-negative amount sign ("")       */
-    char    *negative_sign;     /* negative amount sign ("")          */
+    char *currency_symbol;   /* local currency symbol ("")         */
+    char *mon_decimal_point; /* monetary decimal point ("")         */
+    char *mon_thousands_sep; /* monetary thousands separator ("")  */
+    char *mon_grouping;      /* monetary grouping spec ("")         */
+    char *positive_sign;     /* non-negative amount sign ("")       */
+    char *negative_sign;     /* negative amount sign ("")          */
 
     /* Digit counts (CHAR_MAX = unavailable) */
-    char    int_frac_digits;    /* international fractional digits     */
-    char    frac_digits;        /* local fractional digits            */
+    char int_frac_digits; /* international fractional digits     */
+    char frac_digits;     /* local fractional digits            */
 
     /* Symbol position — non-negative amounts */
-    char    p_cs_precedes;       /* 1 = symbol first, 0 = symbol last  */
-    char    p_sep_by_space;     /* 0/1/2: none/space/other separator  */
-    char    p_sign_posn;         /* 0..4: sign placement               */
+    char p_cs_precedes;  /* 1 = symbol first, 0 = symbol last  */
+    char p_sep_by_space; /* 0/1/2: none/space/other separator  */
+    char p_sign_posn;    /* 0..4: sign placement               */
 
     /* Symbol position — negative amounts */
-    char    n_cs_precedes;
-    char    n_sep_by_space;
-    char    n_sign_posn;
+    char n_cs_precedes;
+    char n_sep_by_space;
+    char n_sign_posn;
 };
 
 /* ====================================================================

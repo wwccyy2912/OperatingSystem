@@ -14,38 +14,38 @@
 
 /* Capability object types */
 typedef enum {
-        CAP_TYPE_NONE = 0,
-        CAP_TYPE_THREAD,        /* Thread control */
-        CAP_TYPE_PORT,          /* IPC port */
-        CAP_TYPE_MEM,           /* Memory region */
-        CAP_TYPE_IRQ,           /* Interrupt binding */
-        CAP_TYPE_IO_PORT,       /* I/O port range */
-        CAP_TYPE_PCI_DEV,       /* PCI device */
-        CAP_TYPE_SERVICE,       /* System service */
-        CAP_TYPE_KERNEL,        /* Kernel object reference */
-        CAP_TYPE_DAC_OVERRIDE,  /* Bypass DAC/credential checks (Linux CAP_DAC_OVERRIDE style) */
+    CAP_TYPE_NONE = 0,
+    CAP_TYPE_THREAD,       /* Thread control */
+    CAP_TYPE_PORT,         /* IPC port */
+    CAP_TYPE_MEM,          /* Memory region */
+    CAP_TYPE_IRQ,          /* Interrupt binding */
+    CAP_TYPE_IO_PORT,      /* I/O port range */
+    CAP_TYPE_PCI_DEV,      /* PCI device */
+    CAP_TYPE_SERVICE,      /* System service */
+    CAP_TYPE_KERNEL,       /* Kernel object reference */
+    CAP_TYPE_DAC_OVERRIDE, /* Bypass DAC/credential checks (Linux CAP_DAC_OVERRIDE style) */
 } cap_type_t;
 
 /* Capability object (kernel-side) */
 typedef struct {
-        cap_t       handle;     /* Unique handle value */
-        cap_type_t  type;
-        rights_t    rights;     /* Permission bitmask */
-        u64         obj_id;     /* Referenced object ID */
-        u64         obj_ptr;    /* Pointer to kernel object (or 0) */
-        u32         ref_count;
+    cap_t      handle; /* Unique handle value */
+    cap_type_t type;
+    rights_t   rights;  /* Permission bitmask */
+    u64        obj_id;  /* Referenced object ID */
+    u64        obj_ptr; /* Pointer to kernel object (or 0) */
+    u32        ref_count;
 
-        /* ---- P0 地基: permission-model lifecycle fields ----
+    /* ---- P0 地基: permission-model lifecycle fields ----
      * atom/expiry/quota/scope are the decision-cache encoding: the
      * perm-engine (P1) signs atom caps; the kernel only does local
      * lookups (see docs/permission_model.md §四).  Existing gated
      * paths (MEM/IRQ/IO_PORT) keep atom=0, expiry=0, quota=0,
      * scope=0, so lazy expiry and atom/scope checks pass through. */
-        u16         atom_id;       /* atom_id_t 值；0 = ATOM_NONE */
-        subject_id_t subject;      /* 持有者主体；0 = System/未指定 */
-        u64         expiry_ticks;  /* 0 = 永久；绝对 tick，超时后视同不存在 */
-        u32         quota;         /* 0 = 无限；>0 = 剩余使用次数 */
-        u64         scope_hash;    /* 0 = 不限制；否则匹配 scope */
+    u16          atom_id;      /* atom_id_t 值；0 = ATOM_NONE */
+    subject_id_t subject;      /* 持有者主体；0 = System/未指定 */
+    u64          expiry_ticks; /* 0 = 永久；绝对 tick，超时后视同不存在 */
+    u32          quota;        /* 0 = 无限；>0 = 剩余使用次数 */
+    u64          scope_hash;   /* 0 = 不限制；否则匹配 scope */
 } cap_entry_t;
 
 /* Per-process capability table.
@@ -55,10 +55,10 @@ typedef struct {
  * generation counters (formerly a global s_gen_counters[] array that
  * cost 1 MB of BSS).  sizeof(cap_table_t) ≈ 73 KB → 19 pages. */
 typedef struct {
-        cap_entry_t entries[MAX_CAPS];
-        u32         count;
-        pid_t       owner_pid;
-        u8          gen[MAX_CAPS];   /* Generation counters (per-slot) */
+    cap_entry_t entries[MAX_CAPS];
+    u32         count;
+    pid_t       owner_pid;
+    u8          gen[MAX_CAPS]; /* Generation counters (per-slot) */
 } cap_table_t;
 
 /**
@@ -88,8 +88,8 @@ void cap_table_destroy(cap_table_t *table);
  * @param obj_ptr Object pointer (kernel-internal).
  * @return Handle, or 0 on failure.
  */
-cap_t cap_create_in_table(cap_table_t *table, cap_type_t type,
-                                                    rights_t rights, u64 obj_id, u64 obj_ptr);
+cap_t cap_create_in_table(
+    cap_table_t *table, cap_type_t type, rights_t rights, u64 obj_id, u64 obj_ptr);
 
 /**
  * Create an atom capability (P0 地基): like cap_create_in_table but
@@ -107,9 +107,14 @@ cap_t cap_create_in_table(cap_table_t *table, cap_type_t type,
  * @param out          Receives the new handle on success.
  * @return OK, or ERR_INVAL (bad table/out) / ERR_NOMEM (table full).
  */
-int cap_create_atom(cap_table_t *table, subject_id_t subject,
-                                        atom_id_t atom, rights_t rights, u64 expiry_ticks,
-                                        u32 quota, u64 scope_hash, cap_t *out);
+int cap_create_atom(cap_table_t *table,
+                    subject_id_t subject,
+                    atom_id_t    atom,
+                    rights_t     rights,
+                    u64          expiry_ticks,
+                    u32          quota,
+                    u64          scope_hash,
+                    cap_t       *out);
 
 /**
  * Consume one quota unit of a capability (P0 地基).
@@ -142,9 +147,13 @@ int cap_consume(cap_table_t *table, cap_t handle);
  * @return OK, ERR_NOENT (no live process holds the subject),
  *         ERR_INVAL (bad atom/rights), or ERR_NOMEM (table full).
  */
-int cap_grant_to_subject(subject_id_t subject, atom_id_t atom,
-                         rights_t rights, u64 expiry_ticks, u32 quota,
-                         u64 scope_hash, cap_t *out);
+int cap_grant_to_subject(subject_id_t subject,
+                         atom_id_t    atom,
+                         rights_t     rights,
+                         u64          expiry_ticks,
+                         u32          quota,
+                         u64          scope_hash,
+                         cap_t       *out);
 
 /**
  * Revoke every capability held by a subject matching an atom
@@ -166,8 +175,7 @@ int cap_revoke_by_atom(subject_id_t subj, atom_id_t atom, u64 scope_hash);
  * @param rights     Rights to grant (subset of original).
  * @return New handle in destination, or 0 on failure.
  */
-cap_t cap_grant(cap_table_t *src_table, cap_table_t *dst_table,
-                                cap_t handle, rights_t rights);
+cap_t cap_grant(cap_table_t *src_table, cap_table_t *dst_table, cap_t handle, rights_t rights);
 
 /**
  * Revoke a capability from a table.
@@ -214,8 +222,7 @@ cap_entry_t *cap_lookup(cap_table_t *table, cap_t handle, rights_t need);
  * @param scope_hash 0 = any scope, else exact scope match.
  * @return Handle of the matched entry, or CAP_NULL (0) if none.
  */
-cap_t cap_lookup_by_atom(cap_table_t *table, subject_id_t subject,
-                         atom_id_t atom, u64 scope_hash);
+cap_t cap_lookup_by_atom(cap_table_t *table, subject_id_t subject, atom_id_t atom, u64 scope_hash);
 
 /**
  * Get the capability table for a given PID.

@@ -18,19 +18,19 @@
  * ==================================================================== */
 
 typedef enum {
-        memory_order_relaxed = __ATOMIC_RELAXED,
-        memory_order_consume = __ATOMIC_CONSUME,
-        memory_order_acquire = __ATOMIC_ACQUIRE,
-        memory_order_release = __ATOMIC_RELEASE,
-        memory_order_acq_rel = __ATOMIC_ACQ_REL,
-        memory_order_seq_cst = __ATOMIC_SEQ_CST
+    memory_order_relaxed = __ATOMIC_RELAXED,
+    memory_order_consume = __ATOMIC_CONSUME,
+    memory_order_acquire = __ATOMIC_ACQUIRE,
+    memory_order_release = __ATOMIC_RELEASE,
+    memory_order_acq_rel = __ATOMIC_ACQ_REL,
+    memory_order_seq_cst = __ATOMIC_SEQ_CST
 } memory_order;
 
 /* ====================================================================
  * Atomic type aliases (C11 §7.17.6)
  * ==================================================================== */
 
-#define _Atomic_type(T)  T _Atomic
+#define _Atomic_type(T) T _Atomic
 
 typedef _Atomic(_Bool)              atomic_bool;
 typedef _Atomic(char)               atomic_char;
@@ -73,69 +73,57 @@ typedef _Atomic(uintmax_t)          atomic_uintmax_t;
  * ==================================================================== */
 
 typedef struct {
-        _Atomic _Bool value;
+    _Atomic _Bool value;
 } atomic_flag;
 
-#define ATOMIC_FLAG_INIT  { 0 }
+#define ATOMIC_FLAG_INIT {0}
 
-#define atomic_flag_test_and_set(p) \
-        __atomic_test_and_set(&(p)->value, __ATOMIC_SEQ_CST)
-#define atomic_flag_test_and_set_explicit(p, mo) \
-        __atomic_test_and_set(&(p)->value, (mo))
-#define atomic_flag_clear(p) \
-        __atomic_clear(&(p)->value, __ATOMIC_SEQ_CST)
-#define atomic_flag_clear_explicit(p, mo) \
-        __atomic_clear(&(p)->value, (mo))
+#define atomic_flag_test_and_set(p) __atomic_test_and_set(&(p)->value, __ATOMIC_SEQ_CST)
+#define atomic_flag_test_and_set_explicit(p, mo) __atomic_test_and_set(&(p)->value, (mo))
+#define atomic_flag_clear(p)                     __atomic_clear(&(p)->value, __ATOMIC_SEQ_CST)
+#define atomic_flag_clear_explicit(p, mo)        __atomic_clear(&(p)->value, (mo))
 
 /* ====================================================================
  * Lock-free property (C11 §7.17.5)
  * ==================================================================== */
 
-#define ATOMIC_BOOL_LOCK_FREE       2
-#define ATOMIC_CHAR_LOCK_FREE       2
-#define ATOMIC_CHAR16_T_LOCK_FREE   2
-#define ATOMIC_CHAR32_T_LOCK_FREE   2
-#define ATOMIC_WCHAR_T_LOCK_FREE    2
-#define ATOMIC_SHORT_LOCK_FREE      2
-#define ATOMIC_INT_LOCK_FREE        2
-#define ATOMIC_LONG_LOCK_FREE       2
-#define ATOMIC_LLONG_LOCK_FREE      2
-#define ATOMIC_POINTER_LOCK_FREE    2
+#define ATOMIC_BOOL_LOCK_FREE     2
+#define ATOMIC_CHAR_LOCK_FREE     2
+#define ATOMIC_CHAR16_T_LOCK_FREE 2
+#define ATOMIC_CHAR32_T_LOCK_FREE 2
+#define ATOMIC_WCHAR_T_LOCK_FREE  2
+#define ATOMIC_SHORT_LOCK_FREE    2
+#define ATOMIC_INT_LOCK_FREE      2
+#define ATOMIC_LONG_LOCK_FREE     2
+#define ATOMIC_LLONG_LOCK_FREE    2
+#define ATOMIC_POINTER_LOCK_FREE  2
 
 /* ====================================================================
  * Generic atomic operations (C11 §7.17.7)
  * ==================================================================== */
 
-#define atomic_init(p, v)   __atomic_store_n(p, v, __ATOMIC_RELAXED)
-#define atomic_load(p)      __atomic_load_n(p, __ATOMIC_SEQ_CST)
-#define atomic_store(p, v)  __atomic_store_n(p, v, __ATOMIC_SEQ_CST)
-#define atomic_exchange(p, v) \
-        __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST)
-#define atomic_load_explicit(p, mo)   __atomic_load_n(p, mo)
-#define atomic_store_explicit(p, v, mo) __atomic_store_n(p, v, mo)
+#define atomic_init(p, v)                  __atomic_store_n(p, v, __ATOMIC_RELAXED)
+#define atomic_load(p)                     __atomic_load_n(p, __ATOMIC_SEQ_CST)
+#define atomic_store(p, v)                 __atomic_store_n(p, v, __ATOMIC_SEQ_CST)
+#define atomic_exchange(p, v)              __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST)
+#define atomic_load_explicit(p, mo)        __atomic_load_n(p, mo)
+#define atomic_store_explicit(p, v, mo)    __atomic_store_n(p, v, mo)
 #define atomic_exchange_explicit(p, v, mo) __atomic_exchange_n(p, v, mo)
 
 #define atomic_compare_exchange_strong(p, expected, desired) \
-        __atomic_compare_exchange_n(p, expected, desired, 0, \
-                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+    __atomic_compare_exchange_n(p, expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
 #define atomic_compare_exchange_weak(p, expected, desired) \
-        __atomic_compare_exchange_n(p, expected, desired, 1, \
-                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+    __atomic_compare_exchange_n(p, expected, desired, 1, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
 #define atomic_compare_exchange_strong_explicit(p, expected, desired, succ, fail) \
-        __atomic_compare_exchange_n(p, expected, desired, 0, succ, fail)
+    __atomic_compare_exchange_n(p, expected, desired, 0, succ, fail)
 #define atomic_compare_exchange_weak_explicit(p, expected, desired, succ, fail) \
-        __atomic_compare_exchange_n(p, expected, desired, 1, succ, fail)
+    __atomic_compare_exchange_n(p, expected, desired, 1, succ, fail)
 
-#define atomic_fetch_add(p, v) \
-        __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST)
-#define atomic_fetch_sub(p, v) \
-        __atomic_fetch_sub(p, v, __ATOMIC_SEQ_CST)
-#define atomic_fetch_or(p, v)  \
-        __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST)
-#define atomic_fetch_xor(p, v) \
-        __atomic_fetch_xor(p, v, __ATOMIC_SEQ_CST)
-#define atomic_fetch_and(p, v) \
-        __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST)
+#define atomic_fetch_add(p, v) __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST)
+#define atomic_fetch_sub(p, v) __atomic_fetch_sub(p, v, __ATOMIC_SEQ_CST)
+#define atomic_fetch_or(p, v)  __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST)
+#define atomic_fetch_xor(p, v) __atomic_fetch_xor(p, v, __ATOMIC_SEQ_CST)
+#define atomic_fetch_and(p, v) __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST)
 
 #define atomic_fetch_add_explicit(p, v, mo) __atomic_fetch_add(p, v, mo)
 #define atomic_fetch_sub_explicit(p, v, mo) __atomic_fetch_sub(p, v, mo)
@@ -147,13 +135,13 @@ typedef struct {
  * Fences (C11 §7.17.4)
  * ==================================================================== */
 
-#define atomic_thread_fence(mo)   __atomic_thread_fence(mo)
-#define atomic_signal_fence(mo)   __atomic_signal_fence(mo)
+#define atomic_thread_fence(mo) __atomic_thread_fence(mo)
+#define atomic_signal_fence(mo) __atomic_signal_fence(mo)
 
 /* ====================================================================
  * Convenience: atomic_var_init (TS 18037 / deprecated in C11)
  * ==================================================================== */
 
-#define ATOMIC_VAR_INIT(v)  (v)
+#define ATOMIC_VAR_INIT(v) (v)
 
 #endif /* LIBC_STDATOMIC_H */

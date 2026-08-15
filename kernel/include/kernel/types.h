@@ -11,18 +11,18 @@
 #include <stdbool.h>
 
 /* Standard type aliases */
-typedef int8_t      i8;
-typedef int16_t     i16;
-typedef int32_t     i32;
-typedef int64_t     i64;
+typedef int8_t  i8;
+typedef int16_t i16;
+typedef int32_t i32;
+typedef int64_t i64;
 
-typedef uint8_t     u8;
-typedef uint16_t    u16;
-typedef uint32_t    u32;
-typedef uint64_t    u64;
+typedef uint8_t  u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
 
-typedef uintptr_t   uptr;
-typedef intptr_t    iptr;
+typedef uintptr_t uptr;
+typedef intptr_t  iptr;
 
 /* Process / Thread identifiers */
 typedef i32 pid_t;
@@ -45,41 +45,41 @@ typedef u32 uid_t;
 typedef u32 gid_t;
 
 /* Superuser (root) has UID 0 */
-#define UID_ROOT        ((uid_t)0)
+#define UID_ROOT ((uid_t)0)
 
 /* Error codes */
 typedef enum {
-        OK              = 0,
-        ERR_NOMEM       = -1,
-        ERR_INVAL       = -2,
-        ERR_NOCAP       = -3,
-        ERR_NOENT       = -4,
-        ERR_BUSY        = -5,
-        ERR_AGAIN       = -6,
-        ERR_FAULT       = -7,
-        ERR_OVERFLOW    = -8,
-        ERR_DENIED      = -9,
-        ERR_INTERRUPTED = -10,  /* blocking wait aborted by a signal kill */
+    OK              = 0,
+    ERR_NOMEM       = -1,
+    ERR_INVAL       = -2,
+    ERR_NOCAP       = -3,
+    ERR_NOENT       = -4,
+    ERR_BUSY        = -5,
+    ERR_AGAIN       = -6,
+    ERR_FAULT       = -7,
+    ERR_OVERFLOW    = -8,
+    ERR_DENIED      = -9,
+    ERR_INTERRUPTED = -10, /* blocking wait aborted by a signal kill */
 } error_t;
 
 /* Memory protection flags */
-#define PROT_NONE       0x00
-#define PROT_READ       0x01
-#define PROT_WRITE      0x02
-#define PROT_EXEC       0x04
+#define PROT_NONE  0x00
+#define PROT_READ  0x01
+#define PROT_WRITE 0x02
+#define PROT_EXEC  0x04
 
 /* Capability rights bitmask */
 typedef u32 rights_t;
-#define RIGHT_READ      (1 << 0)
-#define RIGHT_WRITE     (1 << 1)
-#define RIGHT_EXEC      (1 << 2)
-#define RIGHT_GRANT     (1 << 3)
-#define RIGHT_ALL       (RIGHT_READ | RIGHT_WRITE | RIGHT_EXEC | RIGHT_GRANT)
+#define RIGHT_READ  (1 << 0)
+#define RIGHT_WRITE (1 << 1)
+#define RIGHT_EXEC  (1 << 2)
+#define RIGHT_GRANT (1 << 3)
+#define RIGHT_ALL   (RIGHT_READ | RIGHT_WRITE | RIGHT_EXEC | RIGHT_GRANT)
 
 /* Null handles */
-#define CAP_NULL        ((cap_t)0)
-#define PORT_NULL       ((port_t)0)
-#define PID_NULL        ((pid_t)0)
+#define CAP_NULL  ((cap_t)0)
+#define PORT_NULL ((port_t)0)
+#define PID_NULL  ((pid_t)0)
 
 /* Maximum values */
 /*
@@ -97,16 +97,16 @@ typedef u32 rights_t;
  *   - Cap tables themselves are dynamically allocated (~73 KB each via
  *     pmm_alloc_pages) — ~1 MB total for 14 live processes.
  */
-#define MAX_THREADS     1024
-#define MAX_PORTS       256
-#define MAX_CAPS        1024
-#define MAX_MSG_SIZE    4096
-#define MAX_PATH_LEN    256
+#define MAX_THREADS  1024
+#define MAX_PORTS    256
+#define MAX_CAPS     1024
+#define MAX_MSG_SIZE 4096
+#define MAX_PATH_LEN 256
 
 /* Maximum mutexes a single thread may hold at once (for exit handoff) */
-#define MAX_HELD_MUTEXES    16
+#define MAX_HELD_MUTEXES 16
 
 /* Page size */
-#define PAGE_SIZE       4096UL
+#define PAGE_SIZE 4096UL
 
 #endif /* KERNEL_TYPES_H */

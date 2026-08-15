@@ -292,5 +292,27 @@ debug: iso
 clean:
 	rm -rf build
 
+# --- Code formatting ----------------------------------------------------------
+# clang-format enforces the project style (see .clang-format):
+#   4-space indent, K&R braces, line width <= 100.
+# Excluded: fs_mem_driver.c (frozen), font.h / panic_font.h (generated data).
+format:
+	@echo ">>> Formatting C source files..."
+	@find kernel/ user/ -name '*.c' -o -name '*.h' \
+		| grep -v 'fs_mem_driver.c' \
+		| grep -v 'term/font.h' \
+		| grep -v 'kernel/panic_font.h' \
+		| xargs clang-format -i
+	@echo ">>> Done. Verify with: make iso"
+
+format-check:
+	@echo ">>> Checking formatting..."
+	@find kernel/ user/ -name '*.c' -o -name '*.h' \
+		| grep -v 'fs_mem_driver.c' \
+		| grep -v 'term/font.h' \
+		| grep -v 'kernel/panic_font.h' \
+		| xargs clang-format --dry-run -Werror
+	@echo ">>> All files properly formatted."
+
 # --- Auto-dependency tracking -------------------------------------------------
 -include $(KERNEL_C_OBJ:.o=.d) $(USER_OBJ:.o=.d)

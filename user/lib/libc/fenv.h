@@ -19,10 +19,10 @@
  * (unused under -mno-sse) MXCSR state.  Used by fegetenv/feholdexcept/
  * fesetenv/feupdateenv to save and restore the environment. */
 typedef struct {
-    unsigned short __control;   /* x87 control word */
-    unsigned short __status;    /* x87 status word  */
-    unsigned short __tag;       /* x87 tag word     */
-    unsigned int   __mxcsr;     /* SSE control/status (reserved) */
+    unsigned short __control; /* x87 control word */
+    unsigned short __status;  /* x87 status word  */
+    unsigned short __tag;     /* x87 tag word     */
+    unsigned int   __mxcsr;   /* SSE control/status (reserved) */
 } fenv_t;
 
 /* fexcept_t — represents the floating-point exception flags. */
@@ -34,14 +34,13 @@ typedef int fexcept_t;
  * Bit values correspond to the x87 status word.
  * ==================================================================== */
 
-#define FE_INVALID      0x0001
-#define FE_DIVBYZERO    0x0004
-#define FE_OVERFLOW     0x0008
-#define FE_UNDERFLOW    0x0010
-#define FE_INEXACT      0x0020
+#define FE_INVALID   0x0001
+#define FE_DIVBYZERO 0x0004
+#define FE_OVERFLOW  0x0008
+#define FE_UNDERFLOW 0x0010
+#define FE_INEXACT   0x0020
 
-#define FE_ALL_EXCEPT   (FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW | \
-                         FE_UNDERFLOW | FE_INEXACT)
+#define FE_ALL_EXCEPT (FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW | FE_UNDERFLOW | FE_INEXACT)
 
 /* ====================================================================
  * Rounding mode macros (C11 §7.6.3)
@@ -49,17 +48,17 @@ typedef int fexcept_t;
  * Bit values correspond to bits 10-11 of the x87 control word.
  * ==================================================================== */
 
-#define FE_TONEAREST    0x0000
-#define FE_DOWNWARD     0x0400
-#define FE_UPWARD       0x0800
-#define FE_TOWARDZERO   0x0C00
+#define FE_TONEAREST  0x0000
+#define FE_DOWNWARD   0x0400
+#define FE_UPWARD     0x0800
+#define FE_TOWARDZERO 0x0C00
 
 /* ====================================================================
  * Default environment (C11 §7.6.4)
  * ==================================================================== */
 
 extern const fenv_t __fe_dfl_env;
-#define FE_DFL_ENV      (&__fe_dfl_env)
+#define FE_DFL_ENV (&__fe_dfl_env)
 
 /* ====================================================================
  * Functions — exception flags (C11 §7.6.2.1-7.6.2.5)

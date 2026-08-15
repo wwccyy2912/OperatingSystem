@@ -26,8 +26,7 @@ int fs_delete_item(const char *url, int recursive);
  * access = VFS_ACCESS_* bitmask.  The vfs_server derives the caller's
  * identity from its kernel-issued subject (ipc_recv_from) for the
  * open-time authz gate.  Fills *out_handle on success. */
-int fs_open_item(const char *url, u32 flags, u32 access,
-                 vfs_handle_t *out_handle);
+int fs_open_item(const char *url, u32 flags, u32 access, vfs_handle_t *out_handle);
 
 /* Read up to len bytes at offset into buf; *got receives the actual
  * count (0 = EOF).  buf may be NULL only when len == 0. */
@@ -51,8 +50,7 @@ int fs_enum_next(vfs_handle_t enum_handle, vfs_enum_batch_t *batch);
 int fs_enum_end(vfs_handle_t enum_handle);
 
 /* Volume capacity/usage.  Any out pointer may be NULL. */
-int fs_stat_volume(const char *url, u64 *total_bytes, u64 *used_bytes,
-                   u32 *read_only);
+int fs_stat_volume(const char *url, u64 *total_bytes, u64 *used_bytes, u32 *read_only);
 
 /* Return the caller's kernel-issued subject ID as seen by the vfs
  * server (VFS_OP_WHOAMI proxies SYS_GET_SUBJECT through the trusted
@@ -72,14 +70,17 @@ int fs_whoami(u64 *out_subject);
  * (VFS_BOOKMARK_MAX bytes max).  Fails with VFS_ERR_ACCESS if the
  * access was denied.  The bookmark is bound to the caller's kernel
  * subject (the vfs_server derives it from ipc_recv_from). */
-int fs_create_bookmark(const char *url, u32 access, u64 expiry_ticks,
-                       u8 *out_blob, u32 *out_blob_len);
+int fs_create_bookmark(
+    const char *url, u32 access, u64 expiry_ticks, u8 *out_blob, u32 *out_blob_len);
 
 /* Blob → temporary FileHandle.  The handle is only valid while the
  * bookmark record exists server-side; revoke closes it remotely.
  * Fills handle/item/granted access on success. */
-int fs_resolve_bookmark(const u8 *blob, u32 bk_len, vfs_handle_t *out_handle,
-                                                vfs_item_info_t *out_item, u32 *out_access);
+int fs_resolve_bookmark(const u8        *blob,
+                        u32              bk_len,
+                        vfs_handle_t    *out_handle,
+                        vfs_item_info_t *out_item,
+                        u32             *out_access);
 
 /* Drop the bookmark server-side (idempotent).  After this, resolve
  * fails with VFS_ERR_ACCESS. */
@@ -88,7 +89,9 @@ int fs_revoke_bookmark(const u8 *blob, u32 bk_len);
 /* Move/rename an item.  The itemID stays stable, so bookmarks that
  * reference it remain valid across the move.  new_name = "" or NULL
  * keeps the current name.  Fills *out_item on success. */
-int fs_move_item(const char *src, const char *dst_dir, const char *new_name,
+int fs_move_item(const char      *src,
+                 const char      *dst_dir,
+                 const char      *new_name,
                  vfs_item_info_t *out_item);
 
 #endif /* LIBFS_FS_H */

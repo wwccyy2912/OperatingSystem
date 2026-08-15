@@ -18,8 +18,8 @@
  * sectors is the total number of 512-byte sectors; sector_size is the
  * size of one sector in bytes (512 for virtio-blk). */
 typedef struct {
-        uint64_t sectors;      /* total sectors (512-byte units) */
-        uint64_t sector_size;  /* bytes per sector (512) */
+    uint64_t sectors;     /* total sectors (512-byte units) */
+    uint64_t sector_size; /* bytes per sector (512) */
 } blk_info_t;
 
 #endif /* KERNEL_BLK_H */

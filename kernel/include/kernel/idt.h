@@ -11,9 +11,9 @@
 /**
  * IDT gate descriptor types
  */
-#define IDT_GATE_INTERRUPT     0x0E
-#define IDT_GATE_TRAP          0x0F
-#define IDT_GATE_CALL          0x0C
+#define IDT_GATE_INTERRUPT 0x0E
+#define IDT_GATE_TRAP      0x0F
+#define IDT_GATE_CALL      0x0C
 
 /**
  * Interrupt frame passed to exception/IRQ handlers.
@@ -24,20 +24,20 @@
  * interrupt frame (IRETQ).
  */
 typedef struct {
-        /* GPRs saved by isr_common_stub (bottom of frame) */
-        u64 r15, r14, r13, r12, r11, r10, r9, r8;
-        u64 rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    /* GPRs saved by isr_common_stub (bottom of frame) */
+    u64 r15, r14, r13, r12, r11, r10, r9, r8;
+    u64 rbp, rdi, rsi, rdx, rcx, rbx, rax;
 
-        /* Pseudo-values pushed by individual ISR stubs */
-        u64 vector;
-        u64 error_code;
+    /* Pseudo-values pushed by individual ISR stubs */
+    u64 vector;
+    u64 error_code;
 
-        /* Frame pushed by CPU on interrupt/exception */
-        u64 rip;
-        u64 cs;
-        u64 rflags;
-        u64 rsp;    /* only valid on privilege-level change */
-        u64 ss;     /* only valid on privilege-level change */
+    /* Frame pushed by CPU on interrupt/exception */
+    u64 rip;
+    u64 cs;
+    u64 rflags;
+    u64 rsp; /* only valid on privilege-level change */
+    u64 ss;  /* only valid on privilege-level change */
 } __attribute__((packed)) interrupt_frame_t;
 
 /**

@@ -24,36 +24,35 @@
 #include <libos/syscalls.h>
 #include <libpkg/pkg.h>
 
-int main(void)
-{
-        int r = pkg_ready();
-        printf("sbox_demo: pkg_ready() = %d\n", r);
-        sleep(50);
+int main(void) {
+    int r = pkg_ready();
+    printf("sbox_demo: pkg_ready() = %d\n", r);
+    sleep(50);
 
-        /* A valid wall-clock value (2026). */
-        rtc_time_t t;
-        t.year = 2026;
-        t.month = 8;
-        t.day = 15;
-        t.hour = 12;
-        t.minute = 0;
-        t.second = 0;
+    /* A valid wall-clock value (2026). */
+    rtc_time_t t;
+    t.year   = 2026;
+    t.month  = 8;
+    t.day    = 15;
+    t.hour   = 12;
+    t.minute = 0;
+    t.second = 0;
 
-        int ret = os_set_time(&t);
-        if (ret == 0)
-                printf("set_time OK\n");
-        else if (ret == ERR_NOCAP)
-                printf("set_time DENIED (no permission)\n");
-        else
-                printf("set_time failed: %d\n", ret);
-        sleep(50);
+    int ret = os_set_time(&t);
+    if (ret == 0)
+        printf("set_time OK\n");
+    else if (ret == ERR_NOCAP)
+        printf("set_time DENIED (no permission)\n");
+    else
+        printf("set_time failed: %d\n", ret);
+    sleep(50);
 
-        /* Self-grant attempt: cap_create_atom is gated on
-         * ATOM_CAP_GRANT_SELF (docs/ops_format.md §6), which no app can
-         * declare or hold — this must return ERR_NOCAP. */
-        int h = cap_create_atom(ATOM_SYS_SET_TIME, RIGHT_ALL, 0, 0, 0);
-        printf("self-grant attempt = %d (expect ERR_NOCAP)\n", h);
-        sleep(50);
+    /* Self-grant attempt: cap_create_atom is gated on
+     * ATOM_CAP_GRANT_SELF (docs/ops_format.md §6), which no app can
+     * declare or hold — this must return ERR_NOCAP. */
+    int h = cap_create_atom(ATOM_SYS_SET_TIME, RIGHT_ALL, 0, 0, 0);
+    printf("self-grant attempt = %d (expect ERR_NOCAP)\n", h);
+    sleep(50);
 
-        return 0;
+    return 0;
 }

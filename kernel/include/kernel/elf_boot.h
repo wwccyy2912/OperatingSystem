@@ -21,53 +21,53 @@
 #include <kernel/vmm.h>
 
 /* ---- ELF Magic ---- */
-#define EI_NIDENT       16
+#define EI_NIDENT 16
 
-#define ELFMAG0         0x7F
-#define ELFMAG1         'E'
-#define ELFMAG2         'L'
-#define ELFMAG3         'F'
+#define ELFMAG0 0x7F
+#define ELFMAG1 'E'
+#define ELFMAG2 'L'
+#define ELFMAG3 'F'
 
 /* ---- ELF class and data encoding ---- */
-#define ELFCLASS64      2
-#define ELFDATA2LSB     1       /* Little-endian */
+#define ELFCLASS64  2
+#define ELFDATA2LSB 1 /* Little-endian */
 
 /* ---- Program header types ---- */
-#define PT_LOAD         1       /* Loadable segment */
+#define PT_LOAD 1 /* Loadable segment */
 
 /* ---- Program header flags ---- */
-#define PF_X            0x1     /* Execute */
-#define PF_W            0x2     /* Write */
-#define PF_R            0x4     /* Read */
+#define PF_X 0x1 /* Execute */
+#define PF_W 0x2 /* Write */
+#define PF_R 0x4 /* Read */
 
 /* ---- ELF64 header ---- */
 typedef struct {
-        u8      e_ident[EI_NIDENT]; /* ELF identification */
-        u16     e_type;             /* Object file type */
-        u16     e_machine;          /* Architecture */
-        u32     e_version;          /* Object file version */
-        u64     e_entry;            /* Entry point virtual address */
-        u64     e_phoff;            /* Program header table offset */
-        u64     e_shoff;            /* Section header table offset */
-        u32     e_flags;            /* Processor-specific flags */
-        u16     e_ehsize;           /* ELF header size */
-        u16     e_phentsize;        /* Program header entry size */
-        u16     e_phnum;            /* Number of program header entries */
-        u16     e_shentsize;        /* Section header entry size */
-        u16     e_shnum;            /* Number of section header entries */
-        u16     e_shstrndx;         /* Section name string table index */
+    u8  e_ident[EI_NIDENT]; /* ELF identification */
+    u16 e_type;             /* Object file type */
+    u16 e_machine;          /* Architecture */
+    u32 e_version;          /* Object file version */
+    u64 e_entry;            /* Entry point virtual address */
+    u64 e_phoff;            /* Program header table offset */
+    u64 e_shoff;            /* Section header table offset */
+    u32 e_flags;            /* Processor-specific flags */
+    u16 e_ehsize;           /* ELF header size */
+    u16 e_phentsize;        /* Program header entry size */
+    u16 e_phnum;            /* Number of program header entries */
+    u16 e_shentsize;        /* Section header entry size */
+    u16 e_shnum;            /* Number of section header entries */
+    u16 e_shstrndx;         /* Section name string table index */
 } Elf64_Ehdr;
 
 /* ---- ELF64 program header ---- */
 typedef struct {
-        u32     p_type;             /* Segment type */
-        u32     p_flags;            /* Segment flags */
-        u64     p_offset;           /* Offset in file */
-        u64     p_vaddr;            /* Virtual address */
-        u64     p_paddr;            /* Physical address */
-        u64     p_filesz;           /* Size in file */
-        u64     p_memsz;            /* Size in memory */
-        u64     p_align;            /* Alignment */
+    u32 p_type;   /* Segment type */
+    u32 p_flags;  /* Segment flags */
+    u64 p_offset; /* Offset in file */
+    u64 p_vaddr;  /* Virtual address */
+    u64 p_paddr;  /* Physical address */
+    u64 p_filesz; /* Size in file */
+    u64 p_memsz;  /* Size in memory */
+    u64 p_align;  /* Alignment */
 } Elf64_Phdr;
 
 /**
@@ -85,7 +85,6 @@ typedef struct {
  * @return OK on success, ERR_INVAL on malformed ELF, ERR_NOMEM on
  *         allocation failure.
  */
-int elf_boot_load(addr_space_t *as, const void *elf_data, u64 elf_size,
-                                    u64 *entry_out);
+int elf_boot_load(addr_space_t *as, const void *elf_data, u64 elf_size, u64 *entry_out);
 
 #endif /* KERNEL_ELF_BOOT_H */

@@ -28,17 +28,15 @@
 #include <kernel/types.h>
 
 /** Default root credentials (uid=0, gid=0). */
-#define CRED_ROOT_VAL(_uid) \
-        { .uid = (_uid), .euid = (_uid), .suid = (_uid), \
-            .gid = 0, .egid = 0 }
+#define CRED_ROOT_VAL(_uid) {.uid = (_uid), .euid = (_uid), .suid = (_uid), .gid = 0, .egid = 0}
 
 /** Per-process credentials. */
 typedef struct cred {
-        uid_t   uid;        /* Real user ID        (POSIX: getuid)  */
-        uid_t   euid;       /* Effective user ID   (POSIX: geteuid) */
-        uid_t   suid;       /* Saved set-user-ID                     */
-        gid_t   gid;        /* Real group ID       (POSIX: getgid)  */
-        gid_t   egid;       /* Effective group ID  (POSIX: getegid) */
+    uid_t uid;  /* Real user ID        (POSIX: getuid)  */
+    uid_t euid; /* Effective user ID   (POSIX: geteuid) */
+    uid_t suid; /* Saved set-user-ID                     */
+    gid_t gid;  /* Real group ID       (POSIX: getgid)  */
+    gid_t egid; /* Effective group ID  (POSIX: getegid) */
 } cred_t;
 
 /**
@@ -62,9 +60,8 @@ void cred_destroy(cred_t *cred);
  * Check whether a given EUID is privileged (root).
  * In POSIX, uid 0 bypasses all permission checks.
  */
-static inline bool cred_is_root(uid_t euid)
-{
-        return euid == UID_ROOT;
+static inline bool cred_is_root(uid_t euid) {
+    return euid == UID_ROOT;
 }
 
 #endif /* KERNEL_CRED_H */

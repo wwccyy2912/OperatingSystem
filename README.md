@@ -1,8 +1,10 @@
 # OpSys
 
-**x86_64 微内核操作系统** — C11 + NASM，无 libc，自有 runtime。
+**x86_64 微内核操作系统**
 
 OpSys 是一个从零开始的 64 位微内核操作系统项目，采用「机制在内核、策略在用户态」的设计哲学。内核仅保留调度、内存管理、IPC、能力校验等最小机制；全部设备驱动与服务（串口、键盘、终端、VFS、权限管理、设备管理、包管理等）运行在 Ring 3 用户态，通过同步 IPC 消息传递协作。
+
+**注：本项目完全使用AI生成**
 
 ## 目录
 
@@ -150,15 +152,15 @@ OpSys/
 
 ## 环境依赖
 
-| 工具 | 用途 | 安装示例 |
-|------|------|----------|
-| **GCC**（支持 C11） | 编译 C 源码 | `apt install gcc` |
-| **NASM** | 汇编 .asm/.S 文件 | `apt install nasm` |
+| 工具                 | 用途               | 安装示例                        |
+| -------------------- | ------------------ | ------------------------------- |
+| **GCC**（支持 C11）  | 编译 C 源码        | `apt install gcc`               |
+| **NASM**             | 汇编 .asm/.S 文件  | `apt install nasm`              |
 | **ld** 或 **ld.lld** | 链接内核与用户 ELF | `apt install binutils` 或 `lld` |
-| **GRUB2** | 生成可引导 ISO | `apt install grub2-tools` |
-| **QEMU**（x86_64） | 运行与测试 | `apt install qemu-system-x86` |
-| **GDB**（可选） | 内核调试 | `apt install gdb` |
-| **Python 3**（可选） | 验收测试与打包脚本 | `apt install python3` |
+| **GRUB2**            | 生成可引导 ISO     | `apt install grub2-tools`       |
+| **QEMU**（x86_64）   | 运行与测试         | `apt install qemu-system-x86`   |
+| **GDB**（可选）      | 内核调试           | `apt install gdb`               |
+| **Python 3**（可选） | 验收测试与打包脚本 | `apt install python3`           |
 
 ---
 
@@ -185,6 +187,7 @@ make init_user
 ```
 
 构建产物：
+
 - `kernel.elf` — 内核 ELF（含嵌入的服务 blob）
 - `build/opsos.iso` — GRUB 引导的 ISO 镜像
 - `build/user/services/*.elf` — 各用户服务独立 ELF
@@ -215,19 +218,19 @@ QEMU 参数：`-nographic -serial mon:stdio`（串口输出即终端），virtio
 
 系统启动后进入 shell，支持以下命令（节选）：
 
-| 命令 | 说明 |
-|------|------|
-| `vfs_ls <url>` | 列出目录内容（如 `vfs_ls /Volumes/System/`） |
-| `vfs_cat <url>` | 查看文件内容 |
-| `vfs_write <url> <text>` | 写入文件（首次写磁盘卷触发 Powerbox 授权） |
-| `vfs_stat <url>` | 查看卷/文件信息 |
-| `bm_create <url> <r\|w>` | 创建书签 |
-| `bm_resolve` | 解析书签 |
-| `perm_answer <id> <y\|n>` | 响应 Powerbox 权限询问 |
-| `perm_revoke` | 撤销权限 |
-| `pkg install <name>` | 安装应用 |
-| `pkg list` | 列出已安装应用 |
-| `pkg run <app_id>` | 运行应用 |
+| 命令                      | 说明                                         |
+| ------------------------- | -------------------------------------------- |
+| `vfs_ls <url>`            | 列出目录内容（如 `vfs_ls /Volumes/System/`） |
+| `vfs_cat <url>`           | 查看文件内容                                 |
+| `vfs_write <url> <text>`  | 写入文件（首次写磁盘卷触发 Powerbox 授权）   |
+| `vfs_stat <url>`          | 查看卷/文件信息                              |
+| `bm_create <url> <r\|w>`  | 创建书签                                     |
+| `bm_resolve`              | 解析书签                                     |
+| `perm_answer <id> <y\|n>` | 响应 Powerbox 权限询问                       |
+| `perm_revoke`             | 撤销权限                                     |
+| `pkg install <name>`      | 安装应用                                     |
+| `pkg list`                | 列出已安装应用                               |
+| `pkg run <app_id>`        | 运行应用                                     |
 
 ### Powerbox 授权流程
 
@@ -326,6 +329,7 @@ make format-check  # 检查格式是否合规（CI 用）
 ```
 
 排除文件（不可格式化）：
+
 - `user/services/vfs/fs_mem_driver.c` — 项目规则冻结
 - `user/services/term/font.h` — 生成的字体位图数据
 - `kernel/include/kernel/panic_font.h` — 生成的字体位图数据
@@ -344,12 +348,12 @@ make format-check  # 检查格式是否合规（CI 用）
 
 本项目采用多组件许可证模型，各组件的许可证独立适用：
 
-| 组件 | 许可证 | LICENSE 文件位置 | 适用范围 |
-|------|--------|------------------|----------|
-| **Kernel** | [GPLv3](https://www.gnu.org/licenses/gpl-3.0.html) | [kernel/LICENSE](kernel/LICENSE) | `kernel/` 目录全部代码 |
-| **User Services** | [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0) | [user/services/LICENSE](user/services/LICENSE) | `user/services/` 目录全部服务 |
-| **SDK / libc / Runtime** | [MIT](https://opensource.org/licenses/MIT) | [user/lib/LICENSE](user/lib/LICENSE)、[user/runtime/LICENSE](user/runtime/LICENSE) | `user/lib/` 与 `user/runtime/` 全部库与运行时 |
-| **Documentation** | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) | [docs/LICENSE](docs/LICENSE) | `docs/` 目录全部文档 |
+| 组件                     | 许可证                                                    | LICENSE 文件位置                                                                   | 适用范围                                      |
+| ------------------------ | --------------------------------------------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------- |
+| **Kernel**               | [GPLv3](https://www.gnu.org/licenses/gpl-3.0.html)        | [kernel/LICENSE](kernel/LICENSE)                                                   | `kernel/` 目录全部代码                        |
+| **User Services**        | [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0) | [user/services/LICENSE](user/services/LICENSE)                                     | `user/services/` 目录全部服务                 |
+| **SDK / libc / Runtime** | [MIT](https://opensource.org/licenses/MIT)                | [user/lib/LICENSE](user/lib/LICENSE)、[user/runtime/LICENSE](user/runtime/LICENSE) | `user/lib/` 与 `user/runtime/` 全部库与运行时 |
+| **Documentation**        | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) | [docs/LICENSE](docs/LICENSE)                                                       | `docs/` 目录全部文档                          |
 
 > 引用或分发时，请严格遵守各组件对应的许可证条款。GPLv3 的传染性仅及于内核组件；用户态服务、SDK 与文档可独立使用。
 
@@ -357,14 +361,24 @@ make format-check  # 检查格式是否合规（CI 用）
 
 ## 里程碑
 
-| 版本 | 内容 | 状态 |
-|------|------|------|
-| v0.1 | 内核 + init + 串口 + IPC | 已完成 |
-| v0.2 | 能力系统 + 权限模型（P0/P1/P2） | 已完成 |
+| 版本            | 内容                                             | 状态   |
+| --------------- | ------------------------------------------------ | ------ |
+| v0.1            | 内核 + init + 串口 + IPC                         | 已完成 |
+| v0.2            | 能力系统 + 权限模型（P0/P1/P2）                  | 已完成 |
 | VFS Phase 0/1/2 | 对象模型 + 内存卷 + virtio-blk + 书签 + Powerbox | 已完成 |
-| v0.3 | 包管理器 + .ops 沙盒应用 | 进行中 |
-| v0.4 | 图形 + 窗口管理器 | 规划 |
-| v0.5 | 音频 + 网络 | 规划 |
-| v1.0 | 稳定版（多核、性能优化、文档齐全） | 规划 |
+| v0.3            | 包管理器 + .ops 沙盒应用                         | 进行中 |
+| v0.4            | 图形 + 窗口管理器                                | 规划   |
+| v0.5            | 音频 + 网络                                      | 规划   |
+| v1.0            | 稳定版（多核、性能优化、文档齐全）               | 规划   |
 
 详细路线图见 [docs/kernel_roadmap.md](docs/kernel_roadmap.md) 与 [docs/requirements.md](docs/requirements.md)。
+
+### 特别鸣谢
+
+**1.OpenCode ——本项目所有源代码由此工具编写**
+
+**2.DeepSeek ——本项目关键模块架构由它提供思路**
+
+**3.ChatGpt ——本项目修改建议由它提供思路**
+
+**4.Trae ——本项目的部分代码格式整理由他完成**

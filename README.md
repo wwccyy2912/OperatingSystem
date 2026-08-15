@@ -152,15 +152,13 @@ OpSys/
 
 | 工具 | 用途 | 安装示例 |
 |------|------|----------|
-| **GCC**（支持 C11） | 编译 C 源码 | `dnf install gcc` |
-| **NASM** | 汇编 .asm/.S 文件 | `dnf install nasm` |
-| **ld** 或 **ld.lld** | 链接内核与用户 ELF | `dnf install binutils` 或 `lld` |
-| **GRUB2** | 生成可引导 ISO | `dnf install grub2-tools` |
-| **QEMU**（x86_64） | 运行与测试 | `dnf install qemu-system-x86` |
-| **GDB**（可选） | 内核调试 | `dnf install gdb` |
-| **Python 3**（可选） | 验收测试与打包脚本 | `dnf install python3` |
-
-构建纪律：**必须 0 新警告**（`-Wall -Wextra -O2`，警告即失败）。
+| **GCC**（支持 C11） | 编译 C 源码 | `apt install gcc` |
+| **NASM** | 汇编 .asm/.S 文件 | `apt install nasm` |
+| **ld** 或 **ld.lld** | 链接内核与用户 ELF | `apt install binutils` 或 `lld` |
+| **GRUB2** | 生成可引导 ISO | `apt install grub2-tools` |
+| **QEMU**（x86_64） | 运行与测试 | `apt install qemu-system-x86` |
+| **GDB**（可选） | 内核调试 | `apt install gdb` |
+| **Python 3**（可选） | 验收测试与打包脚本 | `apt install python3` |
 
 ---
 

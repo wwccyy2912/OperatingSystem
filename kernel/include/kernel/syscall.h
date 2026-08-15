@@ -18,11 +18,11 @@
  * implemented slots, which stay NULL in the table and are rejected
  * with ERR_INVAL).  Must equal last defined SYS_ + 1.
  */
-#define SYS_COUNT  (SYS_CAP_REVOKE_BY_ATOM + 1)
+#define SYS_COUNT  (SYS_CAP_HAS_ATOM + 1)
 
 /* System call result passed in RAX */
 typedef struct {
-    i64    value;   /* Result or negative error code */
+        i64    value;   /* Result or negative error code */
 } syscall_result_t;
 
 /**

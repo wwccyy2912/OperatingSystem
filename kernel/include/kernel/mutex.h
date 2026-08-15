@@ -28,10 +28,10 @@
 
 /* Kernel mutex object (static table entry) */
 typedef struct mutex {
-    u32         mutex_id;    /* Handle (index + 1) */
-    tid_t       owner_tid;   /* Owning thread, -1 when free */
-    thread_t   *wait_queue;  /* FIFO queue of blocked waiters */
-    bool        in_use;
+        u32         mutex_id;    /* Handle (index + 1) */
+        tid_t       owner_tid;   /* Owning thread, -1 when free */
+        thread_t   *wait_queue;  /* FIFO queue of blocked waiters */
+        bool        in_use;
 } mutex_t;
 
 /**

@@ -19,9 +19,9 @@
 #define IRQ_BINDING_MAX     16   /* PIC IRQ lines 0-15 */
 
 typedef struct {
-    tid_t   tid;        /* Owner thread */
-    u32     mask;       /* Notification bits delivered per event */
-    bool    active;     /* Binding in effect */
+        tid_t   tid;        /* Owner thread */
+        u32     mask;       /* Notification bits delivered per event */
+        bool    active;     /* Binding in effect */
 } irq_binding_t;
 
 static irq_binding_t s_irq_bindings[IRQ_BINDING_MAX];
@@ -32,23 +32,23 @@ static irq_binding_t s_irq_bindings[IRQ_BINDING_MAX];
  */
 error_t irq_bind(u8 irq, u32 mask)
 {
-    if (irq >= IRQ_BINDING_MAX)
-        return ERR_INVAL;
+        if (irq >= IRQ_BINDING_MAX)
+                return ERR_INVAL;
 
-    /* Kernel-reserved lines: IRQ0 = timer, IRQ2 = PIC cascade */
-    if (irq == 0 || irq == 2)
-        return ERR_DENIED;
+        /* Kernel-reserved lines: IRQ0 = timer, IRQ2 = PIC cascade */
+        if (irq == 0 || irq == 2)
+                return ERR_DENIED;
 
-    thread_t *cur = thread_current();
-    if (!cur)
-        return ERR_FAULT;
+        thread_t *cur = thread_current();
+        if (!cur)
+                return ERR_FAULT;
 
-    s_irq_bindings[irq].tid    = cur->tid;
-    s_irq_bindings[irq].mask   = mask;
-    s_irq_bindings[irq].active = true;
+        s_irq_bindings[irq].tid    = cur->tid;
+        s_irq_bindings[irq].mask   = mask;
+        s_irq_bindings[irq].active = true;
 
-    irq_enable(irq);
-    return OK;
+        irq_enable(irq);
+        return OK;
 }
 
 /*
@@ -57,14 +57,14 @@ error_t irq_bind(u8 irq, u32 mask)
  */
 error_t irq_unbind(u8 irq)
 {
-    if (irq >= IRQ_BINDING_MAX)
-        return ERR_INVAL;
+        if (irq >= IRQ_BINDING_MAX)
+                return ERR_INVAL;
 
-    if (s_irq_bindings[irq].active) {
-        s_irq_bindings[irq].active = false;
-        irq_disable(irq);
-    }
-    return OK;
+        if (s_irq_bindings[irq].active) {
+                s_irq_bindings[irq].active = false;
+                irq_disable(irq);
+        }
+        return OK;
 }
 
 /*
@@ -74,17 +74,17 @@ error_t irq_unbind(u8 irq)
  */
 bool irq_handle(u8 irq)
 {
-    if (irq >= IRQ_BINDING_MAX)
-        return false;
-    if (!s_irq_bindings[irq].active)
-        return false;
+        if (irq >= IRQ_BINDING_MAX)
+                return false;
+        if (!s_irq_bindings[irq].active)
+                return false;
 
-    error_t err = notify(s_irq_bindings[irq].tid, s_irq_bindings[irq].mask);
+        error_t err = notify(s_irq_bindings[irq].tid, s_irq_bindings[irq].mask);
 
-    /* Bound thread died: self-heal — clear the binding, disable the IRQ */
-    if (err == ERR_NOENT) {
-        s_irq_bindings[irq].active = false;
-        irq_disable(irq);
-    }
-    return true;
+        /* Bound thread died: self-heal — clear the binding, disable the IRQ */
+        if (err == ERR_NOENT) {
+                s_irq_bindings[irq].active = false;
+                irq_disable(irq);
+        }
+        return true;
 }

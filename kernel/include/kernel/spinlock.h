@@ -21,25 +21,25 @@
 #include <kernel/types.h>
 
 typedef struct {
-    volatile bool locked;
-    u64 saved_rflags;
+        volatile bool locked;
+        u64 saved_rflags;
 } spinlock_t;
 
 #define SPINLOCK_INIT { .locked = false, .saved_rflags = 0 }
 
 static inline void spin_lock(spinlock_t *l)
 {
-    u64 rflags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
-    l->saved_rflags = rflags;
-    l->locked = true;
+        u64 rflags;
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+        l->saved_rflags = rflags;
+        l->locked = true;
 }
 
 static inline void spin_unlock(spinlock_t *l)
 {
-    l->locked = false;
-    if (l->saved_rflags & 0x200)          /* IF was set before cli */
-        __asm__ volatile("sti" ::: "memory");
+        l->locked = false;
+        if (l->saved_rflags & 0x200)          /* IF was set before cli */
+                __asm__ volatile("sti" ::: "memory");
 }
 
 #endif /* KERNEL_SPINLOCK_H */

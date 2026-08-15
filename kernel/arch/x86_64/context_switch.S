@@ -31,8 +31,8 @@ default rel
 section .text
 
 section .data
-    global s_enter_user_temp_rsp
-    s_enter_user_temp_rsp: dq 0
+        global s_enter_user_temp_rsp
+        s_enter_user_temp_rsp: dq 0
 
 section .text
 
@@ -66,83 +66,83 @@ section .text
 ; ------------------------------------------------------------------
 global context_switch
 context_switch:
-    cli
+        cli
 
-    ; Save callee-saved registers of prev thread
-    ;
-    ; Save RSP *before* the call pushed the return address.  The `call
-    ; context_switch` instruction pushes 8 bytes (the return address) onto
-    ; the stack, so rsp at entry here is 8 bytes below the caller's
-    ; pre-call rsp.  The IRETQ transfer below loads RSP from the frame
-    ; field, so the saved value must be the caller's pre-call rsp
-    ; (rsp + 8), matching the caller's frame layout on resume.  If we
-    ; saved the post-call rsp, the restored thread's epilogue would pop
-    ; from 8 bytes too low, reading a local variable instead of the return
-    ; address -> #PF at a user address (the old bug: CR2=0x40223e).
-    lea rax, [rsp + 8]
-    mov [rdi + RSP_OFFSET], rax
-    mov [rdi + RBX_OFFSET], rbx
-    mov [rdi + RBP_OFFSET], rbp
-    mov [rdi + R12_OFFSET], r12
-    mov [rdi + R13_OFFSET], r13
-    mov [rdi + R14_OFFSET], r14
-    mov [rdi + R15_OFFSET], r15
+        ; Save callee-saved registers of prev thread
+        ;
+        ; Save RSP *before* the call pushed the return address.  The `call
+        ; context_switch` instruction pushes 8 bytes (the return address) onto
+        ; the stack, so rsp at entry here is 8 bytes below the caller's
+        ; pre-call rsp.  The IRETQ transfer below loads RSP from the frame
+        ; field, so the saved value must be the caller's pre-call rsp
+        ; (rsp + 8), matching the caller's frame layout on resume.  If we
+        ; saved the post-call rsp, the restored thread's epilogue would pop
+        ; from 8 bytes too low, reading a local variable instead of the return
+        ; address -> #PF at a user address (the old bug: CR2=0x40223e).
+        lea rax, [rsp + 8]
+        mov [rdi + RSP_OFFSET], rax
+        mov [rdi + RBX_OFFSET], rbx
+        mov [rdi + RBP_OFFSET], rbp
+        mov [rdi + R12_OFFSET], r12
+        mov [rdi + R13_OFFSET], r13
+        mov [rdi + R14_OFFSET], r14
+        mov [rdi + R15_OFFSET], r15
 
-    ; prev->rflags = (resume_if << 9) | 0x2
-    ;   resume_if=0 -> 0x2   (IF=0: resume into the ISR return chain)
-    ;   resume_if=1 -> 0x202 (IF=1: resume directly at the continuation)
-    ; The other flag bits are irrelevant: C code recomputes them, and a
-    ; preempted thread's true flags live in the ISR frame for its iretq.
-    mov eax, edx
-    shl rax, 9
-    or  rax, 0x2
-    mov [rdi + RFLAGS_OFFSET], rax
+        ; prev->rflags = (resume_if << 9) | 0x2
+        ;   resume_if=0 -> 0x2   (IF=0: resume into the ISR return chain)
+        ;   resume_if=1 -> 0x202 (IF=1: resume directly at the continuation)
+        ; The other flag bits are irrelevant: C code recomputes them, and a
+        ; preempted thread's true flags live in the ISR frame for its iretq.
+        mov eax, edx
+        shl rax, 9
+        or  rax, 0x2
+        mov [rdi + RFLAGS_OFFSET], rax
 
-    ; Save the return address (where we'll return to after switch)
-    pop rax
-    mov [rdi + RIP_OFFSET], rax
+        ; Save the return address (where we'll return to after switch)
+        pop rax
+        mov [rdi + RIP_OFFSET], rax
 
-    ; ---------------------------------------------------------------
-    ; Switch address space if needed
-    ; ---------------------------------------------------------------
-    mov rax, [rdi + ADDR_SPACE_OFFSET]   ; prev->addr_space
-    mov rcx, [rsi + ADDR_SPACE_OFFSET]   ; next->addr_space
-    cmp rax, rcx
-    je .load_next
+        ; ---------------------------------------------------------------
+        ; Switch address space if needed
+        ; ---------------------------------------------------------------
+        mov rax, [rdi + ADDR_SPACE_OFFSET]   ; prev->addr_space
+        mov rcx, [rsi + ADDR_SPACE_OFFSET]   ; next->addr_space
+        cmp rax, rcx
+        je .load_next
 
-    ; If next->addr_space is NULL, skip CR3 load (kernel thread)
-    test rcx, rcx
-    jz .load_next
+        ; If next->addr_space is NULL, skip CR3 load (kernel thread)
+        test rcx, rcx
+        jz .load_next
 
-    ; Load CR3 from next address space (pml4_phys at offset 0)
-    mov rax, [rcx]
-    mov cr3, rax
+        ; Load CR3 from next address space (pml4_phys at offset 0)
+        mov rax, [rcx]
+        mov cr3, rax
 
 .load_next:
-    ; Load callee-saved registers of next thread (IF=0 throughout)
-    mov rbx, [rsi + RBX_OFFSET]
-    mov rbp, [rsi + RBP_OFFSET]
-    mov r12, [rsi + R12_OFFSET]
-    mov r13, [rsi + R13_OFFSET]
-    mov r14, [rsi + R14_OFFSET]
-    mov r15, [rsi + R15_OFFSET]
+        ; Load callee-saved registers of next thread (IF=0 throughout)
+        mov rbx, [rsi + RBX_OFFSET]
+        mov rbp, [rsi + RBP_OFFSET]
+        mov r12, [rsi + R12_OFFSET]
+        mov r13, [rsi + R13_OFFSET]
+        mov r14, [rsi + R14_OFFSET]
+        mov r15, [rsi + R15_OFFSET]
 
-    ; Final transfer: build an IRETQ frame on the (abandoned) prev stack
-    ; and let IRETQ perform the switch atomically.  IRETQ pops, in order:
-    ; RIP, CS, RFLAGS, RSP, SS — so push them in reverse order.  The
-    ; frame is dead data once IRETQ runs (prev resumes at its saved RSP,
-    ; above this frame).  Selectors: GDT_SEL_KCODE=0x08, GDT_SEL_KDATA=0x10.
-    mov rax, 0x10               ; kernel SS
-    push rax
-    mov rax, [rsi + RSP_OFFSET]
-    push rax
-    mov rax, [rsi + RFLAGS_OFFSET]
-    push rax
-    mov rax, 0x08               ; kernel CS
-    push rax
-    mov rax, [rsi + RIP_OFFSET]
-    push rax
-    iretq
+        ; Final transfer: build an IRETQ frame on the (abandoned) prev stack
+        ; and let IRETQ perform the switch atomically.  IRETQ pops, in order:
+        ; RIP, CS, RFLAGS, RSP, SS — so push them in reverse order.  The
+        ; frame is dead data once IRETQ runs (prev resumes at its saved RSP,
+        ; above this frame).  Selectors: GDT_SEL_KCODE=0x08, GDT_SEL_KDATA=0x10.
+        mov rax, 0x10               ; kernel SS
+        push rax
+        mov rax, [rsi + RSP_OFFSET]
+        push rax
+        mov rax, [rsi + RFLAGS_OFFSET]
+        push rax
+        mov rax, 0x08               ; kernel CS
+        push rax
+        mov rax, [rsi + RIP_OFFSET]
+        push rax
+        iretq
 
 ; ------------------------------------------------------------------
 ; void context_switch_to_user(u64 rip, u64 rsp, u64 rflags,
@@ -159,17 +159,17 @@ context_switch:
 ; ------------------------------------------------------------------
 global context_switch_to_user
 context_switch_to_user:
-    ; Disable interrupts until IRETQ restores RFLAGS
-    cli
+        ; Disable interrupts until IRETQ restores RFLAGS
+        cli
 
-    ; Build IRETQ frame (pushed in reverse order of IRETQ popping)
-    push r8         ; SS   (user stack segment)
-    push rsi        ; RSP  (user stack pointer)
-    push rdx        ; RFLAGS
-    push rcx        ; CS   (user code segment)
-    push rdi        ; RIP  (user instruction pointer)
+        ; Build IRETQ frame (pushed in reverse order of IRETQ popping)
+        push r8         ; SS   (user stack segment)
+        push rsi        ; RSP  (user stack pointer)
+        push rdx        ; RFLAGS
+        push rcx        ; CS   (user code segment)
+        push rdi        ; RIP  (user instruction pointer)
 
-    iretq
+        iretq
 
 ; ------------------------------------------------------------------
 ; void enter_user_mode(u64 rip, u64 user_rsp, u64 rflags,
@@ -199,21 +199,21 @@ extern s_enter_user_temp_rsp
 
 global enter_user_mode
 enter_user_mode:
-    cli
+        cli
 
-    ; Load temp_rsp from global (higher-half address, accessible from
-    ; both kernel and user page tables since PML4[256..511] is shared).
-    lea rax, [rel s_enter_user_temp_rsp]
-    mov rsp, [rax]
+        ; Load temp_rsp from global (higher-half address, accessible from
+        ; both kernel and user page tables since PML4[256..511] is shared).
+        lea rax, [rel s_enter_user_temp_rsp]
+        mov rsp, [rax]
 
-    ; Switch to user page tables
-    mov cr3, r9
+        ; Switch to user page tables
+        mov cr3, r9
 
-    ; Build IRETQ frame (pushed in reverse order of IRETQ popping)
-    push r8         ; SS   (user stack segment)
-    push rsi        ; RSP  (user stack pointer)
-    push rdx        ; RFLAGS
-    push rcx        ; CS   (user code segment)
-    push rdi        ; RIP  (user instruction pointer)
+        ; Build IRETQ frame (pushed in reverse order of IRETQ popping)
+        push r8         ; SS   (user stack segment)
+        push rsi        ; RSP  (user stack pointer)
+        push rdx        ; RFLAGS
+        push rcx        ; CS   (user code segment)
+        push rdi        ; RIP  (user instruction pointer)
 
-    iretq
+        iretq

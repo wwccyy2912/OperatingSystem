@@ -31,40 +31,40 @@
 
 /* Tag structure layout */
 typedef struct {
-    u32 type;
-    u32 size;
+        u32 type;
+        u32 size;
 } mboot2_tag_t;
 
 /* Memory map entry */
 typedef struct {
-    u64 base_addr;
-    u64 length;
-    u32 type;
-    u32 reserved;
+        u64 base_addr;
+        u64 length;
+        u32 type;
+        u32 reserved;
 } mboot2_mmap_entry_t;
 
 /* Memory map tag */
 typedef struct {
-    u32 entry_size;
-    u32 entry_version;
-    /* Followed by array of mboot2_mmap_entry_t */
+        u32 entry_size;
+        u32 entry_version;
+        /* Followed by array of mboot2_mmap_entry_t */
 } mboot2_mmap_tag_t;
 
 /* ELF sections tag */
 typedef struct {
-    u32 num;
-    u32 entsize;
-    u32 shndx;
-    /* Followed by ELF section header entries */
+        u32 num;
+        u32 entsize;
+        u32 shndx;
+        /* Followed by ELF section header entries */
 } mboot2_elf_tag_t;
 
 /* Header structure (must be placed in .multiboot2 section) */
 typedef struct {
-    u32 magic;
-    u32 architecture;  /* 0 = i386 (32-bit) */
-    u32 header_length;
-    u32 checksum;
-    /* Tags follow */
+        u32 magic;
+        u32 architecture;  /* 0 = i386 (32-bit) */
+        u32 header_length;
+        u32 checksum;
+        /* Tags follow */
 } mboot2_header_t;
 
 /**

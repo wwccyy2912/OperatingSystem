@@ -49,9 +49,39 @@ void srand(unsigned int seed);
  * ==================================================================== */
 
 void *bsearch(const void *key, const void *base, size_t nmemb,
-              size_t size, int (*compar)(const void *, const void *));
+                            size_t size, int (*compar)(const void *, const void *));
 
 void qsort(void *base, size_t nmemb, size_t size,
            int (*compar)(const void *, const void *));
+
+/* ====================================================================
+ * Process termination (C11 §7.22.4)
+ * ==================================================================== */
+
+/* Normal termination — already declared in runtime.h but also
+ * accessible here for code that only includes <stdlib.h>. */
+_Noreturn void abort(void);
+_Noreturn void exit(int status);
+_Noreturn void _Exit(int status);
+int atexit(void (*func)(void));
+int at_quick_exit(void (*func)(void));
+_Noreturn void quick_exit(int status);
+
+/* ====================================================================
+ * Environment (C11 §7.22.4.6-7)
+ * ==================================================================== */
+
+char *getenv(const char *name);
+int   system(const char *string);
+
+/* ====================================================================
+ * Memory (C11 §7.22.3)
+ * ==================================================================== */
+
+/* aligned_alloc is C11: allocate `size` bytes at `alignment` boundary.
+ * The existing malloc already returns 16-byte-aligned payloads, so for
+ * alignment <= 16 we delegate to malloc.  Larger alignments are served
+ * by over-allocating and adjusting. */
+void *aligned_alloc(size_t alignment, size_t size);
 
 #endif /* LIBC_STDLIB_H */

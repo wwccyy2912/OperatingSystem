@@ -75,11 +75,11 @@ typedef struct process process_t;
  * Total: 15*8 + 4*8 = 152 bytes.
  */
 typedef struct {
-    u64 gprs[15];   /* r15,r14,r13,r12,r11,r10,r9,r8,rbp,rdi,rsi,rdx,rcx,rbx,rax */
-    u64 rip;        /* interrupted instruction pointer */
-    u64 rflags;     /* interrupted RFLAGS */
-    u64 rsp;        /* interrupted user stack pointer */
-    u64 signum;     /* signal number delivered */
+        u64 gprs[15];   /* r15,r14,r13,r12,r11,r10,r9,r8,rbp,rdi,rsi,rdx,rcx,rbx,rax */
+        u64 rip;        /* interrupted instruction pointer */
+        u64 rflags;     /* interrupted RFLAGS */
+        u64 rsp;        /* interrupted user stack pointer */
+        u64 signum;     /* signal number delivered */
 } sigframe_t;
 
 /* Total bytes the sigframe + restorer slot occupy below orig_rsp */

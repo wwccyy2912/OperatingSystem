@@ -52,10 +52,18 @@
 
 static u8 rtc_read_reg(u8 reg)
 {
-    /* Bit 7 set: disable NMIs around the access */
-    io_outb(RTC_INDEX_PORT, reg | 0x80);
-    io_delay();
-    return io_inb(RTC_DATA_PORT);
+        /* Bit 7 set: disable NMIs around the access */
+        io_outb(RTC_INDEX_PORT, reg | 0x80);
+        io_delay();
+        return io_inb(RTC_DATA_PORT);
+}
+
+static void rtc_write_reg(u8 reg, u8 val)
+{
+        /* Bit 7 set: disable NMIs around the access (mirrors rtc_read_reg) */
+        io_outb(RTC_INDEX_PORT, reg | 0x80);
+        io_delay();
+        io_outb(RTC_DATA_PORT, val);
 }
 
 /* ------------------------------------------------------------------ */
@@ -64,7 +72,7 @@ static u8 rtc_read_reg(u8 reg)
 
 static u8 rtc_bcd_to_bin(u8 bcd)
 {
-    return (u8)(((bcd >> 4) & 0x0F) * 10 + (bcd & 0x0F));
+        return (u8)(((bcd >> 4) & 0x0F) * 10 + (bcd & 0x0F));
 }
 
 /* ------------------------------------------------------------------ */
@@ -76,78 +84,108 @@ static u8 rtc_bcd_to_bin(u8 bcd)
  */
 static void rtc_wait_uip_clear(void)
 {
-    for (int i = 0; i < 10000; i++) {
-        if (!(rtc_read_reg(RTC_REG_STATUS_A) & RTC_STATUS_A_UIP))
-            return;
-        io_delay();
-    }
+        for (int i = 0; i < 10000; i++) {
+                if (!(rtc_read_reg(RTC_REG_STATUS_A) & RTC_STATUS_A_UIP))
+                        return;
+                io_delay();
+        }
 }
 
 /* ------------------------------------------------------------------ */
 
 void rtc_read(rtc_time_t *out)
 {
-    if (!out)
-        return;
+        if (!out)
+                return;
 
-    u8 status_b = rtc_read_reg(RTC_REG_STATUS_B);
-    bool binary  = (status_b & RTC_STATUS_B_BINARY) != 0;
+        u8 status_b = rtc_read_reg(RTC_REG_STATUS_B);
+        bool binary  = (status_b & RTC_STATUS_B_BINARY) != 0;
 
-    u8 sec, min, hour, day, mon, year;
-    u8 century;
+        u8 sec, min, hour, day, mon, year;
+        u8 century;
 
-    for (int attempt = 0; attempt < 4; attempt++) {
+        for (int attempt = 0; attempt < 4; attempt++) {
+                rtc_wait_uip_clear();
+
+                sec     = rtc_read_reg(RTC_REG_SECONDS);
+                min     = rtc_read_reg(RTC_REG_MINUTES);
+                hour    = rtc_read_reg(RTC_REG_HOURS);
+                day     = rtc_read_reg(RTC_REG_DAY);
+                mon     = rtc_read_reg(RTC_REG_MONTH);
+                year    = rtc_read_reg(RTC_REG_YEAR);
+                century = rtc_read_reg(RTC_REG_CENTURY);
+
+                /* Consistency check: re-read the first register; if the RTC
+         * ticked over between reads, retry. */
+                u8 sec2 = rtc_read_reg(RTC_REG_SECONDS);
+                if (sec2 == sec)
+                        break;
+        }
+
+        /* Convert BCD to binary unless the RTC is already in binary mode */
+        if (!binary) {
+                sec     = rtc_bcd_to_bin(sec);
+                min     = rtc_bcd_to_bin(min);
+                hour    = rtc_bcd_to_bin(hour);
+                day     = rtc_bcd_to_bin(day);
+                mon     = rtc_bcd_to_bin(mon);
+                year    = rtc_bcd_to_bin(year);
+                century = rtc_bcd_to_bin(century);
+        }
+
+        /* 12-hour mode: bit 7 of the hours register is the PM flag */
+        bool pm = false;
+        if (!(status_b & RTC_STATUS_B_24H)) {
+                pm = (hour & 0x80) != 0;
+                hour &= 0x7F;
+                if (hour == 12)
+                        hour = 0;               /* 12:xx AM/PM -> 0:xx/12:xx */
+                if (pm)
+                        hour += 12;
+        }
+
+        /* Year: low byte + century register.  The century register is
+     * not present on all boards; fall back to 2000+year. */
+        u16 full_year;
+        if (century >= 19 && century <= 99)
+                full_year = (u16)(century * 100 + year);
+        else
+                full_year = (u16)(2000 + year);
+
+        out->year   = full_year;
+        out->month  = mon;
+        out->day    = day;
+        out->hour   = hour;
+        out->minute = min;
+        out->second = sec;
+}
+
+void rtc_write(const rtc_time_t *t)
+{
+        if (!t)
+                return;
+
+        /* Force 24-hour BINARY mode up front (status B bit 1 = 24H,
+     * bit 2 = binary).  This sidesteps two write hazards: the PM bit
+     * (bit 7 of the hours register in 12-hour mode) and BCD-vs-binary
+     * encoding.  After this every register below is written as a plain
+     * binary value, and rtc_read (which already handles both modes)
+     * reads them back consistently.  Wait for UIP before touching
+     * status B so the mode switch does not race an update. */
+        rtc_wait_uip_clear();
+        u8 status_b = rtc_read_reg(RTC_REG_STATUS_B);
+        status_b |= RTC_STATUS_B_24H | RTC_STATUS_B_BINARY;
+        rtc_write_reg(RTC_REG_STATUS_B, status_b);
+
+        /* Now wait for UIP again and write the time-of-day registers while
+     * no update is in progress (the RTC updates roughly once a second). */
         rtc_wait_uip_clear();
 
-        sec     = rtc_read_reg(RTC_REG_SECONDS);
-        min     = rtc_read_reg(RTC_REG_MINUTES);
-        hour    = rtc_read_reg(RTC_REG_HOURS);
-        day     = rtc_read_reg(RTC_REG_DAY);
-        mon     = rtc_read_reg(RTC_REG_MONTH);
-        year    = rtc_read_reg(RTC_REG_YEAR);
-        century = rtc_read_reg(RTC_REG_CENTURY);
-
-        /* Consistency check: re-read the first register; if the RTC
-         * ticked over between reads, retry. */
-        u8 sec2 = rtc_read_reg(RTC_REG_SECONDS);
-        if (sec2 == sec)
-            break;
-    }
-
-    /* Convert BCD to binary unless the RTC is already in binary mode */
-    if (!binary) {
-        sec     = rtc_bcd_to_bin(sec);
-        min     = rtc_bcd_to_bin(min);
-        hour    = rtc_bcd_to_bin(hour);
-        day     = rtc_bcd_to_bin(day);
-        mon     = rtc_bcd_to_bin(mon);
-        year    = rtc_bcd_to_bin(year);
-        century = rtc_bcd_to_bin(century);
-    }
-
-    /* 12-hour mode: bit 7 of the hours register is the PM flag */
-    bool pm = false;
-    if (!(status_b & RTC_STATUS_B_24H)) {
-        pm = (hour & 0x80) != 0;
-        hour &= 0x7F;
-        if (hour == 12)
-            hour = 0;               /* 12:xx AM/PM -> 0:xx/12:xx */
-        if (pm)
-            hour += 12;
-    }
-
-    /* Year: low byte + century register.  The century register is
-     * not present on all boards; fall back to 2000+year. */
-    u16 full_year;
-    if (century >= 19 && century <= 99)
-        full_year = (u16)(century * 100 + year);
-    else
-        full_year = (u16)(2000 + year);
-
-    out->year   = full_year;
-    out->month  = mon;
-    out->day    = day;
-    out->hour   = hour;
-    out->minute = min;
-    out->second = sec;
+        rtc_write_reg(RTC_REG_SECONDS, (u8)t->second);
+        rtc_write_reg(RTC_REG_MINUTES, (u8)t->minute);
+        rtc_write_reg(RTC_REG_HOURS,   (u8)t->hour);
+        rtc_write_reg(RTC_REG_DAY,     (u8)t->day);
+        rtc_write_reg(RTC_REG_MONTH,   (u8)t->month);
+        rtc_write_reg(RTC_REG_YEAR,    (u8)(t->year % 100));
+        rtc_write_reg(RTC_REG_CENTURY, (u8)(t->year / 100));
 }

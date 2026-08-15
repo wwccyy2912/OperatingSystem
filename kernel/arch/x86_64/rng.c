@@ -28,9 +28,9 @@ static u64 s_rng_state;
 
 static inline u64 rng_rdtsc(void)
 {
-    u32 lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return ((u64)hi << 32) | (u64)lo;
+        u32 lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        return ((u64)hi << 32) | (u64)lo;
 }
 
 /*
@@ -41,32 +41,32 @@ static inline u64 rng_rdtsc(void)
  */
 static inline u16 rng_pit_counter(void)
 {
-    io_outb(0x43, 0x00);            /* latch channel 0 */
-    u16 lo = (u16)io_inb(0x40);     /* low byte first */
-    u16 hi = (u16)io_inb(0x40);
-    return (u16)(lo | (hi << 8));
+        io_outb(0x43, 0x00);            /* latch channel 0 */
+        u16 lo = (u16)io_inb(0x40);     /* low byte first */
+        u16 hi = (u16)io_inb(0x40);
+        return (u16)(lo | (hi << 8));
 }
 
 static u64 rng_gather_entropy(void)
 {
-    u64 e = rng_rdtsc();
+        u64 e = rng_rdtsc();
 
-    e ^= (u64)rng_pit_counter() << 16;
-    e ^= (u64)rng_pit_counter() << 48;   /* second sample: counter moved */
+        e ^= (u64)rng_pit_counter() << 16;
+        e ^= (u64)rng_pit_counter() << 48;   /* second sample: counter moved */
 
-    rtc_time_t t;
-    rtc_read(&t);
-    e ^= (u64)t.year  << 0;
-    e ^= (u64)t.month << 16;
-    e ^= (u64)t.day   << 24;
-    e ^= (u64)t.hour  << 32;
-    e ^= (u64)t.minute<< 40;
-    e ^= (u64)t.second<< 48;
+        rtc_time_t t;
+        rtc_read(&t);
+        e ^= (u64)t.year  << 0;
+        e ^= (u64)t.month << 16;
+        e ^= (u64)t.day   << 24;
+        e ^= (u64)t.hour  << 32;
+        e ^= (u64)t.minute<< 40;
+        e ^= (u64)t.second<< 48;
 
-    /* Stack address of our own frame — varies with boot path depth. */
-    e ^= (u64)(uptr)&e;
+        /* Stack address of our own frame — varies with boot path depth. */
+        e ^= (u64)(uptr)&e;
 
-    return e;
+        return e;
 }
 
 /* ------------------------------------------------------------------ */
@@ -75,41 +75,41 @@ static u64 rng_gather_entropy(void)
 
 void rng_init(void)
 {
-    if (s_rng_state != 0)
-        return;   /* already seeded */
+        if (s_rng_state != 0)
+                return;   /* already seeded */
 
-    u64 seed = rng_gather_entropy();
-    if (seed == 0)
-        seed = 0x9E3779B97F4A7C15ULL;  /* splitmix golden ratio, fallback */
-    s_rng_state = seed;
+        u64 seed = rng_gather_entropy();
+        if (seed == 0)
+                seed = 0x9E3779B97F4A7C15ULL;  /* splitmix golden ratio, fallback */
+        s_rng_state = seed;
 }
 
 void rng_mix(u64 entropy)
 {
-    /* Fold without risk of landing on the forbidden zero state. */
-    if (entropy == 0)
-        return;
-    s_rng_state ^= entropy;
-    if (s_rng_state == 0)
-        s_rng_state = 0x9E3779B97F4A7C15ULL;
+        /* Fold without risk of landing on the forbidden zero state. */
+        if (entropy == 0)
+                return;
+        s_rng_state ^= entropy;
+        if (s_rng_state == 0)
+                s_rng_state = 0x9E3779B97F4A7C15ULL;
 }
 
 u64 rng_u64(void)
 {
-    /* xorshift64* — good statistical quality, trivial to implement. */
-    u64 x = s_rng_state;
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    s_rng_state = x;
-    return x * 0x2545F4914F6CDD1DULL;
+        /* xorshift64* — good statistical quality, trivial to implement. */
+        u64 x = s_rng_state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        s_rng_state = x;
+        return x * 0x2545F4914F6CDD1DULL;
 }
 
 u64 rng_range(u64 limit)
 {
-    if (limit == 0)
-        return 0;
-    return rng_u64() % limit;
+        if (limit == 0)
+                return 0;
+        return rng_u64() % limit;
 }
 
 /* ------------------------------------------------------------------ */
@@ -118,30 +118,30 @@ u64 rng_range(u64 limit)
 
 u64 aslr_stack_base(void)
 {
-    /* One ASLR_STACK_BLOCK (MAX_THREADS pages, 4 MB at 1024) per
+        /* One ASLR_STACK_BLOCK (MAX_THREADS pages, 4 MB at 1024) per
      * possible thread; pick a random block. */
-    u64 region = ASLR_STACK_END - ASLR_STACK_BASE;
-    u64 blocks = region / ASLR_STACK_BLOCK;
-    return ASLR_STACK_BASE + rng_range(blocks) * ASLR_STACK_BLOCK;
+        u64 region = ASLR_STACK_END - ASLR_STACK_BASE;
+        u64 blocks = region / ASLR_STACK_BLOCK;
+        return ASLR_STACK_BASE + rng_range(blocks) * ASLR_STACK_BLOCK;
 }
 
 u64 aslr_boot_stack(void)
 {
-    u64 region = ASLR_BOOT_STACK_END - ASLR_BOOT_STACK_BASE;
-    u64 pages  = region / PAGE_SIZE;
-    return ASLR_BOOT_STACK_BASE + rng_range(pages) * PAGE_SIZE;
+        u64 region = ASLR_BOOT_STACK_END - ASLR_BOOT_STACK_BASE;
+        u64 pages  = region / PAGE_SIZE;
+        return ASLR_BOOT_STACK_BASE + rng_range(pages) * PAGE_SIZE;
 }
 
 u64 aslr_heap_base(void)
 {
-    u64 region = ASLR_HEAP_BASE_MAX - ASLR_HEAP_BASE_MIN;
-    u64 slots  = region / ASLR_HEAP_ALIGN;
-    return ASLR_HEAP_BASE_MIN + rng_range(slots) * ASLR_HEAP_ALIGN;
+        u64 region = ASLR_HEAP_BASE_MAX - ASLR_HEAP_BASE_MIN;
+        u64 slots  = region / ASLR_HEAP_ALIGN;
+        return ASLR_HEAP_BASE_MIN + rng_range(slots) * ASLR_HEAP_ALIGN;
 }
 
 u64 aslr_elf_base(void)
 {
-    u64 region = ASLR_ELF_BASE_MAX - ASLR_ELF_BASE_MIN;
-    u64 pages  = region / PAGE_SIZE;
-    return ASLR_ELF_BASE_MIN + rng_range(pages) * PAGE_SIZE;
+        u64 region = ASLR_ELF_BASE_MAX - ASLR_ELF_BASE_MIN;
+        u64 pages  = region / PAGE_SIZE;
+        return ASLR_ELF_BASE_MIN + rng_range(pages) * PAGE_SIZE;
 }

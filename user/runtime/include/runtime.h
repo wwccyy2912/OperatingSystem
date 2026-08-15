@@ -16,7 +16,13 @@ typedef void (*init_func_t)(void);
 extern init_func_t __init_array_start[];
 extern init_func_t __init_array_end[];
 
+/* .fini_array destructors — provided by the linker script (user.ld).
+ * Called in reverse order by _fini() during exit(). */
+extern init_func_t __fini_array_start[];
+extern init_func_t __fini_array_end[];
+
 void _init(void);
+void _fini(void);
 
 /* --- atexit --- */
 typedef void (*atexit_func_t)(void);

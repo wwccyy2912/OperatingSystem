@@ -50,7 +50,7 @@
  *         negative errno (ERR_INVAL for malformed/oversized ELF).
  */
 int elf_parse(const void *elf, unsigned long size,
-              proc_image_desc_t *desc_out, proc_seg_desc_t *segs,
-              unsigned long max_segs);
+                            proc_image_desc_t *desc_out, proc_seg_desc_t *segs,
+                            unsigned long max_segs);
 
 #endif /* LIBOS_ELF_PARSE_H */

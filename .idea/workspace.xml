@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="BackendCodeEditorMiscSettings">
+    <option name="/Default/Housekeeping/FeatureSuggestion/FeatureSuggestionManager/DisabledSuggesters/=SwitchToGoToActionSuggester/@EntryIndexedValue" value="true" type="bool" />
+  </component>
+  <component name="CMakeProjectFlavorService">
+    <option name="flavorId" value="CMakePlainProjectFlavor" />
+  </component>
+  <component name="CMakeRunConfigurationManager">
+    <generated />
+  </component>
+  <component name="CMakeSettings">
+    <configurations>
+      <configuration PROFILE_NAME="Debug" ENABLED="true" CONFIG_NAME="Debug" />
+    </configurations>
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="98966497-f594-4507-8fdb-9d9e67c79bf5" name="更改" comment="">
+      <change beforePath="$PROJECT_DIR$/docs/permission_model.md" beforeDir="false" afterPath="$PROJECT_DIR$/docs/permission_model.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kernel.elf" beforeDir="false" afterPath="$PROJECT_DIR$/kernel.elf" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kernel/cap/cap.c" beforeDir="false" afterPath="$PROJECT_DIR$/kernel/cap/cap.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kernel/include/kernel/cap.h" beforeDir="false" afterPath="$PROJECT_DIR$/kernel/include/kernel/cap.h" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kernel/include/kernel/process.h" beforeDir="false" afterPath="$PROJECT_DIR$/kernel/include/kernel/process.h" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kernel/include/kernel/syscall.h" beforeDir="false" afterPath="$PROJECT_DIR$/kernel/include/kernel/syscall.h" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kernel/include/kernel/syscall_numbers.h" beforeDir="false" afterPath="$PROJECT_DIR$/kernel/include/kernel/syscall_numbers.h" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kernel/include/kernel/thread.h" beforeDir="false" afterPath="$PROJECT_DIR$/kernel/include/kernel/thread.h" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kernel/process/process.c" beforeDir="false" afterPath="$PROJECT_DIR$/kernel/process/process.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kernel/sched/thread.c" beforeDir="false" afterPath="$PROJECT_DIR$/kernel/sched/thread.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kernel/syscall/syscall.c" beforeDir="false" afterPath="$PROJECT_DIR$/kernel/syscall/syscall.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/user/lib/libfs/fs.c" beforeDir="false" afterPath="$PROJECT_DIR$/user/lib/libfs/fs.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/user/lib/libfs/fs.h" beforeDir="false" afterPath="$PROJECT_DIR$/user/lib/libfs/fs.h" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/user/lib/libos/syscalls.c" beforeDir="false" afterPath="$PROJECT_DIR$/user/lib/libos/syscalls.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/user/lib/libos/syscalls.h" beforeDir="false" afterPath="$PROJECT_DIR$/user/lib/libos/syscalls.h" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/user/runtime/malloc.c" beforeDir="false" afterPath="$PROJECT_DIR$/user/runtime/malloc.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/user/services/init/main.c" beforeDir="false" afterPath="$PROJECT_DIR$/user/services/init/main.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/user/services/perm/perm-manager.c" beforeDir="false" afterPath="$PROJECT_DIR$/user/services/perm/perm-manager.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/user/services/perm/perm.h" beforeDir="false" afterPath="$PROJECT_DIR$/user/services/perm/perm.h" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/user/services/shell/shell.c" beforeDir="false" afterPath="$PROJECT_DIR$/user/services/shell/shell.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/user/services/term/term.c" beforeDir="false" afterPath="$PROJECT_DIR$/user/services/term/term.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/user/services/vfs/vfs.h" beforeDir="false" afterPath="$PROJECT_DIR$/user/services/vfs/vfs.h" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/user/services/vfs/vfs_server.c" beforeDir="false" afterPath="$PROJECT_DIR$/user/services/vfs/vfs_server.c" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="ClangdSettings">
+    <option name="formatViaClangd" value="false" />
+  </component>
+  <component name="ExternalProjectsData">
+    <projectState path="$PROJECT_DIR$">
+      <ProjectState />
+    </projectState>
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="MacroExpansionManager">
+    <option name="directoryName" value="HXnDD9va" />
+  </component>
+  <component name="MakefileLocalSettings">
+    <option name="availableProjects">
+      <map>
+        <entry>
+          <key>
+            <ExternalProjectPojo>
+              <option name="name" value="OperatingSystem" />
+              <option name="path" value="$PROJECT_DIR$" />
+            </ExternalProjectPojo>
+          </key>
+          <value>
+            <list>
+              <ExternalProjectPojo>
+                <option name="name" value="OperatingSystem" />
+                <option name="path" value="$PROJECT_DIR$" />
+              </ExternalProjectPojo>
+            </list>
+          </value>
+        </entry>
+      </map>
+    </option>
+    <option name="projectSyncType">
+      <map>
+        <entry key="$PROJECT_DIR$" value="RE_IMPORT" />
+      </map>
+    </option>
+  </component>
+  <component name="ProjectApplicationVersion">
+    <option name="ide" value="CLion" />
+    <option name="majorVersion" value="2025" />
+    <option name="minorVersion" value="3.3" />
+    <option name="productBranch" value="Classic" />
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 7
+}</component>
+  <component name="ProjectId" id="3HaB5a7PPQOyb57wexJKbg99Cn4" />
+  <component name="ProjectStatusUIService">{
+  &quot;uiKindId&quot;: &quot;Widget&quot;
+}</component>
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "RunOnceActivity.RadMigrateCodeStyle": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.cidr.known.project.marker": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "RunOnceActivity.readMode.enableVisualFormatting": "true",
+    "RunOnceActivity.typescript.service.memoryLimit.init": "true",
+    "cf.first.check.clang-format": "false",
+    "cidr.known.project.marker": "true",
+    "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1": "true",
+    "git-widget-placeholder": "main",
+    "junie.onboarding.icon.badge.shown": "true",
+    "last_opened_file_path": "/home/admin/桌面/OperatingSystem",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "org.rust.first.attach.projects": "true",
+    "to.speed.mode.migration.done": "true",
+    "vue.rearranger.settings.migration": "true"
+  }
+}]]></component>
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="默认任务">
+      <changelist id="98966497-f594-4507-8fdb-9d9e67c79bf5" name="更改" comment="" />
+      <created>1786096117124</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1786096117124</updated>
+      <workItem from="1786096118463" duration="1091000" />
+      <workItem from="1786100066575" duration="663000" />
+      <workItem from="1786529029926" duration="1691000" />
+    </task>
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+</project>

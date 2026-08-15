@@ -38,7 +38,7 @@
 
 static inline void *vspace_phys_to_virt(u64 phys)
 {
-    return (void *)(phys + KERNEL_VIRT_BASE);
+        return (void *)(phys + KERNEL_VIRT_BASE);
 }
 
 static inline u64 vspace_pml4_index(u64 v) { return (v >> 39) & 0x1FF; }
@@ -47,18 +47,18 @@ static inline u64 vspace_pd_index(u64 v)   { return (v >> 21) & 0x1FF; }
 
 static inline void vspace_zero_page(void *addr)
 {
-    u64 *p = (u64 *)addr;
-    for (int i = 0; i < 512; i++)
-        p[i] = 0;
+        u64 *p = (u64 *)addr;
+        for (int i = 0; i < 512; i++)
+                p[i] = 0;
 }
 
 static inline bool vspace_page_table_empty(const u64 *table)
 {
-    for (int i = 0; i < 512; i++) {
-        if (table[i] & PTE_PRESENT)
-            return false;
-    }
-    return true;
+        for (int i = 0; i < 512; i++) {
+                if (table[i] & PTE_PRESENT)
+                        return false;
+        }
+        return true;
 }
 
 /*
@@ -75,25 +75,25 @@ static inline bool vspace_page_table_empty(const u64 *table)
  */
 static bool vspace_page_free(addr_space_t *as, u64 vaddr)
 {
-    u64 *pml4 = (u64 *)vspace_phys_to_virt(as->pml4_phys);
+        u64 *pml4 = (u64 *)vspace_phys_to_virt(as->pml4_phys);
 
-    u64 idx = vspace_pml4_index(vaddr);
-    if (!(pml4[idx] & PTE_PRESENT))
-        return true;                          /* whole 512 GB region empty */
+        u64 idx = vspace_pml4_index(vaddr);
+        if (!(pml4[idx] & PTE_PRESENT))
+                return true;                          /* whole 512 GB region empty */
 
-    u64 *pdp = (u64 *)vspace_phys_to_virt(pml4[idx] & ~0xFFFULL);
-    idx = vspace_pdp_index(vaddr);
-    if (!(pdp[idx] & PTE_PRESENT))
-        return true;                          /* whole 1 GB region empty */
-    if (pdp[idx] & PTE_HUGE)
-        return false;                         /* 1 GB huge mapping */
+        u64 *pdp = (u64 *)vspace_phys_to_virt(pml4[idx] & ~0xFFFULL);
+        idx = vspace_pdp_index(vaddr);
+        if (!(pdp[idx] & PTE_PRESENT))
+                return true;                          /* whole 1 GB region empty */
+        if (pdp[idx] & PTE_HUGE)
+                return false;                         /* 1 GB huge mapping */
 
-    u64 *pd = (u64 *)vspace_phys_to_virt(pdp[idx] & ~0xFFFULL);
-    idx = vspace_pd_index(vaddr);
-    if (!(pd[idx] & PTE_PRESENT))
-        return true;                          /* whole 2 MB region empty */
+        u64 *pd = (u64 *)vspace_phys_to_virt(pdp[idx] & ~0xFFFULL);
+        idx = vspace_pd_index(vaddr);
+        if (!(pd[idx] & PTE_PRESENT))
+                return true;                          /* whole 2 MB region empty */
 
-    return false;   /* PDE present: huge mapping, live PT, or a pre-built
+        return false;   /* PDE present: huge mapping, live PT, or a pre-built
                      * PT page from an earlier SYS_VSPACE_ALLOC */
 }
 
@@ -106,28 +106,28 @@ static bool vspace_page_free(addr_space_t *as, u64 vaddr)
 static bool vspace_scan_interval(addr_space_t *as, u64 start, u64 end,
                                  u64 page_count, u64 *out_base)
 {
-    u64 run_start = 0;
-    u64 run_len = 0;
+        u64 run_start = 0;
+        u64 run_len = 0;
 
-    for (u64 v = start; v < end; v += PAGE_SIZE) {
-        /* Even a fully-free tail of this interval cannot extend the
+        for (u64 v = start; v < end; v += PAGE_SIZE) {
+                /* Even a fully-free tail of this interval cannot extend the
          * current run far enough — give up on this interval. */
-        if (run_len + (end - v) / PAGE_SIZE < page_count)
-            break;
+                if (run_len + (end - v) / PAGE_SIZE < page_count)
+                        break;
 
-        if (vspace_page_free(as, v)) {
-            if (run_len == 0)
-                run_start = v;
-            run_len++;
-            if (run_len >= page_count) {
-                *out_base = run_start;
-                return true;
-            }
-        } else {
-            run_len = 0;
+                if (vspace_page_free(as, v)) {
+                        if (run_len == 0)
+                                run_start = v;
+                        run_len++;
+                        if (run_len >= page_count) {
+                                *out_base = run_start;
+                                return true;
+                        }
+                } else {
+                        run_len = 0;
+                }
         }
-    }
-    return false;
+        return false;
 }
 
 /*
@@ -145,23 +145,23 @@ static bool vspace_scan_interval(addr_space_t *as, u64 start, u64 end,
 static bool vspace_scan_ranges(addr_space_t *as, u64 heap_base,
                                u64 page_count, u64 *out_base)
 {
-    bool have_heap = heap_base >= PAGE_SIZE &&
+        bool have_heap = heap_base >= PAGE_SIZE &&
                      heap_base + HEAP_USER_SIZE + PAGE_SIZE <= USER_PTR_MAX;
-    u64 heap_lo = have_heap ? heap_base - PAGE_SIZE : 0;
-    u64 heap_hi = have_heap ? heap_base + HEAP_USER_SIZE + PAGE_SIZE : 0;
+        u64 heap_lo = have_heap ? heap_base - PAGE_SIZE : 0;
+        u64 heap_hi = have_heap ? heap_base + HEAP_USER_SIZE + PAGE_SIZE : 0;
 
-    if (vspace_scan_interval(as, VSPACE_FLOOR,
+        if (vspace_scan_interval(as, VSPACE_FLOOR,
                              have_heap ? heap_lo : ASLR_STACK_BASE,
                              page_count, out_base))
-        return true;
+                return true;
 
-    if (have_heap &&
-        vspace_scan_interval(as, heap_hi, ASLR_STACK_BASE,
+        if (have_heap &&
+                vspace_scan_interval(as, heap_hi, ASLR_STACK_BASE,
                              page_count, out_base))
-        return true;
+                return true;
 
-    return vspace_scan_interval(as, ASLR_STACK_END, USER_PTR_MAX,
-                                page_count, out_base);
+        return vspace_scan_interval(as, ASLR_STACK_END, USER_PTR_MAX,
+                                                                page_count, out_base);
 }
 
 /*
@@ -180,41 +180,41 @@ static bool vspace_scan_ranges(addr_space_t *as, u64 heap_base,
 static error_t vspace_build_tables(addr_space_t *as, u64 base,
                                    u64 page_count)
 {
-    for (u64 i = 0; i < page_count; i++) {
-        u64 vaddr = base + i * PAGE_SIZE;
-        u64 *pml4 = (u64 *)vspace_phys_to_virt(as->pml4_phys);
+        for (u64 i = 0; i < page_count; i++) {
+                u64 vaddr = base + i * PAGE_SIZE;
+                u64 *pml4 = (u64 *)vspace_phys_to_virt(as->pml4_phys);
 
-        u64 idx = vspace_pml4_index(vaddr);
-        if (!(pml4[idx] & PTE_PRESENT)) {
-            u64 page = pmm_alloc_page();
-            if (!page)
-                return ERR_NOMEM;
-            vspace_zero_page(vspace_phys_to_virt(page));
-            pml4[idx] = page | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
-        }
-        u64 *pdp = (u64 *)vspace_phys_to_virt(pml4[idx] & ~0xFFFULL);
+                u64 idx = vspace_pml4_index(vaddr);
+                if (!(pml4[idx] & PTE_PRESENT)) {
+                        u64 page = pmm_alloc_page();
+                        if (!page)
+                                return ERR_NOMEM;
+                        vspace_zero_page(vspace_phys_to_virt(page));
+                        pml4[idx] = page | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+                }
+                u64 *pdp = (u64 *)vspace_phys_to_virt(pml4[idx] & ~0xFFFULL);
 
-        idx = vspace_pdp_index(vaddr);
-        if (!(pdp[idx] & PTE_PRESENT)) {
-            u64 page = pmm_alloc_page();
-            if (!page)
-                return ERR_NOMEM;
-            vspace_zero_page(vspace_phys_to_virt(page));
-            pdp[idx] = page | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
-        }
-        u64 *pd = (u64 *)vspace_phys_to_virt(pdp[idx] & ~0xFFFULL);
+                idx = vspace_pdp_index(vaddr);
+                if (!(pdp[idx] & PTE_PRESENT)) {
+                        u64 page = pmm_alloc_page();
+                        if (!page)
+                                return ERR_NOMEM;
+                        vspace_zero_page(vspace_phys_to_virt(page));
+                        pdp[idx] = page | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+                }
+                u64 *pd = (u64 *)vspace_phys_to_virt(pdp[idx] & ~0xFFFULL);
 
-        idx = vspace_pd_index(vaddr);
-        if (!(pd[idx] & PTE_PRESENT)) {
-            u64 page = pmm_alloc_page();
-            if (!page)
-                return ERR_NOMEM;
-            vspace_zero_page(vspace_phys_to_virt(page));
-            pd[idx] = page | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+                idx = vspace_pd_index(vaddr);
+                if (!(pd[idx] & PTE_PRESENT)) {
+                        u64 page = pmm_alloc_page();
+                        if (!page)
+                                return ERR_NOMEM;
+                        vspace_zero_page(vspace_phys_to_virt(page));
+                        pd[idx] = page | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+                }
+                /* Leaf PTE deliberately untouched (not present). */
         }
-        /* Leaf PTE deliberately untouched (not present). */
-    }
-    return OK;
+        return OK;
 }
 
 /*
@@ -227,60 +227,60 @@ static error_t vspace_build_tables(addr_space_t *as, u64 base,
  */
 static void vspace_free_tables(addr_space_t *as, u64 base, u64 page_count)
 {
-    u64 end = base + page_count * PAGE_SIZE;
-    u64 *pml4 = (u64 *)vspace_phys_to_virt(as->pml4_phys);
+        u64 end = base + page_count * PAGE_SIZE;
+        u64 *pml4 = (u64 *)vspace_phys_to_virt(as->pml4_phys);
 
-    /* 1. Free the PT page of every 2 MB window the range touches. */
-    u64 win = base & ~0x1FFFFFULL;
-    u64 last_win = (end - 1) & ~0x1FFFFFULL;
-    while (win <= last_win) {
-        u64 pml4_i = vspace_pml4_index(win);
-        u64 pdp_i = vspace_pdp_index(win);
-        u64 pd_i = vspace_pd_index(win);
-        if (pml4[pml4_i] & PTE_PRESENT) {
-            u64 *pdp = (u64 *)vspace_phys_to_virt(pml4[pml4_i] & ~0xFFFULL);
-            if ((pdp[pdp_i] & PTE_PRESENT) && !(pdp[pdp_i] & PTE_HUGE)) {
-                u64 *pd = (u64 *)vspace_phys_to_virt(pdp[pdp_i] & ~0xFFFULL);
-                if ((pd[pd_i] & PTE_PRESENT) && !(pd[pd_i] & PTE_HUGE)) {
-                    pmm_free_page(pd[pd_i] & ~0xFFFULL);
-                    pd[pd_i] = 0;
+        /* 1. Free the PT page of every 2 MB window the range touches. */
+        u64 win = base & ~0x1FFFFFULL;
+        u64 last_win = (end - 1) & ~0x1FFFFFULL;
+        while (win <= last_win) {
+                u64 pml4_i = vspace_pml4_index(win);
+                u64 pdp_i = vspace_pdp_index(win);
+                u64 pd_i = vspace_pd_index(win);
+                if (pml4[pml4_i] & PTE_PRESENT) {
+                        u64 *pdp = (u64 *)vspace_phys_to_virt(pml4[pml4_i] & ~0xFFFULL);
+                        if ((pdp[pdp_i] & PTE_PRESENT) && !(pdp[pdp_i] & PTE_HUGE)) {
+                                u64 *pd = (u64 *)vspace_phys_to_virt(pdp[pdp_i] & ~0xFFFULL);
+                                if ((pd[pd_i] & PTE_PRESENT) && !(pd[pd_i] & PTE_HUGE)) {
+                                        pmm_free_page(pd[pd_i] & ~0xFFFULL);
+                                        pd[pd_i] = 0;
+                                }
+                        }
                 }
-            }
+                win += 0x200000;
         }
-        win += 0x200000;
-    }
 
-    /* 2. Free PD pages (1 GB windows) that became empty. */
-    u64 gb = base & ~0x3FFFFFFFULL;
-    u64 last_gb = (end - 1) & ~0x3FFFFFFFULL;
-    while (gb <= last_gb) {
-        u64 pml4_i = vspace_pml4_index(gb);
-        u64 pdp_i = vspace_pdp_index(gb);
-        if (pml4[pml4_i] & PTE_PRESENT) {
-            u64 *pdp = (u64 *)vspace_phys_to_virt(pml4[pml4_i] & ~0xFFFULL);
-            if ((pdp[pdp_i] & PTE_PRESENT) && !(pdp[pdp_i] & PTE_HUGE)) {
-                u64 *pd = (u64 *)vspace_phys_to_virt(pdp[pdp_i] & ~0xFFFULL);
-                if (vspace_page_table_empty(pd)) {
-                    pmm_free_page(pdp[pdp_i] & ~0xFFFULL);
-                    pdp[pdp_i] = 0;
+        /* 2. Free PD pages (1 GB windows) that became empty. */
+        u64 gb = base & ~0x3FFFFFFFULL;
+        u64 last_gb = (end - 1) & ~0x3FFFFFFFULL;
+        while (gb <= last_gb) {
+                u64 pml4_i = vspace_pml4_index(gb);
+                u64 pdp_i = vspace_pdp_index(gb);
+                if (pml4[pml4_i] & PTE_PRESENT) {
+                        u64 *pdp = (u64 *)vspace_phys_to_virt(pml4[pml4_i] & ~0xFFFULL);
+                        if ((pdp[pdp_i] & PTE_PRESENT) && !(pdp[pdp_i] & PTE_HUGE)) {
+                                u64 *pd = (u64 *)vspace_phys_to_virt(pdp[pdp_i] & ~0xFFFULL);
+                                if (vspace_page_table_empty(pd)) {
+                                        pmm_free_page(pdp[pdp_i] & ~0xFFFULL);
+                                        pdp[pdp_i] = 0;
+                                }
+                        }
                 }
-            }
+                gb += 0x40000000;
         }
-        gb += 0x40000000;
-    }
 
-    /* 3. Free PDP pages (512 GB regions) that became empty. */
-    u64 first_pml4 = vspace_pml4_index(base);
-    u64 last_pml4 = vspace_pml4_index(end - 1);
-    for (u64 pml4_i = first_pml4; pml4_i <= last_pml4; pml4_i++) {
-        if (pml4[pml4_i] & PTE_PRESENT) {
-            u64 *pdp = (u64 *)vspace_phys_to_virt(pml4[pml4_i] & ~0xFFFULL);
-            if (vspace_page_table_empty(pdp)) {
-                pmm_free_page(pml4[pml4_i] & ~0xFFFULL);
-                pml4[pml4_i] = 0;
-            }
+        /* 3. Free PDP pages (512 GB regions) that became empty. */
+        u64 first_pml4 = vspace_pml4_index(base);
+        u64 last_pml4 = vspace_pml4_index(end - 1);
+        for (u64 pml4_i = first_pml4; pml4_i <= last_pml4; pml4_i++) {
+                if (pml4[pml4_i] & PTE_PRESENT) {
+                        u64 *pdp = (u64 *)vspace_phys_to_virt(pml4[pml4_i] & ~0xFFFULL);
+                        if (vspace_page_table_empty(pdp)) {
+                                pmm_free_page(pml4[pml4_i] & ~0xFFFULL);
+                                pml4[pml4_i] = 0;
+                        }
+                }
         }
-    }
 }
 
 /*
@@ -293,12 +293,12 @@ static void vspace_free_tables(addr_space_t *as, u64 base, u64 page_count)
  */
 static bool vspace_tables_affordable(u64 page_count)
 {
-    u64 pt_pages  = (page_count + 511) / 512;
-    u64 pd_pages  = (page_count + 262143) / 262144;
-    u64 pdp_pages = (page_count + 134217727) / 134217728;
-    u64 need = pt_pages + pd_pages + pdp_pages + 1;
+        u64 pt_pages  = (page_count + 511) / 512;
+        u64 pd_pages  = (page_count + 262143) / 262144;
+        u64 pdp_pages = (page_count + 134217727) / 134217728;
+        u64 need = pt_pages + pd_pages + pdp_pages + 1;
 
-    return need <= pmm_get_free_memory() / PAGE_SIZE;
+        return need <= pmm_get_free_memory() / PAGE_SIZE;
 }
 
 /*
@@ -347,37 +347,37 @@ static bool vspace_tables_affordable(u64 page_count)
  */
 i64 sc_sys_vspace_alloc(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5)
 {
-    (void)a3; (void)a4; (void)a5;
-    u64 size = a1;
-    u64 flags = a2;
+        (void)a3; (void)a4; (void)a5;
+        u64 size = a1;
+        u64 flags = a2;
 
-    if (size == 0 || (size % PAGE_SIZE) != 0)
-        return (i64)ERR_INVAL;
-    if (flags != 0)
-        return (i64)ERR_INVAL;
+        if (size == 0 || (size % PAGE_SIZE) != 0)
+                return (i64)ERR_INVAL;
+        if (flags != 0)
+                return (i64)ERR_INVAL;
 
-    u64 page_count = size / PAGE_SIZE;
+        u64 page_count = size / PAGE_SIZE;
 
-    /* Must be able to fit in the user address space at all. */
-    if (size > USER_PTR_MAX - VSPACE_FLOOR)
-        return (i64)ERR_NOMEM;
-    /* Table pages must fit in physical memory (bounds the scan too). */
-    if (!vspace_tables_affordable(page_count))
-        return (i64)ERR_NOMEM;
+        /* Must be able to fit in the user address space at all. */
+        if (size > USER_PTR_MAX - VSPACE_FLOOR)
+                return (i64)ERR_NOMEM;
+        /* Table pages must fit in physical memory (bounds the scan too). */
+        if (!vspace_tables_affordable(page_count))
+                return (i64)ERR_NOMEM;
 
-    process_t *proc = process_current();
-    if (!proc || !proc->addr_space)
-        return (i64)ERR_FAULT;
+        process_t *proc = process_current();
+        if (!proc || !proc->addr_space)
+                return (i64)ERR_FAULT;
 
-    u64 base;
-    if (!vspace_scan_ranges(proc->addr_space, proc->heap_base,
-                            page_count, &base))
-        return (i64)ERR_NOMEM;
+        u64 base;
+        if (!vspace_scan_ranges(proc->addr_space, proc->heap_base,
+                                                        page_count, &base))
+                return (i64)ERR_NOMEM;
 
-    if (vspace_build_tables(proc->addr_space, base, page_count) != OK) {
-        vspace_free_tables(proc->addr_space, base, page_count);
-        return (i64)ERR_NOMEM;
-    }
+        if (vspace_build_tables(proc->addr_space, base, page_count) != OK) {
+                vspace_free_tables(proc->addr_space, base, page_count);
+                return (i64)ERR_NOMEM;
+        }
 
-    return (i64)base;
+        return (i64)base;
 }

@@ -1,8 +1,9 @@
 # OpSys VFS 服务设计文档（对象句柄 + 安全作用域书签）
 
-> 版本：v0.2（Phase 0 ✅ / Phase 2 ✅）
+> 版本：v0.2（Phase 0 ✅ / Phase 1 ✅ / Phase 2 ✅）
 > 日期：2026-08-06
-> 状态：Phase 0 完成并验收 ✅；Phase 2（书签 + perm-manager + Powerbox）完成并验收 ✅
+> 状态：Phase 0 完成并验收 ✅；Phase 1（virtio-blk 真实磁盘持久化）完成并验收 ✅；
+> Phase 2（书签 + perm-manager + Powerbox）完成并验收 ✅
 > 关联：docs/requirements.md（§1.2 文件系统服务、§4.2 IPC 协议）
 
 ---
@@ -459,6 +460,30 @@ Phase 0 允许两个实现二选一：
 
 **验证**：`vfs_cat` 读磁盘卷；写后重启 QEMU 数据仍在（持久性证明）；
 `vfs_stat_volume` 显示空间占用。
+
+**验收记录（2026-08-14，QEMU 实测，sendkey 注入 + screendump OCR 解码）✅**：
+- `vfs_write /Volumes/Disk/hello.txt hello-disk-123` 首次 → `open FAILED (-105)`
+  = VFS_ERR_ACCESS；term 弹 Powerbox 文本询问：`perm: app 0x5e11e5 requests
+  /Volumes/Disk/hello.txt (W) - perm_answer 513 y/n` —— shell（Standard 角色）
+  的 WRITE 无链规则，按默认拒绝走 Powerbox 授权流（§九 与 shell.c 注释一致）。
+- `perm_answer 513 y` → `[ALLOWED] ... query 513 -> ALLOWED (0)`（grant 写入）。
+- 重试 `vfs_write` → `14 bytes written to /Volumes/Disk/hello.txt`（授权后放行）。
+- host 侧 `xxd disk.img` → 偏移 0x8200 见 `hello-disk-123` 数据块（真实落盘）。
+- **冷重启 QEMU**（保留 disk.img）→ `vfs_cat /Volumes/Disk/hello.txt` →
+  `== read 14 bytes ==` + `hello-disk-123` —— **持久性证明成立**。
+- `vfs_stat /Volumes/Disk` → `8159 KB total, 0 KB used, read-write`
+  （14 字节不足 1 KB 取整为 0 used，正确）。
+- 回归：31/31 passed，0 PANIC/FATAL；Disk 卷跨重启同 UUID
+  （6f707379-732d7666-1be-564245f5）未重格式化。
+
+> **注（shell 写磁盘授权机制）**：P0 种子规则曾给 Standard 角色配
+> `DATA_DOCS_WRITE=DENY` 链规则，链 DENY 短路使 Powerbox 永不触发，
+> shell(STANDARD) 写 Disk 被静默拒绝，与 §九 验收流（-105 + 弹窗 →
+> perm_answer → 重试成功）自相矛盾。已移除该链规则（perm-manager.c
+> seed_rules），Standard 的 WRITE 走默认拒绝 → Powerbox 用户授权流，
+> 与 docs/permission_model.md §2.6「Powerbox 是唯一授权入口」一致；
+> READ 仍链 ALLOW 直通（vfs_cat/vfs_stat 无需授权）。所有 P1 测试
+> 均基于 OWNER/GUEST 角色（chain DENY 语义未变），31/31 回归通过。
 
 ### Phase 2 —— 书签 + 权限管理器 + Powerbox（文本版）
 

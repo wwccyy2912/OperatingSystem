@@ -27,6 +27,8 @@
  *          ├─ process_create("vfs")          VFS namespace server
  *          ├─ process_create("fs_mem_driver") in-memory storage driver
  *          │    (driver-initiated MOUNT handshake onto "vfs", A1)
+ *          ├─ process_create("fs_virtio_blk_driver") virtio-blk disk driver
+ *          │    (self-mounts the persistent "Disk" RW volume via A1)
  *          ├─ process_create("device_mgr")  PCI device manager service
  *          │    (serves the kernel PCI enumeration over "device_mgr")
  *          ├─ process_create("shell")  LAST → the shell owns the prompt
@@ -78,22 +80,24 @@ typedef int32_t     i32;
  * ==================================================================== */
 
 typedef struct {
-    const char *name;
-    int  pid;               /* -1 = not yet spawned */
-    int  restart_count;
-    int  restartable;   /* 1 = monitor loop + auto-restart policy     */
+        const char *name;
+        int  pid;               /* -1 = not yet spawned */
+        int  restart_count;
+        int  restartable;   /* 1 = monitor loop + auto-restart policy     */
 } service_t;
 
 static service_t s_services[] = {
-    { "serial",   -1, 0, 0 },  /* IRQ-lifecycle: future work */
-    { "term",     -1, 0, 0 },  /* owns the framebuffer      */
-    { "keyboard", -1, 0, 0 },  /* owns IRQ1 + PS/2 ports    */
-    { "flaky",    -1, 0, 1 },
-    { "vfs",          -1, 0, 0 },  /* VFS namespace server     */
-    { "fs_mem_driver", -1, 0, 0 }, /* in-memory storage driver */
-    { "perm",         -1, 0, 0 },  /* Powerbox auth manager    */
-    { "device_mgr",   -1, 0, 0 },  /* PCI device manager       */
-    { "shell",    -1, 0, 0 },
+        { "serial",   -1, 0, 0 },  /* IRQ-lifecycle: future work */
+        { "term",     -1, 0, 0 },  /* owns the framebuffer      */
+        { "keyboard", -1, 0, 0 },  /* owns IRQ1 + PS/2 ports    */
+        { "flaky",    -1, 0, 1 },
+        { "vfs",          -1, 0, 0 },  /* VFS namespace server     */
+        { "fs_mem_driver", -1, 0, 0 }, /* in-memory storage driver */
+        { "fs_virtio_blk_driver", -1, 0, 0 }, /* block-device storage driver */
+        { "perm",         -1, 0, 0 },  /* Powerbox auth manager    */
+        { "device_mgr",   -1, 0, 0 },  /* PCI device manager       */
+        { "pkg",          -1, 0, 0 },  /* .ops app container manager */
+        { "shell",    -1, 0, 0 },
 };
 
 #define SVC_SERIAL   0
@@ -102,9 +106,11 @@ static service_t s_services[] = {
 #define SVC_FLAKY    3
 #define SVC_VFS      4
 #define SVC_FS_MEM   5
-#define SVC_PERM     6
-#define SVC_DEVICE_MGR 7
-#define SVC_SHELL    8
+#define SVC_FS_VIRTIO_BLK 6
+#define SVC_PERM     7
+#define SVC_DEVICE_MGR 8
+#define SVC_PKG      9
+#define SVC_SHELL    10
 
 /* ====================================================================
  * Serial service output (mirrors shell.c)
@@ -115,16 +121,16 @@ static int s_serial_port = -1;      /* resolved once by the manager       */
 /* Send one byte to the serial service (WRITE op). */
 static void manager_putc(char c)
 {
-    if (s_serial_port < 0)
-        return;
+        if (s_serial_port < 0)
+                return;
 
-    u32 req[2 + 1];                 /* { op; len; data[1] } */
-    u32 resp[1];                    /* { ret }             */
-    req[0] = SERIAL_OP_WRITE;
-    req[1] = 1;
-    ((u8 *)req)[8] = (u8)c;
-    int resp_len = (int)sizeof(resp);
-    ipc_call(s_serial_port, (const void *)req, 9,
+        u32 req[2 + 1];                 /* { op; len; data[1] } */
+        u32 resp[1];                    /* { ret }             */
+        req[0] = SERIAL_OP_WRITE;
+        req[1] = 1;
+        ((u8 *)req)[8] = (u8)c;
+        int resp_len = (int)sizeof(resp);
+        ipc_call(s_serial_port, (const void *)req, 9,
              (void *)resp, &resp_len);
 }
 
@@ -132,84 +138,84 @@ static void manager_putc(char c)
  * chunked so the request buffer stays small and bounded. */
 static void manager_write(const char *s)
 {
-    if (s_serial_port < 0)
-        return;
+        if (s_serial_port < 0)
+                return;
 
-    u32 req[2 + 8];                 /* { op; len; data[32] } */
-    u32 resp[1];                    /* { ret }              */
-    while (*s != '\0') {
-        int n = 0;
-        while (n < SERIAL_CHUNK && s[n] != '\0') {
-            ((u8 *)req)[8 + n] = (u8)s[n];
-            n++;
-        }
-        req[0] = SERIAL_OP_WRITE;
-        req[1] = (u32)n;
-        int resp_len = (int)sizeof(resp);
-        ipc_call(s_serial_port, (const void *)req, 8 + n,
+        u32 req[2 + 8];                 /* { op; len; data[32] } */
+        u32 resp[1];                    /* { ret }              */
+        while (*s != '\0') {
+                int n = 0;
+                while (n < SERIAL_CHUNK && s[n] != '\0') {
+                        ((u8 *)req)[8 + n] = (u8)s[n];
+                        n++;
+                }
+                req[0] = SERIAL_OP_WRITE;
+                req[1] = (u32)n;
+                int resp_len = (int)sizeof(resp);
+                ipc_call(s_serial_port, (const void *)req, 8 + n,
                  (void *)resp, &resp_len);
-        s += n;
-    }
+                s += n;
+        }
 }
 
 /* Local int -> decimal string (the libc has no itoa). */
 static void manager_itoa(int v, char *buf)
 {
-    char tmp[12];
-    int i = 0, j = 0;
-    int neg = (v < 0);
-    if (neg)
-        v = -v;
-    if (v == 0)
-        tmp[i++] = '0';
-    while (v > 0) {
-        tmp[i++] = (char)('0' + (v % 10));
-        v /= 10;
-    }
-    if (neg)
-        buf[j++] = '-';
-    while (i > 0)
-        buf[j++] = tmp[--i];
-    buf[j] = '\0';
+        char tmp[12];
+        int i = 0, j = 0;
+        int neg = (v < 0);
+        if (neg)
+                v = -v;
+        if (v == 0)
+                tmp[i++] = '0';
+        while (v > 0) {
+                tmp[i++] = (char)('0' + (v % 10));
+                v /= 10;
+        }
+        if (neg)
+                buf[j++] = '-';
+        while (i > 0)
+                buf[j++] = tmp[--i];
+        buf[j] = '\0';
 }
 
 /* Minimal formatted output through the serial service.
  * Supports %d, %s, %c, %% — everything the manager needs. */
 static void manager_printf(const char *fmt, ...)
 {
-    va_list ap;
-    char num[12];
+        va_list ap;
+        char num[12];
 
-    va_start(ap, fmt);
-    for (const char *p = fmt; *p != '\0'; p++) {
-        if (*p != '%') {
-            manager_putc(*p);
-            continue;
+        va_start(ap, fmt);
+        for (const char *p = fmt; *p != '\0'; p++) {
+                if (*p != '%') {
+                        manager_putc(*p);
+                        continue;
+                }
+                p++;
+                if (*p == '\0')
+                        break;
+                switch (*p) {
+                case '%':
+                        manager_putc('%');
+                        break;
+                case 'c':
+                        manager_putc((char)va_arg(ap, int));
+                        break;
+                case 's':
+                        manager_write(va_arg(ap, const char *));
+                        break;
+                case 'd':
+                        manager_itoa(va_arg(ap, int), num);
+                        manager_write(num);
+                        break;
+                default:
+                        manager_putc('%');
+                        manager_putc(*p);
+                        break;
+                }
         }
-        p++;
-        if (*p == '\0')
-            break;
-        switch (*p) {
-        case '%':
-            manager_putc('%');
-            break;
-        case 'c':
-            manager_putc((char)va_arg(ap, int));
-            break;
-        case 's':
-            manager_write(va_arg(ap, const char *));
-            break;
-        case 'd':
-            manager_itoa(va_arg(ap, int), num);
-            manager_write(num);
-            break;
-        default:
-            manager_putc('%');
-            manager_putc(*p);
-            break;
-        }
-    }
-    va_end(ap);
+        va_end(ap);
 }
 
 /* ====================================================================
@@ -231,99 +237,99 @@ static void manager_printf(const char *fmt, ...)
  */
 static void serial_test_run(void)
 {
-    /* Wait for the service thread to create and register its port. */
-    int port = -1;
-    for (int i = 0; i < 20 && port < 0; i++) {
-        port = port_get("serial");
-        if (port < 0)
-            sleep(1);
-    }
-    if (port < 0) {
-        manager_printf("serial-test: port_get('serial') failed (%d)\n", port);
-        return;
-    }
-    manager_printf("serial-test: connected to 'serial' port %d\n", port);
+        /* Wait for the service thread to create and register its port. */
+        int port = -1;
+        for (int i = 0; i < 20 && port < 0; i++) {
+                port = port_get("serial");
+                if (port < 0)
+                        sleep(1);
+        }
+        if (port < 0) {
+                manager_printf("serial-test: port_get('serial') failed (%d)\n", port);
+                return;
+        }
+        manager_printf("serial-test: connected to 'serial' port %d\n", port);
 
-    /* Buffers (u32 arrays so the header fields stay aligned) */
-    u32 req[2 + 4];                 /* { op; len; data[..] } */
-    u32 resp[17];                   /* { ret; data[64] }    */
-    int resp_len;
+        /* Buffers (u32 arrays so the header fields stay aligned) */
+        u32 req[2 + 4];                 /* { op; len; data[..] } */
+        u32 resp[17];                   /* { ret; data[64] }    */
+        int resp_len;
 
-    /* ---- 1. WRITE: the marker string goes out over COM1 TX ---- */
-    static const char marker[] = "SERIAL_SVC_OK\n";
-    req[0] = SERIAL_OP_WRITE;
-    req[1] = (u32)(sizeof(marker) - 1);
-    for (int i = 0; i < (int)sizeof(marker) - 1; i++)
-        ((u8 *)req)[8 + i] = (u8)marker[i];
+        /* ---- 1. WRITE: the marker string goes out over COM1 TX ---- */
+        static const char marker[] = "SERIAL_SVC_OK\n";
+        req[0] = SERIAL_OP_WRITE;
+        req[1] = (u32)(sizeof(marker) - 1);
+        for (int i = 0; i < (int)sizeof(marker) - 1; i++)
+                ((u8 *)req)[8 + i] = (u8)marker[i];
 
-    resp_len = (int)sizeof(resp);
-    int ret = (int)ipc_call(port, (const void *)req,
-                            8 + (int)sizeof(marker) - 1,
-                            (void *)resp, &resp_len);
-    if (ret < 0) {
-        manager_printf("serial-test: WRITE ipc_call failed (%d)\n", ret);
-        return;
-    }
-    if ((i32)resp[0] < 0) {
-        manager_printf("serial-test: WRITE rejected (%d)\n", (i32)resp[0]);
-        return;
-    }
-    manager_printf("serial-test: WRITE ok - %d bytes sent, marker 'SERIAL_SVC_OK'\n",
+        resp_len = (int)sizeof(resp);
+        int ret = (int)ipc_call(port, (const void *)req,
+                                                        8 + (int)sizeof(marker) - 1,
+                                                        (void *)resp, &resp_len);
+        if (ret < 0) {
+                manager_printf("serial-test: WRITE ipc_call failed (%d)\n", ret);
+                return;
+        }
+        if ((i32)resp[0] < 0) {
+                manager_printf("serial-test: WRITE rejected (%d)\n", (i32)resp[0]);
+                return;
+        }
+        manager_printf("serial-test: WRITE ok - %d bytes sent, marker 'SERIAL_SVC_OK'\n",
                    (i32)resp[0]);
 
-    /* ---- 2. Real IRQ4 path: host injects bytes into COM1 RX ----
+        /* ---- 2. Real IRQ4 path: host injects bytes into COM1 RX ----
      * The service's IRQ thread drains the 16550 RX FIFO on IRQ4
      * notification (wait_notification -> FIFO drain -> ring), and the
      * next READ returns the bytes.  The shell is not alive yet, so
      * nothing competes for the RX bytes.  Poll with sleeps until the
      * injected marker round-trips (bounded window). */
-    manager_printf("serial-test: real-RX test - inject 'READ_PATH_OK' into COM1 now\n");
-    sleep(20);                      /* give the host time to react */
+        manager_printf("serial-test: real-RX test - inject 'READ_PATH_OK' into COM1 now\n");
+        sleep(20);                      /* give the host time to react */
 
-    static const char rxmark[] = "READ_PATH_OK\n";
-    int got = 0;
-    for (int tries = 0; tries < 30 && got == 0; tries++) {
-        req[0] = SERIAL_OP_READ;
-        req[1] = 32;
-        resp_len = (int)sizeof(resp);
-        ret = (int)ipc_call(port, (const void *)req, 8,
-                            (void *)resp, &resp_len);
-        if (ret < 0) {
-            manager_printf("serial-test: READ ipc_call failed (%d)\n", ret);
-            return;
-        }
-        i32 n = (i32)resp[0];
-        if (n < 0) {
-            manager_printf("serial-test: READ rejected (%d)\n", n);
-            return;
-        }
-        if (n > 0) {
-            if (n > (i32)sizeof(resp) - 4)
-                n = (i32)sizeof(resp) - 4;
-            /* manager_printf has no %.*s — NUL-terminate a local copy */
-            char echo[64];
-            int m = (n < (int)sizeof(echo) - 1) ? (int)n : (int)sizeof(echo) - 1;
-            for (int i = 0; i < m; i++)
-                echo[i] = (char)((u8 *)resp)[4 + i];
-            echo[m] = '\0';
-            manager_printf("serial-test: real RX ok - %d bytes: '%s'\n", n, echo);
+        static const char rxmark[] = "READ_PATH_OK\n";
+        int got = 0;
+        for (int tries = 0; tries < 30 && got == 0; tries++) {
+                req[0] = SERIAL_OP_READ;
+                req[1] = 32;
+                resp_len = (int)sizeof(resp);
+                ret = (int)ipc_call(port, (const void *)req, 8,
+                                                        (void *)resp, &resp_len);
+                if (ret < 0) {
+                        manager_printf("serial-test: READ ipc_call failed (%d)\n", ret);
+                        return;
+                }
+                i32 n = (i32)resp[0];
+                if (n < 0) {
+                        manager_printf("serial-test: READ rejected (%d)\n", n);
+                        return;
+                }
+                if (n > 0) {
+                        if (n > (i32)sizeof(resp) - 4)
+                                n = (i32)sizeof(resp) - 4;
+                        /* manager_printf has no %.*s — NUL-terminate a local copy */
+                        char echo[64];
+                        int m = (n < (int)sizeof(echo) - 1) ? (int)n : (int)sizeof(echo) - 1;
+                        for (int i = 0; i < m; i++)
+                                echo[i] = (char)((u8 *)resp)[4 + i];
+                        echo[m] = '\0';
+                        manager_printf("serial-test: real RX ok - %d bytes: '%s'\n", n, echo);
 
-            /* Verify the round-tripped bytes equal the injected marker */
-            int match = (n == (int)(sizeof(rxmark) - 1));
-            for (int i = 0; match && i < n; i++)
-                match = (echo[i] == rxmark[i]);
-            if (match)
-                manager_printf("serial-test: READ_PATH_OK - %d bytes round-tripped via IRQ4\n",
+                        /* Verify the round-tripped bytes equal the injected marker */
+                        int match = (n == (int)(sizeof(rxmark) - 1));
+                        for (int i = 0; match && i < n; i++)
+                                match = (echo[i] == rxmark[i]);
+                        if (match)
+                                manager_printf("serial-test: READ_PATH_OK - %d bytes round-tripped via IRQ4\n",
                                n);
-            got = 1;
+                        got = 1;
+                }
+                if (got == 0)
+                        sleep(10);
         }
         if (got == 0)
-            sleep(10);
-    }
-    if (got == 0)
-        manager_printf("serial-test: real RX - no bytes observed (none injected)\n");
+                manager_printf("serial-test: real RX - no bytes observed (none injected)\n");
 
-    manager_printf("serial-test: PASS - serial service verified\n");
+        manager_printf("serial-test: PASS - serial service verified\n");
 }
 
 /* ====================================================================
@@ -340,26 +346,27 @@ static void serial_test_run(void)
  */
 static int spawn_service(service_t *svc, int quiet)
 {
-    static char blob_buf[65536];   /* must hold the largest service ELF */
+        static char blob_buf[131072];  /* must hold the largest service ELF
+                                          (shell.elf ~108 KB after libc migration) */
 
-    int size = blob_get(svc->name, blob_buf, sizeof(blob_buf));
-    if (size < 0) {
-        if (!quiet)
-            manager_printf("manager: %s blob_get failed (%d)\n",
+        int size = blob_get(svc->name, blob_buf, sizeof(blob_buf));
+        if (size < 0) {
+                if (!quiet)
+                        manager_printf("manager: %s blob_get failed (%d)\n",
                            svc->name, size);
-        return size;
-    }
-    int pid = process_create(svc->name, blob_buf, size);
-    if (pid < 0) {
-        if (!quiet)
-            manager_printf("manager: %s process_create failed (%d)\n",
+                return size;
+        }
+        int pid = process_create(svc->name, blob_buf, size);
+        if (pid < 0) {
+                if (!quiet)
+                        manager_printf("manager: %s process_create failed (%d)\n",
                            svc->name, pid);
-        return pid;
-    }
-    svc->pid = pid;
-    if (!quiet)
-        manager_printf("manager: %s started (PID=%d)\n", svc->name, pid);
-    return 0;
+                return pid;
+        }
+        svc->pid = pid;
+        if (!quiet)
+                manager_printf("manager: %s started (PID=%d)\n", svc->name, pid);
+        return 0;
 }
 
 /* ====================================================================
@@ -378,25 +385,25 @@ static int spawn_service(service_t *svc, int quiet)
  */
 static void flaky_monitor(void)
 {
-    service_t *svc = &s_services[SVC_FLAKY];
+        service_t *svc = &s_services[SVC_FLAKY];
 
-    for (;;) {
-        int exit_code = 0;
-        int ret = process_wait(svc->pid, &exit_code);
-        if (ret < 0) {
-            manager_printf("manager: %s wait failed (%d)\n", svc->name, ret);
-            break;
-        }
-        if (svc->restart_count >= MAX_RESTARTS) {
-            manager_printf("manager: %s marked FAILED\n", svc->name);
-            break;
-        }
-        svc->restart_count++;
-        manager_printf("manager: %s exited (code %d), restart %d/%d\n",
+        for (;;) {
+                int exit_code = 0;
+                int ret = process_wait(svc->pid, &exit_code);
+                if (ret < 0) {
+                        manager_printf("manager: %s wait failed (%d)\n", svc->name, ret);
+                        break;
+                }
+                if (svc->restart_count >= MAX_RESTARTS) {
+                        manager_printf("manager: %s marked FAILED\n", svc->name);
+                        break;
+                }
+                svc->restart_count++;
+                manager_printf("manager: %s exited (code %d), restart %d/%d\n",
                        svc->name, exit_code, svc->restart_count, MAX_RESTARTS);
-        if (spawn_service(svc, 0) < 0)
-            break;
-    }
+                if (spawn_service(svc, 0) < 0)
+                        break;
+        }
 }
 
 /* ====================================================================
@@ -405,57 +412,57 @@ static void flaky_monitor(void)
 
 int main(void)
 {
-    /* ---- 1. Serial service first, then resolve its port ----
+        /* ---- 1. Serial service first, then resolve its port ----
      * All manager logging goes through the serial service (WRITE op),
      * so every log is deferred until the port resolves.  Only a
      * pre-resolution failure falls back to kernel debug_log().  (The
      * spawn success log is likewise dropped: s_serial_port is still
      * -1, so manager_putc() silently discards it.) */
-    if (spawn_service(&s_services[SVC_SERIAL], 0) < 0) {
-        debug_log("manager: serial service spawn FAILED\n");
-        for (;;)
-            thread_yield();
-    }
+        if (spawn_service(&s_services[SVC_SERIAL], 0) < 0) {
+                debug_log("manager: serial service spawn FAILED\n");
+                for (;;)
+                        thread_yield();
+        }
 
-    for (int i = 0; i < 2000 && s_serial_port < 0; i++) {
-        s_serial_port = port_get("serial");
-        if (s_serial_port < 0)
-            sleep(1);           /* let the serial process run and register */
-    }
-    if (s_serial_port < 0) {
-        debug_log("manager: serial port never resolved\n");
-        for (;;)
-            thread_yield();
-    }
-    manager_printf("manager: serial service ready (port %d)\n", s_serial_port);
+        for (int i = 0; i < 2000 && s_serial_port < 0; i++) {
+                s_serial_port = port_get("serial");
+                if (s_serial_port < 0)
+                        sleep(1);           /* let the serial process run and register */
+        }
+        if (s_serial_port < 0) {
+                debug_log("manager: serial port never resolved\n");
+                for (;;)
+                        thread_yield();
+        }
+        manager_printf("manager: serial service ready (port %d)\n", s_serial_port);
 
-    /* ---- 2. Serial self-test (markers byte-identical to P0-B) ---- */
-    manager_write("manager: running serial self-test\n");
-    serial_test_run();
+        /* ---- 2. Serial self-test (markers byte-identical to P0-B) ---- */
+        manager_write("manager: running serial self-test\n");
+        serial_test_run();
 
-    /* ---- 3. Terminal + keyboard services ----
+        /* ---- 3. Terminal + keyboard services ----
      * Spawned after the serial self-test (which must be the only serial
      * RX consumer) and before the flaky cycle: the shell needs both
      * ports resolved when it starts, and neither service touches the
      * serial port, so they cannot disturb the call stream. */
-    manager_write("manager: starting display services\n");
-    if (spawn_service(&s_services[SVC_TERM], 0) < 0)
-        for (;;)
-            thread_yield();
-    if (spawn_service(&s_services[SVC_KEYBOARD], 0) < 0)
-        for (;;)
-            thread_yield();
+        manager_write("manager: starting display services\n");
+        if (spawn_service(&s_services[SVC_TERM], 0) < 0)
+                for (;;)
+                        thread_yield();
+        if (spawn_service(&s_services[SVC_KEYBOARD], 0) < 0)
+                for (;;)
+                        thread_yield();
 
-    /* ---- 4. Flaky demo service ----
+        /* ---- 4. Flaky demo service ----
      * Only flaky is started here: it is IPC-silent (sleep + exit), so
      * it cannot disturb the serial-port call stream.  The shell is
      * deliberately NOT started yet — see the single-writer rule below. */
-    manager_write("manager: starting services\n");
-    if (spawn_service(&s_services[SVC_FLAKY], 0) < 0)
-        for (;;)
-            thread_yield();
+        manager_write("manager: starting services\n");
+        if (spawn_service(&s_services[SVC_FLAKY], 0) < 0)
+                for (;;)
+                        thread_yield();
 
-    /* ---- 5. Supervisor loop ----
+        /* ---- 5. Supervisor loop ----
      * The manager's single thread blocks in process_wait() until the
      * flaky process exits, then applies the restart policy.  During
      * the whole flaky cycle this thread is the ONLY ipc_call() user on
@@ -466,11 +473,11 @@ int main(void)
      * reply would clobber the first caller's reply slot and deadlock
      * it.  Kernel/serial.c/shell.c are off-limits, so the manager
      * serialises port access by construction instead.) */
-    flaky_monitor();
+        flaky_monitor();
 
-    manager_write("manager: MANAGER_OK\n");
+        manager_write("manager: MANAGER_OK\n");
 
-    /* ---- 5b. VFS services (before the shell — single-writer rule) ----
+        /* ---- 5b. VFS services (before the shell — single-writer rule) ----
      * vfs_server owns the namespace; fs_mem_driver is spawned as its
      * own process (decision A1) and performs the driver-initiated
      * MOUNT handshake against "vfs".  The manager waits for both ports
@@ -478,42 +485,77 @@ int main(void)
      * shell never sees a not-yet-mounted volume.  Neither service
      * touches the serial port while the manager is writing here, and
      * from now on all further output goes through them only. */
-    manager_write("manager: starting VFS services\n");
-    if (spawn_service(&s_services[SVC_VFS], 0) < 0)
-        for (;;)
-            thread_yield();
-    for (int i = 0; i < 2000 && port_get("vfs") < 0; i++)
-        sleep(1);
-    if (spawn_service(&s_services[SVC_FS_MEM], 0) < 0)
-        for (;;)
-            thread_yield();
-    for (int i = 0; i < 2000 && port_get("vfs.fs.mem") < 0; i++)
-        sleep(1);
-    sleep(20);      /* let the MOUNT handshake register both volumes */
+        manager_write("manager: starting VFS services\n");
+        if (spawn_service(&s_services[SVC_VFS], 0) < 0)
+                for (;;)
+                        thread_yield();
+        for (int i = 0; i < 2000 && port_get("vfs") < 0; i++)
+                sleep(1);
+        if (spawn_service(&s_services[SVC_FS_MEM], 0) < 0)
+                for (;;)
+                        thread_yield();
+        for (int i = 0; i < 2000 && port_get("vfs.fs.mem") < 0; i++)
+                sleep(1);
+        sleep(20);      /* let the MOUNT handshake register both volumes */
 
-    /* ---- 5c. Powerbox (perm-manager), before the shell ----
+        /* ---- 5b'. Powerbox (perm-manager), before the shell ----
      * vfs_server lazy-resolves the "perm" port on the first bookmark
      * op; term registers "perm.ui" at startup.  Spawned here so the
-     * shell's perm_answer/perm_revoke commands find both ports. */
-    manager_write("manager: starting Powerbox\n");
-    if (spawn_service(&s_services[SVC_PERM], 0) < 0)
-        for (;;)
-            thread_yield();
-    for (int i = 0; i < 2000 && port_get("perm") < 0; i++)
-        sleep(1);
+     * shell's perm_answer/perm_revoke commands find both ports.
+     * perm MUST come up before the block-device driver: that driver
+     * may degrade (no virtio-blk device) and never register its port,
+     * which would stall the manager here for the full 2000-tick wait
+     * and starve the init P1 suite (its own 2000-tick bookmark budget
+     * is the same length — a zero-value g_p1_res then cascades into
+     * every later GRANT/P2V test). */
+        manager_write("manager: starting Powerbox\n");
+        if (spawn_service(&s_services[SVC_PERM], 0) < 0)
+                for (;;)
+                        thread_yield();
+        for (int i = 0; i < 2000 && port_get("perm") < 0; i++)
+                sleep(1);
 
-    /* ---- 5d. PCI device manager, before the shell ----
+        /* ---- 5c. Block-device storage driver (before the shell) ----
+     * fs_virtio_blk_driver owns the persistent Disk volume (format on
+     * first boot, then mount); it must come after vfs_server (MOUNT
+     * handshake) and before the shell (which can then address "Disk:").
+     * The port wait + sleep mirror the fs_mem_driver block above.
+     * When no virtio-blk device exists the driver degrades WITHOUT
+     * registering 'vfs.fs.virtio_blk', so this wait runs its full
+     * budget — harmless for the regression (the init P1/P2 suite runs
+     * in parallel), only the shell start is delayed. */
+        manager_write("manager: starting block-device driver\n");
+        if (spawn_service(&s_services[SVC_FS_VIRTIO_BLK], 0) < 0)
+                for (;;)
+                        thread_yield();
+        for (int i = 0; i < 2000 && port_get("vfs.fs.virtio_blk") < 0; i++)
+                sleep(1);
+        sleep(20);      /* let the Disk MOUNT handshake register the volume */
+
+        /* ---- 5d. PCI device manager, before the shell ----
      * Spawned with the rest of the device services so its "device_mgr"
      * port is registered by the time the shell starts (the shell's
      * device_mgr commands resolve it lazily).  Like the perm service it
      * never touches the serial port, so it cannot disturb the call
      * stream.  The service self-checks the PCI enumeration at boot. */
-    manager_write("manager: starting device manager\n");
-    if (spawn_service(&s_services[SVC_DEVICE_MGR], 0) < 0)
-        for (;;)
-            thread_yield();
+        manager_write("manager: starting device manager\n");
+        if (spawn_service(&s_services[SVC_DEVICE_MGR], 0) < 0)
+                for (;;)
+                        thread_yield();
 
-    /* ---- 6. Shell LAST (keeps the single-writer rule) ----
+        /* ---- 5e. pkg-manager, before the shell ----
+     * pkg owns .ops application installation and sandbox capability
+     * issuance (docs/ops_format.md).  It depends on vfs (fs_write of
+     * /Volumes/Users/Apps) and perm (the Powerbox flow fires on the
+     * first Users-volume write), so it must come after both.  It never
+     * touches the serial port, so it cannot disturb the call stream.
+     * The shell resolves the "pkg" port lazily on its pkg commands. */
+        manager_write("manager: starting pkg-manager\n");
+        if (spawn_service(&s_services[SVC_PKG], 0) < 0)
+                for (;;)
+                        thread_yield();
+
+        /* ---- 6. Shell LAST (keeps the single-writer rule) ----
      * The shell is spawned only after the manager's output phase is
      * over, and the manager never writes to the serial port again:
      * from here on the shell is the sole ipc_call() user (banner,
@@ -521,10 +563,10 @@ int main(void)
      * silent (no "shell started (PID=..)" log): printing it after
      * process_create() would let the fresh shell run mid-print and
      * collide on the port. */
-    manager_write("manager: starting shell\n");
-    (void)spawn_service(&s_services[SVC_SHELL], 1);
+        manager_write("manager: starting shell\n");
+        (void)spawn_service(&s_services[SVC_SHELL], 1);
 
-    /* Idle — the shell keeps running as its own process. */
-    for (;;)
-        thread_yield();
+        /* Idle — the shell keeps running as its own process. */
+        for (;;)
+                thread_yield();
 }

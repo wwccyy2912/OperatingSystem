@@ -18,14 +18,14 @@ section .text
 global __restore_rt
 
 __restore_rt:
-    ; RSP == sigframe base (the slot holding our own address was popped
-    ; by the handler's ret).  Pass it as arg1 (RDI) to SYS_SIGRETURN.
-    mov rdi, rsp
-    mov eax, 50             ; SYS_SIGRETURN
-    int 0x80
+        ; RSP == sigframe base (the slot holding our own address was popped
+        ; by the handler's ret).  Pass it as arg1 (RDI) to SYS_SIGRETURN.
+        mov rdi, rsp
+        mov eax, 50             ; SYS_SIGRETURN
+        int 0x80
 
-    ; The kernel must never return from SYS_SIGRETURN.  If it does,
-    ; something is badly wrong — hang loudly.
+        ; The kernel must never return from SYS_SIGRETURN.  If it does,
+        ; something is badly wrong — hang loudly.
 .halt:
-    hlt
-    jmp .halt
+        hlt
+        jmp .halt

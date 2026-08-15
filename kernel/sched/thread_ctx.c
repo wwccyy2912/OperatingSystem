@@ -53,49 +53,49 @@ _Static_assert(offsetof(thread_t, rsp) + sizeof(thread_ctx_t) ==
  */
 i64 sc_sys_thread_set_ctx(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5)
 {
-    (void)a4;
-    (void)a5;
+        (void)a4;
+        (void)a5;
 
-    tid_t tid      = (tid_t)a1;
-    u64   ctx_ptr  = a2;
-    u64   ctx_size = a3;
+        tid_t tid      = (tid_t)a1;
+        u64   ctx_ptr  = a2;
+        u64   ctx_size = a3;
 
-    /* A negative TID cannot exist (the thread table is indexed by TID). */
-    if (tid < 0)
-        return (i64)ERR_INVAL;
+        /* A negative TID cannot exist (the thread table is indexed by TID). */
+        if (tid < 0)
+                return (i64)ERR_INVAL;
 
-    /* The caller must hand us exactly one thread_ctx_t. */
-    if (ctx_size != sizeof(thread_ctx_t))
-        return (i64)ERR_INVAL;
+        /* The caller must hand us exactly one thread_ctx_t. */
+        if (ctx_size != sizeof(thread_ctx_t))
+                return (i64)ERR_INVAL;
 
-    /* Resolve the target: it must be a thread of the CALLING process.
+        /* Resolve the target: it must be a thread of the CALLING process.
      * A thread that exists but belongs to another process is reported
      * like an unknown TID so no existence information leaks. */
-    process_t *proc = process_current();
-    if (!proc)
-        return (i64)ERR_FAULT;
-    thread_t *target = thread_get(tid);
-    if (!target || target->pid != proc->pid)
-        return (i64)ERR_NOENT;
+        process_t *proc = process_current();
+        if (!proc)
+                return (i64)ERR_FAULT;
+        thread_t *target = thread_get(tid);
+        if (!target || target->pid != proc->pid)
+                return (i64)ERR_NOENT;
 
-    /* Validate the user range before touching it: every page must be
+        /* Validate the user range before touching it: every page must be
      * mapped (the kernel reads the buffer, so need_write=false; a
      * present-but-unwritable page is fine).  This mirrors validate_user_ptr
      * in syscall.c, which wraps vmm_validate_user_range the same way, and
      * prevents an unmapped window from #PF-ing the kernel on the memcpy. */
-    if (!vmm_validate_user_range(proc->addr_space, ctx_ptr,
+        if (!vmm_validate_user_range(proc->addr_space, ctx_ptr,
                                  sizeof(thread_ctx_t), false))
-        return (i64)ERR_FAULT;
+                return (i64)ERR_FAULT;
 
-    /* Copy into a kernel-local struct, then overwrite the target's
+        /* Copy into a kernel-local struct, then overwrite the target's
      * saved-context slot.  The slot is the thread_t region at
      * &target->rsp, exactly sizeof(thread_ctx_t) bytes wide (see the
      * _Static_assert above).  rax..r11 are NOT part of the frame:
      * context_switch.S only saves/restores rsp, rbx, rbp, r12..r15,
      * rflags and rip, so there is nothing else to preserve. */
-    thread_ctx_t ctx;
-    memcpy(&ctx, (const void *)(uptr)ctx_ptr, sizeof(ctx));
-    memcpy(&target->rsp, &ctx, sizeof(ctx));
+        thread_ctx_t ctx;
+        memcpy(&ctx, (const void *)(uptr)ctx_ptr, sizeof(ctx));
+        memcpy(&target->rsp, &ctx, sizeof(ctx));
 
-    return (i64)OK;
+        return (i64)OK;
 }

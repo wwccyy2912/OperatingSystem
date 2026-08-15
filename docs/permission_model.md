@@ -1,8 +1,8 @@
 # OpSys 基于属性的动态权限模型（Attribute-Based Dynamic Permission Model）
 
-> 版本：v0.2（P0 地基已落地）
-> 日期：2026-08-11
-> 状态：**P0 地基 ✅ 已实现并验证（31/31 测试通过）** —— P1（perm-engine）待启动；含原设计五层模型 + 架构修正补充（补充一 ~ 补充八）
+> 版本：v0.4（P0 + P1 + P2 已落地）
+> 日期：2026-08-13
+> 状态：**P0 地基 ✅（31/31 测试通过）** —— **P1 perm-engine ✅（回归 31/31 + P1 10/10）** —— **P2 接入 ✅（回归 31/31 + P1 10/10 + P2 Gate 3/3 + P2 VFS 4/4）**；P3（上下文/频率/路径约束）、P4（持久化/审计/开发者/恢复模式）待启动（P3/P4 协议接口已预留，见 §十）；含原设计五层模型 + 架构修正补充（补充一 ~ 补充八）
 > 关联：docs/vfs_design.md（书签 + Powerbox）、docs/kernel_roadmap.md、kernel/cap/、kernel/ipc/、user/services/perm/
 
 ---
@@ -369,10 +369,10 @@ typedef enum {
 | Phase | 内容 | 关键交付 | 验收标准 |
 |-------|------|---------|---------|
 | **P0 地基** ✅ | 内核 SubjectID + 消息头身份 + 能力生命周期 | `process_t.subject_id`、`SYS_IPC_RECV_FROM` sender 出参、`cap_entry_t` 扩展（atom/expiry/quota/scope）、`SYS_CAP_CREATE_ATOM`/`SYS_CAP_CONSUME`/`SYS_CAP_REVOKE_BY_ATOM`、`atom.h` 枚举 | 两个进程互冒充身份被拒；能力超时自动失效；批量撤权生效；31/31 测试通过（27 现有 + 4 新增 P0 测试）|
-| **P1 引擎** | perm-engine（perm-manager 进化版） | 策略存储（内存+导出）、角色解析、规则链评估、check API、能力签发路径、UI 聚合标签 | 弹窗→授权→能力签发闭环；角色切换热重载；UI 显示聚合文案 |
-| **P2 接入** | VFS 全操作接入 + 敏感 syscall 门控 | 文件 open/read/write 全部走 check；FileHandle 能力化（抹位）；`sys_set_time` 等走能力门控 | 未授权读写被拒且 EPERM；只读授权拿不到 WRITE 句柄；现有书签流程兼容 |
-| **P3 上下文** | 前台感知、频率计数、路径约束 | 焦点/前台服务；频率计数；scope=bookmark 落地 | 切后台摄像头能力回收；1h 10 次位置限制生效 |
-| **P4 治理** | 持久化、审计、开发者模式、恢复模式 | Policy.db 落盘（块设备就绪后）、加密审计、Developer 角色+水印、Recovery 签名链 | 重启策略保留；审计不可篡改；无 Root 路径可达 |
+| **P1 引擎** ✅ | perm-engine（perm-manager 进化版） | 策略存储（内存+导出）、角色解析、规则链评估、check API、能力签发路径、UI 聚合标签 | 弹窗→授权→能力签发闭环；角色切换热重载；UI 显示聚合文案；回归 31/31 + P1 10/10 |
+| **P2 接入** ✅ | VFS 全操作接入 + 敏感 syscall 门控 | 文件 open/read/write 全部走 check；FileHandle 能力化（抹位）；`sys_set_time` 等走能力门控 | 未授权读写被拒且 EPERM；只读授权拿不到 WRITE 句柄；现有书签流程兼容；回归 31/31 + P1 10/10 + P2 Gate 3/3 + P2 VFS 4/4 |
+| **P3 上下文** | 前台感知、频率计数、路径约束 | 焦点/前台服务；频率计数；scope=bookmark 落地（协议已预留：`perm_req_check_t.scope_hash`、`PERM_OP_CONTEXT`/`PERM_OP_FREQ`、perm-engine 频率计数表） | 切后台摄像头能力回收；1h 10 次位置限制生效 |
+| **P4 治理** | 持久化、审计、开发者模式、恢复模式 | Policy.db 落盘（块设备就绪后）、加密审计、Developer 角色+水印、Recovery 签名链（协议已预留：`PERM_OP_POLICY_SAVE`/`PERM_OP_POLICY_LOAD` 热重载、`PERM_OP_AUDIT` 审计环形缓冲） | 重启策略保留；审计不可篡改；无 Root 路径可达 |
 
 **顺序原则**：P0 是 P1-P4 的前提（身份+生命周期不落地，上层全是空中楼阁）；
 P1 与现有 Powerbox 并行演进（perm-manager → perm-engine 平滑替换）；P2 的

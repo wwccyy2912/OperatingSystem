@@ -17,11 +17,11 @@
 
 /* Framebuffer info (filled by fb_init) */
 typedef struct {
-    u64  addr;          /* Virtual address of mapped framebuffer */
-    u32  width;         /* Width in pixels */
-    u32  height;        /* Height in pixels */
-    u32  pitch;         /* Bytes per scanline */
-    u8   bpp;           /* Bits per pixel */
+        u64  addr;          /* Virtual address of mapped framebuffer */
+        u32  width;         /* Width in pixels */
+        u32  height;        /* Height in pixels */
+        u32  pitch;         /* Bytes per scanline */
+        u8   bpp;           /* Bits per pixel */
 } fb_info_t;
 
 /*
@@ -34,12 +34,12 @@ typedef struct {
  * struct in user/lib/libos/syscalls.h.
  */
 typedef struct {
-    u64  phys_addr;     /* Physical address of the framebuffer */
-    u32  width;         /* Width in pixels (logical px in VGA text mode) */
-    u32  height;        /* Height in pixels (logical px in VGA text mode) */
-    u32  pitch;         /* Bytes per scanline (linear mode only) */
-    u8   bpp;           /* Bits per pixel (linear mode only) */
-    u8   vga_text;      /* 1 = VGA text mode (0xB8000), 0 = linear RGB */
+        u64  phys_addr;     /* Physical address of the framebuffer */
+        u32  width;         /* Width in pixels (logical px in VGA text mode) */
+        u32  height;        /* Height in pixels (logical px in VGA text mode) */
+        u32  pitch;         /* Bytes per scanline (linear mode only) */
+        u8   bpp;           /* Bits per pixel (linear mode only) */
+        u8   vga_text;      /* 1 = VGA text mode (0xB8000), 0 = linear RGB */
 } fb_user_info_t;
 
 /* Common 32-bit RGB colors */

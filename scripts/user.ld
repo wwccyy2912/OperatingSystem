@@ -10,57 +10,57 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x400000;
+        . = 0x400000;
 
-    .text : ALIGN(4096)
-    {
-        *(.text)
-        *(.text.*)
-    }
+        .text : ALIGN(4096)
+        {
+                *(.text)
+                *(.text.*)
+        }
 
-    .rodata : ALIGN(4096)
-    {
-        *(.rodata)
-        *(.rodata.*)
-    }
+        .rodata : ALIGN(4096)
+        {
+                *(.rodata)
+                *(.rodata.*)
+        }
 
-    .data : ALIGN(4096)
-    {
-        *(.data)
-        *(.data.*)
-    }
+        .data : ALIGN(4096)
+        {
+                *(.data)
+                *(.data.*)
+        }
 
-    .init_array : ALIGN(8)
-    {
-        __init_array_start = .;
-        *(.init_array)
-        *(.init_array.*)
-        __init_array_end = .;
-    }
+        .init_array : ALIGN(8)
+        {
+                __init_array_start = .;
+                *(.init_array)
+                *(.init_array.*)
+                __init_array_end = .;
+        }
 
-    .fini_array : ALIGN(8)
-    {
-        __fini_array_start = .;
-        *(.fini_array)
-        *(.fini_array.*)
-        __fini_array_end = .;
-    }
+        .fini_array : ALIGN(8)
+        {
+                __fini_array_start = .;
+                *(.fini_array)
+                *(.fini_array.*)
+                __fini_array_end = .;
+        }
 
-    .bss : ALIGN(4096)
-    {
-        _bss_start = .;
-        *(.bss)
-        *(.bss.*)
-        *(COMMON)
-        _bss_end = .;
-    }
+        .bss : ALIGN(4096)
+        {
+                _bss_start = .;
+                *(.bss)
+                *(.bss.*)
+                *(COMMON)
+                _bss_end = .;
+        }
 
-    /DISCARD/ :
-    {
-        *(.comment)
-        *(.note.*)
-        *(.eh_frame)
-        *(.eh_frame_hdr)
-        *(.gnu.build-id)
-    }
+        /DISCARD/ :
+        {
+                *(.comment)
+                *(.note.*)
+                *(.eh_frame)
+                *(.eh_frame_hdr)
+                *(.gnu.build-id)
+        }
 }

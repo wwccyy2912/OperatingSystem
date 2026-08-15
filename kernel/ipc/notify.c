@@ -31,10 +31,10 @@ static spinlock_t s_notify_lock = SPINLOCK_INIT;
  * it into the CFS tree). */
 static void notify_wake(thread_t *t)
 {
-    if (t && t->state == THREAD_STATE_BLOCKED) {
-        t->state = THREAD_STATE_READY;
-        sched_enqueue(t);
-    }
+        if (t && t->state == THREAD_STATE_BLOCKED) {
+                t->state = THREAD_STATE_READY;
+                sched_enqueue(t);
+        }
 }
 
 /*
@@ -45,24 +45,24 @@ static void notify_wake(thread_t *t)
  */
 error_t notify(tid_t target_tid, u32 mask)
 {
-    spin_lock(&s_notify_lock);
+        spin_lock(&s_notify_lock);
 
-    thread_t *target = thread_get(target_tid);
-    if (!target) {
+        thread_t *target = thread_get(target_tid);
+        if (!target) {
+                spin_unlock(&s_notify_lock);
+                return ERR_NOENT;
+        }
+
+        target->pending_signals |= mask;
+
+        /* Wake the target only when matched bits are non-zero */
+        if (target->wait_mask != 0 &&
+                (target->pending_signals & target->wait_mask) != 0) {
+                notify_wake(target);
+        }
+
         spin_unlock(&s_notify_lock);
-        return ERR_NOENT;
-    }
-
-    target->pending_signals |= mask;
-
-    /* Wake the target only when matched bits are non-zero */
-    if (target->wait_mask != 0 &&
-        (target->pending_signals & target->wait_mask) != 0) {
-        notify_wake(target);
-    }
-
-    spin_unlock(&s_notify_lock);
-    return OK;
+        return OK;
 }
 
 /*
@@ -75,21 +75,21 @@ error_t notify(tid_t target_tid, u32 mask)
  */
 u32 wait_notification(u32 mask)
 {
-    thread_t *cur = thread_current();
-    if (!cur)
-        return 0;
+        thread_t *cur = thread_current();
+        if (!cur)
+                return 0;
 
-    spin_lock(&s_notify_lock);
+        spin_lock(&s_notify_lock);
 
-    /* Fast path: poll (mask == 0) or signals already pending */
-    if (mask == 0 || (cur->pending_signals & mask) != 0) {
-        u32 val = cur->pending_signals;
-        cur->pending_signals = 0;
-        spin_unlock(&s_notify_lock);
-        return val;
-    }
+        /* Fast path: poll (mask == 0) or signals already pending */
+        if (mask == 0 || (cur->pending_signals & mask) != 0) {
+                u32 val = cur->pending_signals;
+                cur->pending_signals = 0;
+                spin_unlock(&s_notify_lock);
+                return val;
+        }
 
-    /* Block until notify() delivers a matching signal.
+        /* Block until notify() delivers a matching signal.
      *
      * Critical section (lock held, IF=0): wait_mask, state and the
      * ready-tree dequeue must be atomic w.r.t. the timer IRQ.  If a
@@ -97,17 +97,17 @@ u32 wait_notification(u32 mask)
      * pick_next() (which does NOT check state) could force-pick it as
      * `next`, mark it RUNNING and switch into it -- a spurious wakeup
      * with no signals pending.  Mirror sched_sleep()'s dequeue. */
-    cur->wait_mask = mask;
-    cur->state = THREAD_STATE_BLOCKED;
-    sched_dequeue(cur);
-    spin_unlock(&s_notify_lock);
-    thread_yield();
+        cur->wait_mask = mask;
+        cur->state = THREAD_STATE_BLOCKED;
+        sched_dequeue(cur);
+        spin_unlock(&s_notify_lock);
+        thread_yield();
 
-    /* Woken by notify(): clear the wait and consume the word */
-    spin_lock(&s_notify_lock);
-    cur->wait_mask = 0;
-    u32 val = cur->pending_signals;
-    cur->pending_signals = 0;
-    spin_unlock(&s_notify_lock);
-    return val;
+        /* Woken by notify(): clear the wait and consume the word */
+        spin_lock(&s_notify_lock);
+        cur->wait_mask = 0;
+        u32 val = cur->pending_signals;
+        cur->pending_signals = 0;
+        spin_unlock(&s_notify_lock);
+        return val;
 }

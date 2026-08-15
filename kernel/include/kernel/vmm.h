@@ -50,8 +50,8 @@ extern u64 vmm_kernel_cr3;
 
 /* Address space structure */
 typedef struct {
-    u64 pml4_phys;      /* Physical address of PML4 */
-    u64 stack_base;     /* ASLR: per-address-space user stack region base
+        u64 pml4_phys;      /* Physical address of PML4 */
+        u64 stack_base;     /* ASLR: per-address-space user stack region base
                          * (1 MB aligned; thread TID stacks at
                          * stack_base + tid*PAGE_SIZE).  Random per
                          * address space — see rng.h aslr_stack_base(). */
@@ -115,7 +115,7 @@ void vmm_switch_addr_space(addr_space_t *as);
  * Map a range of pages.
  */
 error_t vmm_map_range(addr_space_t *as, u64 virt, u64 phys,
-                      u64 page_count, u64 flags);
+                                            u64 page_count, u64 flags);
 
 /**
  * Unmap a range of pages.

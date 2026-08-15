@@ -37,7 +37,7 @@ LDFLAGS := -T kernel/arch/x86_64/linker.ld -nostdlib -z max-page-size=0x1000
 # User-space flags (different include paths, large model for position-independent)
 USER_CFLAGS := -ffreestanding -ffunction-sections -fdata-sections \
                -fno-stack-protector -nostdlib -nostdinc -mcmodel=large \
-               -mno-red-zone -mno-sse -mno-sse2 -mno-mmx \
+               -mno-red-zone \
                -isystem $(FREESTANDING_INC) \
                -I user/lib -I user/lib/libos -I user/lib/libc \
                -I user/runtime/include \
@@ -60,6 +60,7 @@ KERNEL_C := \
     kernel/arch/x86_64/io.c \
     kernel/arch/x86_64/rtc.c \
     kernel/arch/x86_64/rng.c \
+    kernel/arch/x86_64/virtio_blk.c \
     kernel/arch/x86_64/stack_chk.c \
     kernel/mm/pmm.c \
     kernel/mm/vmm.c \
@@ -93,6 +94,12 @@ USER_C := \
     user/lib/libc/stdlib.c \
     user/lib/libc/string.c \
     user/lib/libc/ctype.c \
+    user/lib/libc/inttypes.c \
+    user/lib/libc/time.c \
+    user/lib/libc/math.c \
+    user/lib/libc/threads.c \
+    user/lib/libc/wchar.c \
+    user/lib/libc/wctype.c \
     user/lib/libos/syscalls.c \
     user/lib/libos/elf_parse.c \
     user/lib/libipc/ipc.c \
@@ -106,9 +113,13 @@ USER_C := \
     user/services/hello/main.c \
     user/services/vfs/vfs_server.c \
     user/services/vfs/fs_mem_driver.c \
+    user/services/vfs/fs_virtio_blk_driver.c \
     user/services/perm/perm-manager.c \
     user/services/device_mgr/device_mgr.c \
-    user/lib/libfs/fs.c
+    user/services/pkg/pkg_manager.c \
+    user/services/sbox_demo/main.c \
+    user/lib/libfs/fs.c \
+    user/lib/libpkg/pkg.c
 
 # Object files (mirror source tree under build/) ------------------------------
 # NASM .asm -> build/<path>.asm.o   NASM .S -> build/<path>.S.o
@@ -119,7 +130,8 @@ KERNEL_OBJ    := $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ)
 
 USER_ASM := \
     user/runtime/crt0.S \
-    user/runtime/sigrestore.S
+    user/runtime/sigrestore.S \
+    user/lib/libc/setjmp.S
 USER_C_OBJ   := $(patsubst %.c, build/%.c.o, $(USER_C))
 USER_ASM_OBJ := $(patsubst %.S, build/%.S.o, $(USER_ASM))
 USER_OBJ     := $(USER_C_OBJ) $(USER_ASM_OBJ)
@@ -142,11 +154,14 @@ USER_SVC_ENTRY_OBJ := \
     build/user/services/hello/main.c.o \
     build/user/services/vfs/vfs_server.c.o \
     build/user/services/vfs/fs_mem_driver.c.o \
+    build/user/services/vfs/fs_virtio_blk_driver.c.o \
     build/user/services/perm/perm-manager.c.o \
-    build/user/services/device_mgr/device_mgr.c.o
+    build/user/services/device_mgr/device_mgr.c.o \
+    build/user/services/pkg/pkg_manager.c.o \
+    build/user/services/sbox_demo/main.c.o
 USER_SHARED_OBJ := $(filter-out $(USER_SVC_ENTRY_OBJ), $(USER_OBJ))
 
-SVC_NAMES := init manager serial keyboard term shell flaky hello vfs fs_mem_driver perm device_mgr
+SVC_NAMES := init manager serial keyboard term shell flaky hello vfs fs_mem_driver fs_virtio_blk_driver perm device_mgr pkg sbox_demo
 SVC_BLOBS := $(addprefix build/, $(addsuffix _blob.o, $(SVC_NAMES)))
 
 # ==============================================================================
@@ -213,8 +228,11 @@ $(eval $(call SVC_LINK_RULE,flaky,flaky/main.c.o))
 $(eval $(call SVC_LINK_RULE,hello,hello/main.c.o))
 $(eval $(call SVC_LINK_RULE,vfs,vfs/vfs_server.c.o))
 $(eval $(call SVC_LINK_RULE,fs_mem_driver,vfs/fs_mem_driver.c.o))
+$(eval $(call SVC_LINK_RULE,fs_virtio_blk_driver,vfs/fs_virtio_blk_driver.c.o))
 $(eval $(call SVC_LINK_RULE,perm,perm/perm-manager.c.o))
 $(eval $(call SVC_LINK_RULE,device_mgr,device_mgr/device_mgr.c.o))
+$(eval $(call SVC_LINK_RULE,pkg,pkg/pkg_manager.c.o))
+$(eval $(call SVC_LINK_RULE,sbox_demo,sbox_demo/main.c.o))
 
 # Embed each service ELF as a kernel blob object (symbols renamed to <svc>_elf_*).
 define SVC_BLOB_RULE
@@ -254,7 +272,9 @@ run: iso
 		-m 256M \
 		-nographic \
 		-serial mon:stdio \
-		-d int,cpu_reset,guest_errors
+		-d int,cpu_reset,guest_errors \
+		-drive file=disk.img,if=none,id=vd,cache=writethrough \
+		-device virtio-blk-pci,drive=vd,disable-modern=on
 
 debug: iso
 	@echo ">>> GDB stub listening on port 1234"
@@ -264,7 +284,9 @@ debug: iso
 		-m 256M \
 		-nographic \
 		-serial mon:stdio \
-		-s -S
+		-s -S \
+		-drive file=disk.img,if=none,id=vd,cache=writethrough \
+		-device virtio-blk-pci,drive=vd,disable-modern=on
 
 # --- Cleanup ------------------------------------------------------------------
 clean:

@@ -9,6 +9,12 @@
 extern int __errno;
 #define errno __errno
 
+/* Standard POSIX errno accessor — returns the address of the per-thread
+ * errno storage.  v0.1: single global; v1.0+ will return a TLS slot.
+ * Provided so libc and user code can use the standard idiom
+ * (*__errno_location()) = ENOMEM; without depending on the macro. */
+int *__errno_location(void);
+
 /* Standard POSIX error codes */
 #define EPERM    1
 #define ENOENT   2

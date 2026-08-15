@@ -122,4 +122,40 @@
 #define SYS_CAP_CONSUME            58   /* (handle) */
 #define SYS_CAP_REVOKE_BY_ATOM     59   /* (subject, atom, scope_hash) */
 
+/* ---- P1 地基: perm-engine signing path (docs/permission_model.md §四) ----
+ * Subject-targeted atom issuance: resolves the target process by
+ * subject_id and creates the atom cap in ITS table (entry.subject =
+ * target).  This is how the perm-engine encodes an authorization
+ * decision into a capability without holding a handle first. */
+#define SYS_CAP_GRANT_TO_SUBJECT   60   /* (subject, atom, rights, expiry, quota) */
+
+/* ---- P2 地基: sensitive syscall gating (docs/permission_model.md §四) ----
+ * Sensitive syscalls are gated by atom caps: the handler does a pure
+ * kernel cap-table lookup (决策下沉 — ZERO IPC to user space) and
+ * returns ERR_NOCAP when the caller holds no live atom cap. */
+#define SYS_SET_TIME              61   /* (rtc_time_t *user_t) */
+
+/* ---- Block device (Phase 1: legacy virtio-blk, kernel/arch/x86_64/
+ * virtio_blk.c).  Gated on CAP_TYPE_PCI_DEV (obj_id = PCI table index
+ * of the adapter, rights RIGHT_READ|RIGHT_WRITE). */
+#define SYS_BLK_READ              62   /* (disk, lba, count, buf) */
+#define SYS_BLK_WRITE             63   /* (disk, lba, count, buf) */
+#define SYS_BLK_INFO              64   /* (disk, out blk_info_t) */
+
+/* ---- P0 地基: app identity query (docs/permission_model.md §三) ----
+ * Unit 1 (TUI 权限查询): the app identity moves from a forgeable
+ * self-reported u32 app_id_hash to the kernel-issued App Subject
+ * (uuid), allocated at app instantiation.  Resolves a subject_id to
+ * the target process's kernel-issued identity record. */
+#define SYS_PROC_INFO_BY_SUBJECT  65   /* (subject, out proc_ident_t *) */
+
+/* ---- P1 地基: management-plane atom inspection (docs/ops_format.md §6) ----
+ * Read-only query: does `subject` hold a live atom cap for `atom`?
+ * Returns 1/0.  Used by the perm-engine's do_grant gate (capability-
+ * based: a caller holding ATOM_SERVICE_MANAGE may grant even when its
+ * ROLE is not management — grants beat role defaults, §四).  GATED on
+ * ATOM_SERVICE_MANAGE of the CALLER: only management-plane processes
+ * may inspect others' atom holdings. */
+#define SYS_CAP_HAS_ATOM          66   /* (subject, atom) -> 1/0 */
+
 #endif /* KERNEL_SYSCALL_NUMBERS_H */

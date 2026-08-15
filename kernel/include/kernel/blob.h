@@ -15,12 +15,12 @@
 #include <kernel/types.h>
 
 #define BLOB_NAME_MAX       32   /* Max blob name length incl. NUL */
-#define BLOB_MAX_ENTRIES    16   /* Max registered blobs (8 services + vfs + fs_mem_driver) */
+#define BLOB_MAX_ENTRIES    18   /* Max registered blobs (services + sbox_demo_noperm alias + headroom) */
 
 typedef struct {
-    char     name[BLOB_NAME_MAX];
-    const void *data;            /* Kernel virtual address of blob */
-    u64      size;               /* Blob length in bytes */
+        char     name[BLOB_NAME_MAX];
+        const void *data;            /* Kernel virtual address of blob */
+        u64      size;               /* Blob length in bytes */
 } blob_entry_t;
 
 /**

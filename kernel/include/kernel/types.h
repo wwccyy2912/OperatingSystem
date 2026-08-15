@@ -49,17 +49,17 @@ typedef u32 gid_t;
 
 /* Error codes */
 typedef enum {
-    OK              = 0,
-    ERR_NOMEM       = -1,
-    ERR_INVAL       = -2,
-    ERR_NOCAP       = -3,
-    ERR_NOENT       = -4,
-    ERR_BUSY        = -5,
-    ERR_AGAIN       = -6,
-    ERR_FAULT       = -7,
-    ERR_OVERFLOW    = -8,
-    ERR_DENIED      = -9,
-    ERR_INTERRUPTED = -10,  /* blocking wait aborted by a signal kill */
+        OK              = 0,
+        ERR_NOMEM       = -1,
+        ERR_INVAL       = -2,
+        ERR_NOCAP       = -3,
+        ERR_NOENT       = -4,
+        ERR_BUSY        = -5,
+        ERR_AGAIN       = -6,
+        ERR_FAULT       = -7,
+        ERR_OVERFLOW    = -8,
+        ERR_DENIED      = -9,
+        ERR_INTERRUPTED = -10,  /* blocking wait aborted by a signal kill */
 } error_t;
 
 /* Memory protection flags */
@@ -84,17 +84,18 @@ typedef u32 rights_t;
 /* Maximum values */
 /*
  * MAX_THREADS bounds the thread table, the process table (one entry
- * per PID), the per-process capability table pool and the user thread
- * stack region (ASLR_STACK_BLOCK = MAX_THREADS * PAGE_SIZE).
+ * per PID), the per-process capability table pointer array and the
+ * user thread stack region (ASLR_STACK_BLOCK = MAX_THREADS * PAGE_SIZE).
  *
  * Raised from 256 to 1024 so a single process can run 1000+ concurrent
  * threads (stress test).  Static memory cost at 1024:
- *   - s_cap_table_pool:   1024 x sizeof(cap_table_t) = 40 MB (BSS)
- *   - s_gen_counters:     1024 x MAX_CAPS = 1 MB (BSS)
+ *   - s_cap_tables:       1024 x 8 B = 8 KB (BSS, pointer array only)
  *   - s_thread_table:     ~0.3 MB
  *   - s_process_table:    ~0.7 MB
  *   - ASLR stack region:  1024 pages = 4 MB virtual (fits in the
  *     [0x90000000, 0x100000000) block; physical only when touched)
+ *   - Cap tables themselves are dynamically allocated (~73 KB each via
+ *     pmm_alloc_pages) — ~1 MB total for 14 live processes.
  */
 #define MAX_THREADS     1024
 #define MAX_PORTS       256

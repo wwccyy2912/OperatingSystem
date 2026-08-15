@@ -27,6 +27,6 @@ int ipc_connect(const char *service_name);
  * @return 0 on success, negative error code on failure.
  */
 int ipc_request(int port, const void *req, int req_len,
-                void *resp, int resp_len);
+                                void *resp, int resp_len);
 
 #endif /* LIBIPC_IPC_CLIENT_H */

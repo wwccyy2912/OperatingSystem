@@ -58,13 +58,13 @@ typedef int32_t     i32;
  * ==================================================================== */
 
 typedef struct {
-    u32 op;             /* DMGR_OP_* */
-    i32 index;          /* GET_DEVICE: 0-based device index */
+        u32 op;             /* DMGR_OP_* */
+        i32 index;          /* GET_DEVICE: 0-based device index */
 } dmgr_req_t;
 
 typedef struct {
-    i32 ret;            /* GET_COUNT: count; GET_DEVICE: 0 or error */
-    pci_device_info_t dev;   /* GET_DEVICE: device snapshot (zeroed on error) */
+        i32 ret;            /* GET_COUNT: count; GET_DEVICE: 0 or error */
+        pci_device_info_t dev;   /* GET_DEVICE: device snapshot (zeroed on error) */
 } dmgr_resp_t;
 
 /* ====================================================================
@@ -82,16 +82,16 @@ static u8 s_resp[sizeof(dmgr_resp_t)];
  */
 static void dmgr_reply(int token, i32 ret, const pci_device_info_t *dev)
 {
-    dmgr_resp_t *resp = (dmgr_resp_t *)s_resp;
-    resp->ret = ret;
-    if (dev) {
-        resp->dev = *dev;
-    } else {
-        memset(&resp->dev, 0, sizeof(resp->dev));
-    }
-    int r = ipc_reply(token, s_resp, (int)sizeof(*resp));
-    if (r < 0)
-        printf("device_mgr: ipc_reply failed (%d)\n", r);
+        dmgr_resp_t *resp = (dmgr_resp_t *)s_resp;
+        resp->ret = ret;
+        if (dev) {
+                resp->dev = *dev;
+        } else {
+                memset(&resp->dev, 0, sizeof(resp->dev));
+        }
+        int r = ipc_reply(token, s_resp, (int)sizeof(*resp));
+        if (r < 0)
+                printf("device_mgr: ipc_reply failed (%d)\n", r);
 }
 
 /*
@@ -101,31 +101,31 @@ static void dmgr_reply(int token, i32 ret, const pci_device_info_t *dev)
  */
 static void dmgr_handle_request(int token, u32 op, int msg_len)
 {
-    switch (op) {
-    case DMGR_OP_GET_COUNT: {
-        int n = pci_get_count();
-        dmgr_reply(token, (i32)n, NULL);
-        break;
-    }
-    case DMGR_OP_GET_DEVICE: {
-        if (msg_len < (int)sizeof(dmgr_req_t)) {
-            dmgr_reply(token, ERR_INVAL, NULL);
-            break;
+        switch (op) {
+        case DMGR_OP_GET_COUNT: {
+                int n = pci_get_count();
+                dmgr_reply(token, (i32)n, NULL);
+                break;
         }
-        dmgr_req_t *req = (dmgr_req_t *)s_req;
-        pci_device_info_t dev;
-        int r = pci_get_device(req->index, &dev);
-        if (r < 0) {
-            dmgr_reply(token, (i32)r, NULL);
-            break;
+        case DMGR_OP_GET_DEVICE: {
+                if (msg_len < (int)sizeof(dmgr_req_t)) {
+                        dmgr_reply(token, ERR_INVAL, NULL);
+                        break;
+                }
+                dmgr_req_t *req = (dmgr_req_t *)s_req;
+                pci_device_info_t dev;
+                int r = pci_get_device(req->index, &dev);
+                if (r < 0) {
+                        dmgr_reply(token, (i32)r, NULL);
+                        break;
+                }
+                dmgr_reply(token, 0, &dev);
+                break;
         }
-        dmgr_reply(token, 0, &dev);
-        break;
-    }
-    default:
-        dmgr_reply(token, ERR_INVAL, NULL);
-        break;
-    }
+        default:
+                dmgr_reply(token, ERR_INVAL, NULL);
+                break;
+        }
 }
 
 /* ====================================================================
@@ -138,21 +138,21 @@ static void dmgr_handle_request(int token, u32 op, int msg_len)
  */
 static void dmgr_server_loop(int port)
 {
-    for (;;) {
-        int msg_len = (int)sizeof(s_req);
-        int token = 0;
-        int ret = ipc_recv(port, s_req, &msg_len, &token);
-        if (ret < 0) {
-            printf("device_mgr: ipc_recv failed (%d)\n", ret);
-            thread_exit(1);
+        for (;;) {
+                int msg_len = (int)sizeof(s_req);
+                int token = 0;
+                int ret = ipc_recv(port, s_req, &msg_len, &token);
+                if (ret < 0) {
+                        printf("device_mgr: ipc_recv failed (%d)\n", ret);
+                        thread_exit(1);
+                }
+                if (msg_len < (int)sizeof(u32)) {   /* no op code */
+                        dmgr_reply(token, ERR_INVAL, NULL);
+                        continue;
+                }
+                u32 op = *(u32 *)s_req;
+                dmgr_handle_request(token, op, msg_len);
         }
-        if (msg_len < (int)sizeof(u32)) {   /* no op code */
-            dmgr_reply(token, ERR_INVAL, NULL);
-            continue;
-        }
-        u32 op = *(u32 *)s_req;
-        dmgr_handle_request(token, op, msg_len);
-    }
 }
 
 /* ====================================================================
@@ -167,50 +167,50 @@ static void dmgr_server_loop(int port)
  */
 static void dmgr_self_check(void)
 {
-    int count = pci_get_count();
-    if (count < 0) {
-        printf("device_mgr: pci_get_count failed (%d)\n", count);
-        thread_exit(1);
-    }
-    printf("device_mgr: %d PCI devices\n", count);
+        int count = pci_get_count();
+        if (count < 0) {
+                printf("device_mgr: pci_get_count failed (%d)\n", count);
+                thread_exit(1);
+        }
+        printf("device_mgr: %d PCI devices\n", count);
 
-    if (count > 0) {
-        pci_device_info_t dev;
-        int r = pci_get_device(0, &dev);
-        if (r < 0) {
-            printf("device_mgr: pci_get_device(0) failed (%d)\n", r);
-        } else {
-            printf("device_mgr: device 0 bus=%u dev=%u func=%u "
+        if (count > 0) {
+                pci_device_info_t dev;
+                int r = pci_get_device(0, &dev);
+                if (r < 0) {
+                        printf("device_mgr: pci_get_device(0) failed (%d)\n", r);
+                } else {
+                        printf("device_mgr: device 0 bus=%u dev=%u func=%u "
                    "vendor=0x%x device=0x%x class=0x%x irq=%u\n",
                    (u32)dev.bus, (u32)dev.dev, (u32)dev.func,
                    (u32)dev.vendor_id, (u32)dev.device_id,
                    (u32)dev.class_code, (u32)dev.irq_line);
+                }
         }
-    }
 }
 
 int main(void)
 {
-    printf("device_mgr: starting PCI device manager\n");
+        printf("device_mgr: starting PCI device manager\n");
 
-    dmgr_self_check();
+        dmgr_self_check();
 
-    /* IPC port, registered under the well-known name "device_mgr". */
-    int port = ipc_port_create();
-    if (port < 0) {
-        printf("device_mgr: ipc_port_create failed (%d)\n", port);
-        thread_exit(1);
-    }
-    int ret = port_register(DMGR_PORT_NAME, port);
-    if (ret < 0) {
-        printf("device_mgr: port_register('%s') failed (%d)\n",
+        /* IPC port, registered under the well-known name "device_mgr". */
+        int port = ipc_port_create();
+        if (port < 0) {
+                printf("device_mgr: ipc_port_create failed (%d)\n", port);
+                thread_exit(1);
+        }
+        int ret = port_register(DMGR_PORT_NAME, port);
+        if (ret < 0) {
+                printf("device_mgr: port_register('%s') failed (%d)\n",
                DMGR_PORT_NAME, ret);
-        thread_exit(1);
-    }
-    printf("device_mgr: port %d registered as '%s'\n", port, DMGR_PORT_NAME);
+                thread_exit(1);
+        }
+        printf("device_mgr: port %d registered as '%s'\n", port, DMGR_PORT_NAME);
 
-    /* Serve clients. */
-    printf("device_mgr: serving on port %d\n", port);
-    dmgr_server_loop(port);
-    return 0;   /* unreachable */
+        /* Serve clients. */
+        printf("device_mgr: serving on port %d\n", port);
+        dmgr_server_loop(port);
+        return 0;   /* unreachable */
 }

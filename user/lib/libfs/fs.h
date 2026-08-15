@@ -23,7 +23,9 @@ int fs_create_dir(const char *url);
 int fs_delete_item(const char *url, int recursive);
 
 /* Open (optionally create/truncate) a file.  flags = VFS_OPEN_*,
- * access = VFS_ACCESS_* bitmask.  Fills *out_handle on success. */
+ * access = VFS_ACCESS_* bitmask.  The vfs_server derives the caller's
+ * identity from its kernel-issued subject (ipc_recv_from) for the
+ * open-time authz gate.  Fills *out_handle on success. */
 int fs_open_item(const char *url, u32 flags, u32 access,
                  vfs_handle_t *out_handle);
 
@@ -52,6 +54,11 @@ int fs_enum_end(vfs_handle_t enum_handle);
 int fs_stat_volume(const char *url, u64 *total_bytes, u64 *used_bytes,
                    u32 *read_only);
 
+/* Return the caller's kernel-issued subject ID as seen by the vfs
+ * server (VFS_OP_WHOAMI proxies SYS_GET_SUBJECT through the trusted
+ * server, so the value is unforgeable).  Fills *out_subject. */
+int fs_whoami(u64 *out_subject);
+
 /* ====================================================================
  * Phase 2: security-scoped bookmarks + move (design §5, §8)
  *
@@ -63,15 +70,16 @@ int fs_stat_volume(const char *url, u64 *total_bytes, u64 *used_bytes,
 
 /* Request a Powerbox-gated bookmark for url.  Fills a blob
  * (VFS_BOOKMARK_MAX bytes max).  Fails with VFS_ERR_ACCESS if the
- * access was denied. */
-int fs_create_bookmark(const char *url, u32 access, u32 app_id_hash,
-                       u64 expiry_ticks, u8 *out_blob, u32 *out_blob_len);
+ * access was denied.  The bookmark is bound to the caller's kernel
+ * subject (the vfs_server derives it from ipc_recv_from). */
+int fs_create_bookmark(const char *url, u32 access, u64 expiry_ticks,
+                       u8 *out_blob, u32 *out_blob_len);
 
 /* Blob → temporary FileHandle.  The handle is only valid while the
  * bookmark record exists server-side; revoke closes it remotely.
  * Fills handle/item/granted access on success. */
 int fs_resolve_bookmark(const u8 *blob, u32 bk_len, vfs_handle_t *out_handle,
-                        vfs_item_info_t *out_item, u32 *out_access);
+                                                vfs_item_info_t *out_item, u32 *out_access);
 
 /* Drop the bookmark server-side (idempotent).  After this, resolve
  * fails with VFS_ERR_ACCESS. */

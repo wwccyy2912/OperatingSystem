@@ -25,4 +25,11 @@ i64 sc_sys_pci_get_device(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
 /* kernel/syscall/process_desc.c — SYS_PROCESS_CREATE (descriptor-based image) */
 i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
 
+/* kernel/arch/x86_64/virtio_blk.c — SYS_BLK_READ/WRITE/INFO (legacy
+ * virtio-blk; arg1 = disk = PCI table index of the adapter, gated on
+ * CAP_TYPE_PCI_DEV with RIGHT_READ|RIGHT_WRITE for that obj_id) */
+i64 sc_sys_blk_read(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
+i64 sc_sys_blk_write(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
+i64 sc_sys_blk_info(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
+
 #endif /* KERNEL_SYSCALL_HANDLERS_H */

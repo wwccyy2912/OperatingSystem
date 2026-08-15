@@ -93,134 +93,134 @@ section .text
 ; ------------------------------------------------------------------
 global syscall_entry_stub
 syscall_entry_stub:
-    ; ---------------------------------------------------------------
-    ; Step 1: Switch to per-thread kernel stack
-    ;
-    ; We use RCX and R11 as temporaries (both trashed by INT 0x80).
-    ; Load g_current_thread (global pointer to current thread_t*),
-    ; then read kstack_top from offset 104.
-    ; ---------------------------------------------------------------
-    lea  rcx, [rel g_current_thread]
-    mov  rcx, [rcx]              ; rcx = thread_t*
-    mov  r11, [rcx + KSTACK_TOP_OFFSET]  ; r11 = kstack_top
+        ; ---------------------------------------------------------------
+        ; Step 1: Switch to per-thread kernel stack
+        ;
+        ; We use RCX and R11 as temporaries (both trashed by INT 0x80).
+        ; Load g_current_thread (global pointer to current thread_t*),
+        ; then read kstack_top from offset 104.
+        ; ---------------------------------------------------------------
+        lea  rcx, [rel g_current_thread]
+        mov  rcx, [rcx]              ; rcx = thread_t*
+        mov  r11, [rcx + KSTACK_TOP_OFFSET]  ; r11 = kstack_top
 
-    ; ---------------------------------------------------------------
-    ; Step 2: Copy 40-byte INT frame from TSS.RSP0 to per-thread stack
-    ;
-    ; Make room on the per-thread stack, then copy each qword.
-    ; ---------------------------------------------------------------
-    sub  r11, 40                 ; make room for 5 qwords
+        ; ---------------------------------------------------------------
+        ; Step 2: Copy 40-byte INT frame from TSS.RSP0 to per-thread stack
+        ;
+        ; Make room on the per-thread stack, then copy each qword.
+        ; ---------------------------------------------------------------
+        sub  r11, 40                 ; make room for 5 qwords
 
-    mov  rcx, [rsp + 0]         ; RIP
-    mov  [r11 + 0],  rcx
-    mov  rcx, [rsp + 8]         ; CS
-    mov  [r11 + 8],  rcx
-    mov  rcx, [rsp + 16]        ; RFLAGS
-    mov  [r11 + 16], rcx
-    mov  rcx, [rsp + 24]        ; RSP (user)
-    mov  [r11 + 24], rcx
-    mov  rcx, [rsp + 32]        ; SS
-    mov  [r11 + 32], rcx
+        mov  rcx, [rsp + 0]         ; RIP
+        mov  [r11 + 0],  rcx
+        mov  rcx, [rsp + 8]         ; CS
+        mov  [r11 + 8],  rcx
+        mov  rcx, [rsp + 16]        ; RFLAGS
+        mov  [r11 + 16], rcx
+        mov  rcx, [rsp + 24]        ; RSP (user)
+        mov  [r11 + 24], rcx
+        mov  rcx, [rsp + 32]        ; SS
+        mov  [r11 + 32], rcx
 
-    ; ---------------------------------------------------------------
-    ; Step 3: Switch RSP to per-thread kernel stack
-    ;
-    ; After this, RSP points to the INT frame on the per-thread stack.
-    ; TSS.RSP0 is no longer in use by this thread.
-    ; ---------------------------------------------------------------
-    mov  rsp, r11
+        ; ---------------------------------------------------------------
+        ; Step 3: Switch RSP to per-thread kernel stack
+        ;
+        ; After this, RSP points to the INT frame on the per-thread stack.
+        ; TSS.RSP0 is no longer in use by this thread.
+        ; ---------------------------------------------------------------
+        mov  rsp, r11
 
-    ; ---------------------------------------------------------------
-    ; Step 4: Save all general-purpose registers onto per-thread stack
-    ; ---------------------------------------------------------------
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
+        ; ---------------------------------------------------------------
+        ; Step 4: Save all general-purpose registers onto per-thread stack
+        ; ---------------------------------------------------------------
+        push rax
+        push rbx
+        push rcx
+        push rdx
+        push rsi
+        push rdi
+        push rbp
+        push r8
+        push r9
+        push r10
+        push r11
+        push r12
+        push r13
+        push r14
+        push r15
 
-    ; ---------------------------------------------------------------
-    ; Step 5: Set up arguments for syscall_dispatch()
-    ;   i64 syscall_dispatch(u64 num, u64 arg1, u64 arg2,
-    ;                        u64 arg3, u64 arg4, u64 arg5)
-    ;
-    ; System V AMD64: RDI, RSI, RDX, RCX, R8, R9
-    ;
-    ; From saved registers on stack:
-    ;   syscall num  = saved RAX  [rsp + SF_RAX]
-    ;   arg1         = saved RDI  [rsp + SF_RDI]
-    ;   arg2         = saved RSI  [rsp + SF_RSI]
-    ;   arg3         = saved RDX  [rsp + SF_RDX]
-    ;   arg4         = saved R10  [rsp + SF_R10]
-    ;   arg5         = saved R8   [rsp + SF_R8]
-    ; ---------------------------------------------------------------
+        ; ---------------------------------------------------------------
+        ; Step 5: Set up arguments for syscall_dispatch()
+        ;   i64 syscall_dispatch(u64 num, u64 arg1, u64 arg2,
+        ;                        u64 arg3, u64 arg4, u64 arg5)
+        ;
+        ; System V AMD64: RDI, RSI, RDX, RCX, R8, R9
+        ;
+        ; From saved registers on stack:
+        ;   syscall num  = saved RAX  [rsp + SF_RAX]
+        ;   arg1         = saved RDI  [rsp + SF_RDI]
+        ;   arg2         = saved RSI  [rsp + SF_RSI]
+        ;   arg3         = saved RDX  [rsp + SF_RDX]
+        ;   arg4         = saved R10  [rsp + SF_R10]
+        ;   arg5         = saved R8   [rsp + SF_R8]
+        ; ---------------------------------------------------------------
 
-    mov rdi, [rsp + SF_RAX]    ; syscall number
-    mov rsi, [rsp + SF_RDI]    ; arg1
-    mov rdx, [rsp + SF_RSI]    ; arg2
-    mov rcx, [rsp + SF_RDX]    ; arg3
-    mov r8,  [rsp + SF_R10]    ; arg4
-    mov r9,  [rsp + SF_R8]     ; arg5
+        mov rdi, [rsp + SF_RAX]    ; syscall number
+        mov rsi, [rsp + SF_RDI]    ; arg1
+        mov rdx, [rsp + SF_RSI]    ; arg2
+        mov rcx, [rsp + SF_RDX]    ; arg3
+        mov r8,  [rsp + SF_R10]    ; arg4
+        mov r9,  [rsp + SF_R8]     ; arg5
 
-    call syscall_dispatch
+        call syscall_dispatch
 
-    ; ---------------------------------------------------------------
-    ; Step 6: Store return value in saved RAX slot
-    ; ---------------------------------------------------------------
-    mov [rsp + SF_RAX], rax
+        ; ---------------------------------------------------------------
+        ; Step 6: Store return value in saved RAX slot
+        ; ---------------------------------------------------------------
+        mov [rsp + SF_RAX], rax
 
-    ; ---------------------------------------------------------------
-    ; Step 6.5: Signal delivery checkpoint
-    ;
-    ; If the current process has a pending signal and this is a user
-    ; syscall (CS == 0x1B), build the sigframe on the user stack and
-    ; rewrite the saved frame so the handler runs on IRETQ.  The frame
-    ; pointer is RSP (the saved RAX slot is frame[0]).
-    ;
-    ; The checkpoint follows the SysV ABI: caller-saved registers are
-    ; all already saved in their frame slots, callee-saved ones
-    ; (rbx/rbp/r12-r15) are preserved by the callee, and RSP is
-    ; restored by the callee's ret.  If a signal was delivered, the
-    ; frame's RAX slot still holds the syscall return value; the
-    ; handler's eventual sigreturn restores the original RAX.
-    ; ---------------------------------------------------------------
-    mov  rdi, rsp                ; frame pointer
-    call signal_check_syscall
+        ; ---------------------------------------------------------------
+        ; Step 6.5: Signal delivery checkpoint
+        ;
+        ; If the current process has a pending signal and this is a user
+        ; syscall (CS == 0x1B), build the sigframe on the user stack and
+        ; rewrite the saved frame so the handler runs on IRETQ.  The frame
+        ; pointer is RSP (the saved RAX slot is frame[0]).
+        ;
+        ; The checkpoint follows the SysV ABI: caller-saved registers are
+        ; all already saved in their frame slots, callee-saved ones
+        ; (rbx/rbp/r12-r15) are preserved by the callee, and RSP is
+        ; restored by the callee's ret.  If a signal was delivered, the
+        ; frame's RAX slot still holds the syscall return value; the
+        ; handler's eventual sigreturn restores the original RAX.
+        ; ---------------------------------------------------------------
+        mov  rdi, rsp                ; frame pointer
+        call signal_check_syscall
 
-    ; ---------------------------------------------------------------
-    ; Step 7: Restore all general-purpose registers
-    ; ---------------------------------------------------------------
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
+        ; ---------------------------------------------------------------
+        ; Step 7: Restore all general-purpose registers
+        ; ---------------------------------------------------------------
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rbp
+        pop rdi
+        pop rsi
+        pop rdx
+        pop rcx
+        pop rbx
+        pop rax
 
-    ; ---------------------------------------------------------------
-    ; Step 8: Return to user mode via IRETQ
-    ; CPU pops: RIP, CS, RFLAGS, RSP, SS  from per-thread stack
-    ; ---------------------------------------------------------------
-    iretq
+        ; ---------------------------------------------------------------
+        ; Step 8: Return to user mode via IRETQ
+        ; CPU pops: RIP, CS, RFLAGS, RSP, SS  from per-thread stack
+        ; ---------------------------------------------------------------
+        iretq
 
 
 ; ------------------------------------------------------------------
@@ -232,4 +232,4 @@ syscall_entry_stub:
 ; ------------------------------------------------------------------
 global syscall_entry_iretq
 syscall_entry_iretq:
-    iretq
+        iretq

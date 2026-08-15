@@ -18,6 +18,6 @@
 
 int main(void)
 {
-    sleep(5);               /* ~0.05 s at 100 Hz — 4 runs ≈ 0.2 s */
-    return 7;
+        sleep(5);               /* ~0.05 s at 100 Hz — 4 runs ≈ 0.2 s */
+        return 7;
 }

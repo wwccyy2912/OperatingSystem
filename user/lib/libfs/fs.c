@@ -335,6 +335,33 @@ int fs_whoami(u64 *out_subject) {
     return 0;
 }
 
+int fs_list_volumes(vfs_vol_info_t *out_vols, u32 *out_count) {
+    if (!out_vols || !out_count)
+        return ERR_INVAL;
+    int port = fs_port();
+    if (port < 0)
+        return port;
+
+    vfs_req_list_volumes_t *req = (vfs_req_list_volumes_t *)s_req;
+    memset(req, 0, sizeof(*req));
+    req->op = VFS_OP_LIST_VOLUMES;
+
+    vfs_resp_list_volumes_t *resp     = (vfs_resp_list_volumes_t *)s_resp;
+    int                      resp_len = (int)sizeof(*resp);
+    int                      r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    if (r < 0)
+        return r;
+    if (resp->ret < 0)
+        return resp->ret;
+    u32 n = resp->count;
+    if (n > VFS_MAX_VOLS)
+        n = VFS_MAX_VOLS;
+    for (u32 i = 0; i < n; i++)
+        out_vols[i] = resp->vols[i];
+    *out_count = n;
+    return 0;
+}
+
 /* ====================================================================
  * Phase 2: security-scoped bookmarks + move (design §5, §8)
  * ==================================================================== */

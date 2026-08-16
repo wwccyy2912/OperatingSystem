@@ -2,70 +2,20 @@
  * signal.h - POSIX-style signal definitions for user-space
  * Copyright (c) 2026 OpSys Project
  *
- * User-space signal handling interface.  Mirrors kernel/include/kernel/signal.h
- * but with user-facing types and helper functions.
+ * Compatibility header.  The canonical signal API (constants, types,
+ * signal()/kill()) lives in <libos/syscalls.h>, which mirrors
+ * kernel/include/kernel/signal.h.  This header exists so code written
+ * against the POSIX name <signal.h> still compiles unchanged.
+ *
+ * Note: only the kernel-implemented signal subset is exposed.  In
+ * particular SIGCHLD/SIGCONT are NOT defined — the kernel has no
+ * child-status tracking, and kill(pid, SIGCHLD) would return ERR_INVAL.
  */
 
 #ifndef SIGNAL_H
 #define SIGNAL_H
 
-#include <stdint.h>
-
-/* ====================================================================
- * Signal numbers (POSIX subset)
- * ==================================================================== */
-
-#define SIGKILL 9  /* Kill signal (uncatchable, unignorable) */
-#define SIGUSR1 10 /* User-defined signal 1 */
-#define SIGSEGV 11 /* Segmentation fault */
-#define SIGUSR2 12 /* User-defined signal 2 */
-#define SIGPIPE 13 /* Broken pipe */
-#define SIGALRM 14 /* Alarm clock */
-#define SIGTERM 15 /* Termination signal */
-#define SIGCHLD 17 /* Child status changed */
-#define SIGCONT 18 /* Continue */
-#define SIGSTOP 19 /* Stop (unignorable) */
-
-/* ---- Handler sentinels ---- */
-#define SIG_DFL ((sighandler_t)0)    /* Default action */
-#define SIG_IGN ((sighandler_t)1)    /* Ignore signal */
-#define SIG_ERR ((sighandler_t) - 1) /* Error return from signal() */
-
-/* ====================================================================
- * Signal handler type
- * ==================================================================== */
-
-typedef void (*sighandler_t)(int);
-
-/* ====================================================================
- * Signal handling functions (from libos/syscalls.h)
- * ==================================================================== */
-
-/**
- * Register a signal handler or query the current handler.
- *
- * @param signum  Signal number (1..NSIG-1)
- * @param handler SIG_DFL, SIG_IGN, or a user function pointer
- * @return        Previous handler on success, SIG_ERR on failure
- *
- * Signal delivery is process-wide and lazy (checkpoint-based).
- * For SIGKILL and SIGSTOP, registration fails (POSIX-compliant).
- */
-sighandler_t signal(int signum, sighandler_t handler);
-
-/**
- * Send a signal to a process.
- *
- * @param pid    Destination process ID
- * @param signum Signal number (1..NSIG-1)
- * @return       0 on success, negative error code on failure
- *               - ERR_NOENT: process not found
- *               - ERR_INVAL: invalid signal number
- *
- * The signal is delivered lazily at the next checkpoint on any thread
- * of the target process (syscall return or interrupt return).
- */
-int kill(int pid, int signum);
+#include <libos/syscalls.h>
 
 /* ====================================================================
  * Signal handling best practices (comments for user code)
@@ -101,8 +51,6 @@ int kill(int pid, int signum);
  *   SIGPIPE      - Terminate
  *   SIGALRM      - Terminate
  *   SIGTERM      - Terminate
- *   SIGCHLD      - Ignore
- *   SIGCONT      - Continue (unblocked by SIGSTOP)
  *   SIGSTOP      - Stop process (uncatchable, unignorable)
  */
 

@@ -520,22 +520,21 @@ static int cmd_pid(int argc, char *argv[]) {
 }
 
 /*
- * The demo program (hello.elf) is embedded into kernel.elf as a blob
- * (build/hello_blob.o) and registered under the name "hello" in the
- * kernel blob table.  Fetch it via SYS_BLOB_GET, then spawn it via
- * SYS_PROCESS_CREATE.
+ * Spawn an embedded demo/service ELF.  Blob name comes from argv[1]
+ * (defaults to "hello" for backward compatibility); every registered
+ * image (hello, runtime_demo, sbox_demo, ...) is fetchable via
+ * SYS_BLOB_GET and spawnable via SYS_PROCESS_CREATE.
  */
 static int cmd_spawn(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
-    static char blob_buf[131072]; /* must hold hello.elf (~86 KB after libc migration) */
-    int         size = blob_get("hello", blob_buf, sizeof(blob_buf));
+    const char *name = (argc > 1) ? argv[1] : "hello";
+    static char blob_buf[131072]; /* must hold the largest demo ELF */
+    int         size = blob_get(name, blob_buf, sizeof(blob_buf));
     if (size < 0) {
-        shell_printf("spawn: blob_get FAILED (%d)\n", size);
+        shell_printf("spawn: blob_get(%s) FAILED (%d)\n", name, size);
         return 1;
     }
-    shell_printf("spawn: fetched hello.elf blob from kernel (%d bytes)\n", size);
-    int pid = process_create("hello", blob_buf, size);
+    shell_printf("spawn: fetched %s.elf blob from kernel (%d bytes)\n", name, size);
+    int pid = process_create(name, blob_buf, size);
     if (pid < 0) {
         shell_printf("spawn: FAILED (%d)\n", pid);
         return 1;
@@ -902,12 +901,30 @@ static int cmd_kill(int argc, char *argv[]) {
 
 /*
  * vfs_ls <url> — enumerate a directory.  URL like "/Volumes/System/"
- * or "Users".  Prints one child name per line, then the entry count.
+ * or "Users".  "/" and "/Volumes" enumerate the mounted volumes (the
+ * root view: there is no root item, the server answers from the mount
+ * table).  Prints one child name per line, then the entry count.
  */
 static int cmd_vfs_ls(int argc, char *argv[]) {
     if (argc < 2) {
         shell_write("Usage: vfs_ls <dir-url>\n");
         return -1;
+    }
+    if (strcmp(argv[1], "/") == 0 || strcmp(argv[1], "/Volumes") == 0 ||
+        strcmp(argv[1], "/Volumes/") == 0) {
+        static vfs_vol_info_t vols[VFS_MAX_VOLS]; /* small, static */
+        u32                   count = 0;
+        int                   r     = fs_list_volumes(vols, &count);
+        if (r < 0) {
+            shell_printf("vfs_ls: %s FAILED (%d)\n", argv[1], r);
+            return -1;
+        }
+        for (u32 i = 0; i < count; i++) {
+            shell_write(vols[i].mount_name);
+            shell_write(vols[i].read_only ? " (ro)\n" : "\n");
+        }
+        shell_printf("vfs_ls: %d volumes\n", count);
+        return 0;
     }
     static vfs_enum_batch_t batch; /* ~16.5 KB — keep off the stack */
     vfs_handle_t            e;
@@ -1470,14 +1487,15 @@ static void shell_main(void *arg) {
     shell_register_command("sleep", "Sleep for N ticks: sleep <ticks>", cmd_sleep);
     shell_register_command("threads", "Spawn a test worker thread", cmd_threads);
     shell_register_command("mutex", "Mutex demo: N threads on a counter", cmd_mutex);
-    shell_register_command("spawn", "Spawn the embedded demo process", cmd_spawn);
+    shell_register_command("spawn", "Spawn an embedded demo (spawn [blob_name])", cmd_spawn);
     shell_register_command("uptime", "Show system tick count", cmd_uptime);
     shell_register_command("exit", "Exit the shell", cmd_exit);
     shell_register_command("reboot", "Halt the system", cmd_reboot);
     shell_register_command("panic", "Trigger a kernel panic (TEMP test)", cmd_panic);
     shell_register_command("kill", "Send a signal: kill <pid> [signum]", cmd_kill);
     shell_register_command("ps", "List running processes", cmd_ps);
-    shell_register_command("vfs_ls", "List a VFS directory: vfs_ls <url>", cmd_vfs_ls);
+    shell_register_command(
+        "vfs_ls", "List a VFS dir: vfs_ls <url> (/ or /Volumes = volumes)", cmd_vfs_ls);
     shell_register_command("vfs_cat", "Show a VFS file: vfs_cat <url>", cmd_vfs_cat);
     shell_register_command("vfs_stat", "VFS volume stats: vfs_stat [url]", cmd_vfs_stat);
     shell_register_command("vfs_write", "Write a VFS file: vfs_write <url> <text>", cmd_vfs_write);

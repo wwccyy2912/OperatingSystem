@@ -510,11 +510,19 @@ static i32 vbdk_extent_ensure(vbdk_inode_t *it, u32 need) {
         old_blocks = need;
     for (u32 i = 0; i < old_blocks; i++) {
         i32 r = vbdk_sector_read((u64)it->extent_start + i, cbuf);
-        if (r < 0)
+        if (r < 0) {
+            /* Roll back the fresh extent: it was bm_set by
+             * vbdk_extent_alloc but is not yet referenced by the
+             * inode — without this the blocks leak from the derived
+             * bitmap until the next rebuild (volume appears full). */
+            vbdk_extent_release((u32)ns, need);
             return r;
+        }
         r = vbdk_sector_write((u64)ns + i, cbuf);
-        if (r < 0)
+        if (r < 0) {
+            vbdk_extent_release((u32)ns, need);
             return r;
+        }
     }
     if (it->extent_blocks > 0)
         vbdk_extent_release(it->extent_start, it->extent_blocks);

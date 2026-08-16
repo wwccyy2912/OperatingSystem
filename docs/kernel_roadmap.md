@@ -63,12 +63,12 @@
 
 | 区域 | 行数 | 说明 |
 |---|---|---|
-| 内核 `kernel/` | 9,497（.c/.S，不含 include 头；含头 12,172） | 含 arch、mm、sched、ipc、cap、syscall、gfx、process、blob |
-| 用户态 `user/` | 10,885 | 服务 12 个 + libc/libos/libfs/libipc/runtime（含新增 elf_parse、device_mgr） |
+| 内核 `kernel/` | 11,008（.c/.S，不含 include 头；含头 14,037） | 含 arch、mm、sched、ipc、cap、syscall、gfx、process、blob |
+| 用户态 `user/` | 17,750（.c/.S；含头 21,793） | 服务 12 个 + libc/libos/libfs/libipc/runtime（含新增 elf_parse、device_mgr） |
 
-> 行数口径：`find kernel -name '*.[chS]' | xargs wc -l`。2026-08-09 实测（P1/P2 原语落地后）：
-> 新增 `vspace.c`(383)、`thread_ctx.c`(101)、`pci.c`(211)、`process_desc.c`(255)、`elf_boot.c`(181)；
-> ELF 解析攻击面已移出内核（`elf.c` 218 行 → `elf_boot.c` 181 行仅保留 init 加载器 + 用户态
+> 行数口径：`find kernel -name '*.[chS]' | xargs wc -l`。2026-08-16 实测：
+> `vspace.c`(374)、`thread_ctx.c`(99)、`pci.c`(247)、`process_desc.c`(270)、`elf_boot.c`(177)；
+> ELF 解析攻击面已移出内核（`elf.c` 218 行 → `elf_boot.c` 177 行仅保留 init 加载器 + 用户态
 > `user/lib/libos/elf_parse.c` 承担全部解析）。行数回升源于计划内的新原语增量，非 TCB 扩张。
 
 ### 2.2 已符合微内核的项（✅ 不动）
@@ -91,7 +91,7 @@
 | ELF 加载器 | `kernel/mm/elf.c` + `sys_process_create` 内 elf_load | 218 | **Cold Path → 移 Ring 3** |
 | Framebuffer 绘制 | `kernel/gfx/framebuffer.c` fb_fill/fb_puts/fb_printf | 543 | **Cold Path → 移 Ring 3** |
 | POSIX 信号 | `SYS_SIGNAL/KILL/SIGRETURN` 内核实现 | — | **低频 → 移 Ring 3** |
-| 运行时串口日志 | 11 个内核文件用 `serial_printf` | — | 保留 panic 裸写，常规走用户态 |
+| 运行时串口日志 | 14 个内核文件用 `serial_printf` | — | 保留 panic 裸写，常规走用户态 |
 
 ---
 
@@ -120,7 +120,7 @@
 
 | 阶段 | 工作 | 说明 | 验证 |
 |---|---|---|---|
-| **P0** | Mutex Fast-Path：用户态 spinlock 封装 | `libos` 提供 `user_spinlock`（原子 CAS，无竞争 0 syscall），竞争时才走 `SYS_MUTEX_*` | ✅ 完成：`user/lib/libos/spinlock.h`（CAS+yield），`malloc` 无竞争 0 syscall |
+| **P0** | Mutex Fast-Path：用户态 spinlock 封装 | `libos` 提供 `user_spinlock`（原子 CAS，无竞争 0 syscall），竞争时 `thread_yield()` | ✅ 完成：`user/lib/libos/spinlock.h`（CAS+yield），`malloc` 无竞争 0 syscall |
 | **P3** | Futex 化内核 Mutex | 无竞争纯原子 + 竞争排队；**SMP 阶段实施** | 多核竞争基准 |
 | **P3** | IPC 多活动调用 | 当前 `s_active_call` 每端口单活动调用，多客户端排队 | vfs 并发基准 |
 | **P3** | 零拷贝读路径 | `CAP_TYPE_MEM` 映射文件页，绕开 4096 上限（vfs_design §8.4） | vfs_cat 大文件基准 |
@@ -165,13 +165,13 @@
 | malloc 单次 syscall 次数 | 2（lock+unlock） | ✅ 0（无竞争 fast-path，P0 达成） |
 | IPC 单次 call 延迟 | — | ✅ 微秒级（100k 往返实测：100,000 calls / 11,755 ticks） |
 | vfs 写 4KiB 块 | 已验收（4032 分块） | 不变 |
-| 内核行数 | 8,644 | ✅ 9,497（P1/P2 原语增量：vspace/thread_ctx/pci/process_desc/elf_boot 落地；ELF 解析攻击面已移出） |
+| 内核行数 | 8,644 | ✅ 11,008（P1/P2 原语增量：vspace/thread_ctx/pci/process_desc/elf_boot 落地；ELF 解析攻击面已移出） |
 | 线程容量 | MAX_THREADS=256 | ✅ 1024（`types.h` 提升；1000 线程压力测试通过） |
 
 ### 5.2 回归保障
 
-- 每次 Ring 归属变更后：`make iso` 干净构建 + 现有验收（24 项内核测试：20 项既有 +
-  4 项新增（vspace_alloc / thread_set_ctx / 1000 线程 / 100k IPC）、VFS Phase 0 六项）全量回归。
+- 每次 Ring 归属变更后：`make iso` 干净构建 + 现有验收（31 项经典内核测试；总回归
+  49 项 = 经典 31 + P1 10 + P2 Gate 3 + P2V 4 + KBD 1）全量回归。
 - 用户态化组件必须保持对外行为不变（ELF 加载结果、信号语义、启动画面时序）。
 
 ---

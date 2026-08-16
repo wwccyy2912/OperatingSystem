@@ -784,8 +784,8 @@ static void term_server_loop(int port) {
  *                       synchronous UI_SHOW push (ipc_call) is answered
  *                       immediately.  It snapshots the screen when a
  *                       PENDING query appears, renders the panel, shows
- *                       the verdict, holds it, then restores the
- *                       snapshot.
+ *                       the verdict, holds it, then restores the area
+ *                       the panel covered.
  *
  *   perm_ui_input_main  (thread B) — the keyboard front-end.  It polls
  *                       s_ui_await, takes the keyboard focus, reads a
@@ -801,9 +801,11 @@ static void term_server_loop(int port) {
  *
  * The panel is a full-screen TUI dialog (62x9, centered, ASCII border
  * only — the VGA font covers just 0x20-0x7E).  The screen underneath
- * is snapshotted once when the first PENDING query arrives and
- * restored after the verdict has been shown.  All rendering runs
- * under s_render_lock (the same mutex as term_write).
+ * is snapshotted once when the first PENDING query arrives; after the
+ * verdict has been shown, only the panel's own rectangle is restored,
+ * so any shell output written while the panel was up (the -105 error
+ * and the fresh prompt) stays on screen.  All rendering runs under
+ * s_render_lock (the same mutex as term_write).
  * ==================================================================== */
 
 /* Panel geometry (centered; clamped to the real screen) */
@@ -830,8 +832,6 @@ static void term_server_loop(int port) {
  * only).  s_ui_await and s_ui_query_id are the handoff to thread B:
  * A arms them, B clears s_ui_await after answering. */
 static u8           s_ui_snapshot[TERM_MAX_ROWS][TERM_MAX_COLS];
-static u32          s_ui_snapshot_cx;
-static u32          s_ui_snapshot_cy;
 static int          s_ui_active;         /* 1 = panel on screen (A only) */
 static volatile u32 s_ui_await;          /* 1 = input thread should run  */
 static volatile u32 s_ui_query_id;       /* query being answered (u32)   */
@@ -909,9 +909,7 @@ static void perm_ui_render_panel(const perm_req_ui_t *req, int fresh) {
             if (s_cols < TERM_MAX_COLS)
                 memset(s_ui_snapshot[r] + s_cols, ' ', TERM_MAX_COLS - s_cols);
         }
-        s_ui_snapshot_cx = s_cursor_x;
-        s_ui_snapshot_cy = s_cursor_y;
-        s_ui_active      = 1;
+        s_ui_active = 1;
     }
 
     /* Interior clear (no stale glyphs) */
@@ -1004,17 +1002,29 @@ static void perm_ui_render_panel(const perm_req_ui_t *req, int fresh) {
         (void)mutex_unlock(s_render_lock);
 }
 
-/* Restore the snapshot and re-show the cursor. */
+/* Restore the screen area the panel covered (its centered rectangle),
+ * leaving whatever the shell wrote while the panel was up — the -105
+ * error and the fresh prompt — on screen.  The cursor stays where the
+ * shell's last write left it: the shell never re-prints its prompt, so
+ * resetting the cursor to the pre-panel position would orphan future
+ * keystrokes off the visible prompt line. */
 static void perm_ui_restore(void) {
+    u32 w = PERM_UI_PANEL_W;
+    u32 h = PERM_UI_PANEL_H;
+    if (w > s_cols)
+        w = s_cols;
+    if (h > s_rows)
+        h = s_rows;
+    u32 px = (s_cols - w) / 2;
+    u32 py = (s_rows - h) / 2;
+
     if (s_render_lock >= 0)
         (void)mutex_lock(s_render_lock);
-    for (u32 r = 0; r < s_rows; r++) {
-        memcpy(s_cells[r], s_ui_snapshot[r], s_cols);
-        for (u32 c = 0; c < s_cols; c++)
+    for (u32 r = py; r < py + h; r++) {
+        memcpy(s_cells[r] + px, s_ui_snapshot[r] + px, w);
+        for (u32 c = px; c < px + w; c++)
             term_draw_cell(c, r, s_cells[r][c], TERM_FG, TERM_BG);
     }
-    s_cursor_x = s_ui_snapshot_cx;
-    s_cursor_y = s_ui_snapshot_cy;
     term_draw_cursor();
     s_ui_active = 0;
     if (s_render_lock >= 0)

@@ -21,7 +21,7 @@
 4         4         version = 1
 8         4         manifest_len  (u32, ≤ PKG_MANIFEST_MAX=512)
 12        4         payload_len   (u32, > 0)
-16        manifest_len   manifest 文本（UTF-8, LF 换行, ≤100 列）
+16        manifest_len   manifest 文本（UTF-8, LF 换行；≤100 列为 host 侧 ops_pack.py 强制，pkg-manager 解析器不校验行宽）
 16+manifest_len  payload_len   单 ELF（x86_64, 由 SYS_PROCESS_CREATE 直接加载）
 ```
 
@@ -35,9 +35,9 @@
 | key | 必填 | 说明 |
 |---|---|---|
 | `app_id` | 是 | 应用标识，`[a-zA-Z0-9_]{1,63}`，作为安装目录名与进程名 |
-| `app_name` | 否 | 显示名（TUI/日志用），默认 = app_id |
-| `version` | 否 | 版本字符串，默认 "1.0"（仅信息） |
-| `entry` | 否 | 入口名，默认 "main"（仅信息；实际入口取 ELF entry） |
+| `app_name` | 否 | 显示名（TUI/日志用），仅记录性，pkg-manager 忽略 |
+| `version` | 否 | 版本字符串，仅记录性，pkg-manager 忽略 |
+| `entry` | 否 | 入口名，仅记录性，pkg-manager 忽略（实际入口取 ELF entry） |
 | `permissions` | 否 | 逗号分隔的原子名列表（见 §4），空/缺省 = 无任何权限 |
 
 示例：
@@ -94,7 +94,7 @@ pkg-manager 用 `ipc_recv_from` 取 kernel 认证的调用者 subject，经
 shell: pkg install <name> [--perms=a,b,c]
   → pkg-manager: blob_get(name) 取内嵌 ELF → 构造 manifest（app_id=name,
     permissions=--perms）→ 内存打包 .ops → fs_write 到
-    /Volumes/Users/Apps/<name>/app.ops （安装即持久化，Users 卷 RW）
+    /Volumes/Users/Apps/<name>/app.ops （写入 Users 内存卷，重启不保留；仅 Disk 卷持久）
   （pkg-manager 首次写 Users 卷会触发 Powerbox → term 面板 → 用户 y）
 
 shell: pkg run <app_id>
@@ -102,7 +102,8 @@ shell: pkg run <app_id>
     → 记录 s_pending[pid]{app_id, atoms[]} → process_create(app_id, payload)
     → 返回 pid
 
-应用启动 → libpkg: pkg_ready(app_id)
+应用启动 → libpkg: pkg_ready()
+  （无参数：app_id 由内部 get_subject() + proc_info_by_subject() 推导）
   → 连 "pkg" 端口 → PKG_OP_APP_READY
   → pkg-manager: ipc_recv_from → subject → proc_info_by_subject(subject)
     校验 proc->name == app_id 且 pid == s_pending 记录 → 匹配
@@ -117,8 +118,7 @@ shell: pkg run <app_id>
 ## 6. 内核门控（Phase A 内核改动，防绕过）
 
 现状：`SYS_CAP_CREATE_ATOM`/`SYS_CAP_REVOKE_BY_ATOM`/`SYS_CAP_GRANT_TO_SUBJECT`
-未门控（注释承诺 P1/P2 落地但从未实现），perm `do_grant` 未门控 → 沙盒可被三处绕过。
-Phase A 一并关闭：
+与 perm `do_grant` 四处入口，Phase A 关闭后已全部门控，沙盒无法自授。门控表：
 
 | 入口 | 门控 | 说明 |
 |---|---|---|
@@ -129,7 +129,7 @@ Phase A 一并关闭：
 | perm `do_grant` | 调用者持 `ATOM_SERVICE_MANAGE` | 能力制（见下） |
 
 门控用 `cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM, 0)` 判存在（同
-syscall.c:780 SYS_SET_TIME 模式）。
+syscall.c:818 SYS_SET_TIME 模式）。
 
 **perm `do_grant` 门控为能力制而非角色制**：授予以「调用者持有 `ATOM_SERVICE_MANAGE`
 原子」为准，而非 `role_is_management`。原因：grant 必须能压倒角色默认（§四 grants
@@ -165,7 +165,7 @@ ATOM_SERVICE_MANAGE)` 查询（`SYS_CAP_HAS_ATOM`，新增 syscall 66）。`do_r
 ## 8. 验收标准（Phase A）
 
 1. `make iso` 0 新警告。
-2. QEMU 回归：31/31 + P1/P2/P2V 全绿（init 种子后不回归）。
+2. QEMU 回归：31/31 + P1 10/10 + P2 Gate 3/3 + P2V 4/4 + KBD 1/1 全绿（init 种子后不回归）。
 3. `pkg install hello`（Powerbox y）→ `pkg list` 显示 hello → `pkg run hello` 正常退出。
 4. `pkg install sbox_demo --perms=sys.set_time` → `pkg run sbox_demo` → 打印
    `set_time OK`。
@@ -173,3 +173,45 @@ ATOM_SERVICE_MANAGE)` 查询（`SYS_CAP_HAS_ATOM`，新增 syscall 66）。`do_r
    `set_time DENIED (no permission)`，且应用尝试 `cap_create_atom(ATOM_SYS_SET_TIME)`
    自授也返回 `ERR_NOCAP`（证明门控有效）。
 6. `scripts/ops_pack.py` 能在 host 侧打包/校验 `.ops`（与 pkg-manager 解析互认）。
+
+## 9. 验收记录（Phase A，2026-08-16，QEMU 实测）✅
+
+**验收方法**：`make iso` 构建 → QEMU（`-vnc 127.0.0.1:0` + `-serial file:` + unix
+monitor socket）→ sendkey 注入 Powerbox `y` → serial log + screendump 双路取证 →
+VGA framebuffer 解码（1024x768 32bpp @ 0xfd000000，8x16 字体 / 9x20 px 网格 = 113x38
+cells，PPM 头 `P6\n1024 768\n255\n`，pixel data 在 maxval 行之后）。验收驱动同时
+检测崩溃标记 `KERNEL PANIC|Triple fault|BOOT:`。
+
+**观测模型（修正）**：shell 提示符/命令回显/错误只渲染到 VGA linear framebuffer；
+serial 永不显示 shell 输出（`TERM_DEBUG_SERIAL_MIRROR` 编译排除）。serial 承载服务
+libc printf（pkg/hello/sbox_demo 的 debug_log）。Powerbox 面板只渲染到 VGA；用 QEMU
+monitor `sendkey y` 回答，等待约 3 s（verdict hold 100 ticks + restore + focus
+release）；授权按 (subject, resource) 粒度，多次 PENDING 需多轮 y。init (PID 1)
+启动时有一个 pending 面板（`Access: X` → `System/Kernel/init.elf`），验收驱动先
+`answer_panels()`（max_rounds=5）应答再键入首个命令。
+
+| # | 标准（§8） | 结果 | 证据 |
+|---|---|---|---|
+| 1 | `make iso` 0 新警告 | ✅ | exit 0；`-Wall -Wextra -O2` 0 新警告 |
+| 2 | QEMU 回归 31/31 + P1/P2 Gate/P2V/KBD 全绿 | ✅ | serial.log：`=== Results: 31/31 passed ===`、`=== P1 Permissions: 10/10 passed ===`、`=== P2 Gate: 3/3 passed ===`、`=== P2 VFS: 4/4 passed ===`、`=== KBD Focus: 1/1 passed ===` |
+| 3 | `pkg install hello`（Powerbox y）→ list 显示 → run 正常退出 | ✅ | `pkg: installed 'hello' (0 atom(s), 90053 bytes)`；VGA `pkg list: 1 app(s) installed`；`pkg: run 'hello' pid 17 (0 atom(s) pending)`；信号自测 PASSED；SIGTERM 后 `proc: LAST_THREAD pid=17 code=143 waiting_tid=-1`（128+15 正常按信号终止；hello 未被 wait，waiting_tid=-1，无 survival 行） |
+| 4 | `pkg install sbox_demo --perms=sys.set_time` → run → `set_time OK` | ✅ | `pkg: installed 'sbox_demo' (1 atom(s), 85906 bytes)`；`pkg: run 'sbox_demo' pid 18 (1 atom(s) pending)`；`pkg: signed 'sbox_demo' pid 18 with 1 atom(s)`；`set_time OK` |
+| 5 | `pkg install sbox_demo_noperm` → run → `set_time DENIED` + 自授 `ERR_NOCAP` | ✅ | `pkg: installed 'sbox_demo_noperm' (0 atom(s), 85888 bytes)`；`signed ... with 0 atom(s)`；`set_time DENIED (no permission)`；`self-grant attempt = -3 (expect ERR_NOCAP)` |
+| 6 | `scripts/ops_pack.py` host 打包/校验与 pkg-manager 解析互认 | ✅ | cross_check 7/7 PASS（见下） |
+
+**§8.6 互认细节（host ops_pack ↔ pkg-manager）**：
+- 格式一致：16 B 头（magic/version/manifest_len/payload_len 小端）+ manifest +
+  ELF payload；`OPS_MAGIC=0x3153504F`（"OPS1" LE）、`OPS_VERSION=1`、
+  `manifest_len ∈ (0,512]`、`plen > 0`、`16+mlen+plen == 总长`（pkg_ops_parse 精确
+  尺寸检查，host 侧同规则）。
+- 双向往返：host `ops_pack.py pack` 产物 hello.ops（90096 B）与 sbox_demo.ops
+  （85906 B = 16+42+85848）被 pkg-manager 解析规则接受；pkg-manager 风格
+  （`app_id=` 单行 / `app_id`+`permissions=`）构造的 sys_*.ops 被 ops_pack check
+  接受（含 sys_sbox_demo_noperm.ops；sbox_demo_noperm 是 sbox_demo.elf 的内核 blob
+  别名，`kernel/blob/blob.c` 注册，非独立 ELF）。
+- 封闭原子表 19 项（§4）双方一致；管理面原子 `service.manage` / `cap.grant_self` /
+  `sys.debug` 双向拒绝（负例 PASS）。
+
+备注：hello 安装共 4 次尝试 / 3 轮 Powerbox `y`（安装路径按 (subject, resource)
+多次授权）；其余命令各 1 轮 y。验收后 serial.log 停在 sbox_demo_noperm 正常退出，
+无崩溃/挂起。

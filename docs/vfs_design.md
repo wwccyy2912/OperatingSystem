@@ -25,12 +25,12 @@ NSFileManager / Security-Scoped Bookmarks / APFS。
 
 | 约束 | 出处 | 对设计的影响 |
 |------|------|--------------|
-| IPC 消息上限 **4096 字节** | `kernel/include/kernel/types.h:82 MAX_MSG_SIZE` | 文件读写必须分块；大批量枚举需分批 |
+| IPC 消息上限 **4096 字节** | `kernel/include/kernel/types.h:103 MAX_MSG_SIZE` | 文件读写必须分块；大批量枚举需分批 |
 | IPC 同步 `call` 风格 | `user/lib/libipc/ipc.c` → `ipc_call(port, req, req_len, resp, &resp_len)` | VFS 客户端协议沿用「请求结构体 + 响应结构体」 |
-| 命名端口 `port_get("keyboard")` | `shell.c:870` | VFS 端口名定为 `"vfs"`，驱动端口名 `"vfs.fs.<driver>"` |
+| 命名端口 `port_get("keyboard")` | `shell.c:1474` | VFS 端口名定为 `"vfs"`，驱动端口名 `"vfs.fs.<driver>"` |
 | 每进程能力表 + 跨进程 grant | `kernel/include/kernel/cap.h`（`cap_create_in_table` / grant / `rights_t`） | FileHandle 句柄直接复用能力语义；内核只加 `CAP_TYPE_FILE` 占位或全部走用户态表 |
-| 服务由 manager 从 blob 拉起 | `manager.c:328 spawn_service` | `vfs_server` / `fs_*_driver` 加入服务表即可 |
-| **无块设备驱动** | `kernel/arch/x86_64/` 仅 serial/rtc/rng/io | Phase 0 必须用内存卷（blob 只读卷 + RAM 可写卷），virtio-blk 留到 Phase 1 |
+| 服务由 manager 从 blob 拉起 | `manager.c:336 spawn_service` | `vfs_server` / `fs_*_driver` 加入服务表即可 |
+| **无块设备驱动（已过时）** | `kernel/arch/x86_64/` 仅 serial/rtc/rng/io | Phase 0 约束；Phase 1 已完成 `kernel/arch/x86_64/virtio_blk.c`，virtio-blk 已实装 |
 | 无密码学子系统 | — | 书签的 MAC 签名阶段化：先做服务端记录 + 随机 token，真 MAC 后置 |
 | 无共享内存 IPC 路径 | 仅 `CAP_TYPE_MEM` 地基 | 零拷贝读取（§8.4）列为 Phase 3 |
 | 类型风格 | `u8/u16/u32/u64/i32`、`_t` 后缀、`模块_动词_名词` 命名 | 本文档所有定义遵守 |
@@ -109,7 +109,7 @@ typedef struct {
 ### 3.3 FileHandle（打开的文件实例 = 能力句柄）
 
 ```c
-typedef u32 vfs_handle_t;   /* 服务端句柄表索引，0 无效 */
+typedef u32 vfs_handle_t;   /* 随机 32 位 token，0 无效（handle_alloc，vfs_server.c:430-460） */
 
 /* 打开时的访问权限 —— 与内核 rights_t 位语义对齐 */
 #define VFS_ACCESS_READ    (1u << 0)
@@ -148,7 +148,7 @@ typedef struct {
 ```
 
 > 设计决策：单批 ≤64 项，名称定长 256B → 单批最大 ~16KB > 4096，因此
-> Phase 0 将 IPC 响应分页（每批 8~16 项，见 §6.4）。`batch[64][256]`
+> Phase 0 将 IPC 响应分页（固定每批 8 项，见 §6.4）。`batch[64][256]`
 > 仅作为客户端聚合缓冲。
 
 ---
@@ -177,10 +177,20 @@ enum {
     VFS_OP_MOUNT           = 13, /* 驱动侧 → vfs_server */
     VFS_OP_UNMOUNT         = 14,
     VFS_OP_STAT_VOLUME     = 15,
+    VFS_OP_MOVE            = 16, /* Phase 2: move/rename */
+    VFS_OP_WHOAMI          = 17, /* P1 地基: caller → subject_id */
+    VFS_OP_LIST_VOLUMES    = 18, /* 枚举已挂载卷（根 "/" 视图） */
 };
 
 /* 响应首字段为 i32 ret：0 = 成功，负数 = 错误码 */
 /* 错误码沿用内核 ERR_* 约定（负值） */
+/* VFS 专用错误码（vfs.h:134-139，负值避开内核 ERR_* 区间） */
+#define VFS_ERR_READONLY (-100) /* 只读卷写入（EROFS） */
+#define VFS_ERR_NOSPC    (-101) /* 卷满（ENOSPC） */
+#define VFS_ERR_STALE    (-102) /* 句柄/枚举器失效（ESTALE） */
+#define VFS_ERR_PERM     (-103) /* 权限拒绝（EPERM） */
+#define VFS_ERR_EXISTS   (-104) /* 建目录已存在（EEXIST） */
+#define VFS_ERR_ACCESS   (-105) /* 书签未授权（EACCES） */
 ```
 
 ### 4.2 关键消息体
@@ -200,7 +210,7 @@ typedef struct {
 /* VFS_OP_OPEN_ITEM */
 typedef struct {
     u32  op;
-    char path[1024];        /* 或从书签打开：flags 置 VFS_OPEN_FROM_BOOKMARK */
+    char path[1024];        /* 书签打开走 VFS_OP_RESOLVE_BOOKMARK，无 VFS_OPEN_FROM_BOOKMARK 宏 */
     u32  flags;
     u32  access;
 } vfs_req_open_t;
@@ -225,6 +235,46 @@ typedef struct {
     u8   data[VFS_MAX_READ];
 } vfs_resp_read_t;
 
+/* VFS_OP_MOVE —— Phase 2: move/rename（parent_id 链保持，itemID 稳定） */
+typedef struct {
+    u32  op;
+    char src[1024];         /* 源 URL */
+    char dst_dir[1024];     /* 目标目录 URL */
+    char new_name[256];     /* 可选改名；"" = 保持原名 */
+} vfs_req_move_t;
+
+typedef struct {
+    i32             ret;
+    vfs_item_info_t item;
+} vfs_resp_move_t;
+
+/* VFS_OP_WHOAMI —— P1 地基: caller → 内核签发 subject_id */
+typedef struct {
+    u32 op;                 /* = VFS_OP_WHOAMI */
+} vfs_req_whoami_t;
+
+typedef struct {
+    i32  ret;
+    u64  subject_id;        /* 0 = 错误/未知 */
+} vfs_resp_whoami_t;
+
+/* VFS_OP_LIST_VOLUMES —— 枚举已挂载卷（根 "/" 视图） */
+typedef struct {
+    char mount_name[64];    /* 如 "System" */
+    char driver_name[64];   /* 如 "mem" */
+    u32  read_only;
+} vfs_vol_info_t;
+
+typedef struct {
+    u32 op;                 /* = VFS_OP_LIST_VOLUMES */
+} vfs_req_list_volumes_t;
+
+typedef struct {
+    i32             ret;
+    u32             count;  /* 已挂载卷数，≤ VFS_MAX_VOLS(4) */
+    vfs_vol_info_t  vols[VFS_MAX_VOLS];
+} vfs_resp_list_volumes_t;
+
 /* VFS_OP_CREATE_BOOKMARK / RESOLVE —— 见 §5 */
 ```
 
@@ -246,12 +296,21 @@ int  fs_enum_begin(const char *url, vfs_handle_t *out_enum);
 int  fs_enum_next(vfs_handle_t e, vfs_enum_batch_t *batch);
 int  fs_enum_end(vfs_handle_t e);
 
+/* 卷 */
+int  fs_stat_volume(const char *url, u64 *total_bytes, u64 *used_bytes,
+                    u32 *read_only);
+int  fs_whoami(u64 *out_subject);
+int  fs_list_volumes(vfs_vol_info_t *out_vols, u32 *out_count);
+
 /* 书签 */
-int  fs_create_bookmark(const char *url, u32 access,
+int  fs_create_bookmark(const char *url, u32 access, u64 expiry_ticks,
                         u8 *out_bk, u32 *bk_len);
 int  fs_resolve_bookmark(const u8 *bk, u32 bk_len,
-                         vfs_handle_t *out_handle, u32 *access);
+                         vfs_handle_t *out_handle, vfs_item_info_t *out_item,
+                         u32 *access);
 int  fs_revoke_bookmark(const u8 *bk, u32 bk_len);
+int  fs_move_item(const char *src, const char *dst_dir,
+                  const char *new_name, vfs_item_info_t *out_item);
 ```
 
 ---
@@ -269,7 +328,7 @@ vfs_server ──► perm-manager：该 app 有权限吗？
    │                ▼
    │         term 弹 Powerbox 询问（文本 UI，Phase 2）
    │         ┌ 允许 ┤
-   │         ▼      └ 拒绝 → 返回 -EPERM
+   │         ▼      └ 拒绝 → 返回 VFS_ERR_ACCESS (-105)（EACCES）
    │   perm-manager 记录授权，通知 vfs_server
    ▼
 vfs_server 生成 BookmarkData（含卷 UUID + itemID + 权限 + 有效期）
@@ -284,38 +343,41 @@ resolve_bookmark(BookmarkData)
    └─ 用户已撤销 → -EACCES
 ```
 
-### 5.2 二进制格式（v1，明文初版 + 签名占位）
+### 5.2 二进制格式（v2，明文初版 + 签名占位）
 
 ```c
 #define VFS_BOOKMARK_MAGIC  0x4B4D4256   /* 'VB MK' */
-#define VFS_BOOKMARK_VERSION 1
+#define VFS_BOOKMARK_VERSION 2   /* vfs.h:294 */
 
 typedef struct {
     u32  magic;             /* VFS_BOOKMARK_MAGIC */
-    u32  version;           /* = 1 */
+    u32  version;           /* = 2 */
     u32  payload_len;       /* 以下 payload 长度 */
-    u32  reserved;
-    /* --- payload（版本 1） --- */
+    /* --- payload（版本 2） --- */
     vfs_resource_t resource;   /* 卷 UUID + itemID（稳定定位） */
     vfs_item_id_t  parent_id;  /* 创建时的父 ID，用于移动追踪 */
     u32  access;               /* 授予的 VFS_ACCESS_* */
-    u32  app_id_hash;          /* 沙盒 app id 的 32 位哈希 */
+    u64  subject_id;           /* 创建者内核签发身份（不可伪造） */
     u64  created_ticks;        /* RTC 时间戳 */
     u64  expiry_ticks;         /* 0 = 永不过期 */
     /* --- 签名区（Phase 3：引入密码学后启用） --- */
     u8   mac[16];              /* 当前填 0，占位 */
-} vfs_bookmark_t;
+} vfs_bookmark_t;              /* sizeof = 96 字节 */
 ```
 
-**阶段化说明**：当前无密码学子系统，Phase 2 的书签有效性以
-「vfs_server 服务端记录表 + 随机 token」为准，`BookmarkData` 仅为
-服务端表索引的封装（应用拿到的是一段不透明 blob，路径字符串不出服务端）。
-`mac[16]` 字段预留在 Phase 3 用 HMAC-SHA256（vfs_server 主密钥）真正签名。
+**阶段化说明**：当前无密码学子系统，Phase 2 的书签有效性以**字段匹配**
+为准：blob 是承载去规范化字段的不透明载体，不含服务端 token/索引
+（应用拿到的是一段不透明 blob，路径字符串不出服务端）；校验时
+magic/version/resource/parent/access/subject/timestamps 逐字段与服务端
+记录比对（vfs.h:283-291、vfs_server.c:552-576），记录由调用者内核签发
+subject 绑定。服务端 token 字段存在但仅作参考信息。`mac[16]` 字段预留在
+Phase 3 用 HMAC-SHA256（vfs_server 主密钥）真正签名。
 
 ### 5.3 权限检查的单一事实源
 
-- **服务端强制**：vfs_server 每次 `open_item`/`resolve_bookmark` 都向
-  perm-manager 校验当前授权（IPC 查询，缓存 1s 以内）。
+- **服务端强制**：vfs_server 在每次 open/resolve/read/write/enum_next
+  都重新执行 perm_check（vfs_server.c:1047,1110,1260），无授权缓存；
+  仅 perm-manager 对 term 端口句柄有惰性缓存（perm-manager.c:690）。
 - **撤回即失效**：用户在设置中撤销 → perm-manager 通知 vfs_server 删除
   该 app 的全部书签记录 → 应用下次 resolve 得到 `-EACCES`。
 - **不信任路径字符串**：书签解析结果只返回句柄，不返回路径，应用侧
@@ -330,37 +392,42 @@ typedef struct {
 ```
 resolve(url):
   "VolumeName/a/b/c" → 卷表查 VolumeName → 根 itemID → 逐级 parent_id 查子项
-  每级：名称哈希（FNV-1a 32）→ 驱动返回候选列表 → 精确匹配 name
+  每级：一次 DRV_OP_LOOKUP(parent_id, name) 精确名称查找
 ```
 
 Phase 0 不做全局 B-Tree 索引：驱动内部维护「父 ID → 子表」即可，层级
-浅（≤6 层），每层一次 IPC，足够。**B-Tree 全局索引列为 Phase 3 优化**
-（对齐 APFS 命名空间设计，但不阻塞主链路）。
+浅（VFS_MAX_DEPTH = 8 层，vfs_server.c:49），每层一次 IPC，足够。**B-Tree
+全局索引列为 Phase 3 优化**（对齐 APFS 命名空间设计，但不阻塞主链路）。
 
 ### 6.2 挂载配置（修正概念稿的自相矛盾）
 
-不用 `/etc/fstab` 文本文件。挂载配置是 vfs_server 自己的持久化对象：
+不用 `/etc/fstab` 文本文件。挂载配置是 vfs_server 的编译期静态表
+（vfs_server.c:73-84）：
 
 ```c
 typedef struct {
-    vfs_uuid_t     vol;           /* 卷 UUID */
-    char           mount_name[64];/* 挂载名，如 "System" "SSD-Data" */
-    char           driver[64];    /* 驱动名，如 "fs.mem" "fs.virtio_blk" */
-    bool           read_only;
-    bool           auto_mount;    /* 启动时自动挂载 */
-} vfs_mount_config_t;
+    const char *mount_name;   /* 挂载名，如 "System" "Users" "Disk" */
+    const char *driver_name;  /* 驱动名，如 "mem" "virtio_blk" */
+    u32         read_only;
+} vfs_mount_cfg_t;
+
+static const vfs_mount_cfg_t s_mount_cfg[3] = {
+    {"System", "mem", 1},
+    {"Users",  "mem", 0},
+    {"Disk",   "virtio_blk", 0},
+};
 ```
 
-配置持久化在**系统卷**（Phase 0 为只读内存卷内嵌的静态表；Phase 1 起
-存于系统卷自身）。
+驱动端口名为 `"vfs.fs.<driver>"`（如 `"vfs.fs.mem"` / `"vfs.fs.virtio_blk"`），
+`driver_name` 本身不带 `fs.` 前缀。Phase 1 后仍无持久化，配置仍是静态表。
 
 ### 6.3 目录树（多卷视图，Phase 0 即可呈现）
 
 ```
 /Volumes/System      ← fs_mem_driver（blob 只读卷，内容见下）
 /Volumes/Users       ← fs_mem_driver（RAM 可写卷，重启丢失）
-/Volumes/SSD-Data    ← Phase 1 真实磁盘
-/.Trash/<uid>/       ← 用户隔离（Phase 2）
+/Volumes/Disk        ← Phase 1 真实磁盘（virtio_blk）
+/.Trash/<uid>/       ← 用户隔离（Phase 2，未实现）
 ```
 
 > 概念稿的 `/System /Users` 顶层目录由 vfs_server 的「逻辑视图」层实现：
@@ -369,9 +436,11 @@ typedef struct {
 
 ### 6.4 枚举分页（4096 上限对策）
 
-- 单次 `VFS_OP_ENUM_NEXT` 响应：`{ ret, count(≤16), items[16] }`，
-  每项定长 `name[256] + id` → 单响应 ≤ 16×264 + 头 ≈ 4.2KB。若超限，
-  服务端自动降为 8 项/批。
+- 单次 `VFS_OP_ENUM_NEXT` 响应：`{ ret, count, items[8] }`，固定
+  `VFS_ENUM_BATCH 8` 项/批（vfs.h:124、fs_mem_driver.c:459-464）；
+  vfs_server 仅转发驱动批次，无自适应降级逻辑（vfs_server.c:1281-1284）。
+- 每项 `vfs_enum_item_t` 定长 `name[256] + id + u32 type`
+  （vfs.h:270-274）→ 单响应 ≈ 8×(264+4) + 头 < 4096。
 - 客户端 `fs_enum_next` 循环聚合到用户提供的 `vfs_enum_batch_t`。
 
 ---
@@ -391,17 +460,21 @@ fs_<format>_driver（用户态进程，如 fs_mem_driver）
         write(item_id, off, buf) → 字节数
         create_dir / delete / mkfile
         enumerate(parent_id, from) → 一批 (id, name)
+        stat(volume)             → 容量/已用/只读（DRV_OP_STAT = 9，vfs.h:466）
+        move(src, dst_dir, name) → itemID 稳定（DRV_OP_MOVE = 10，vfs.h:467）
 ```
 
 ### 7.2 挂载握手（`VFS_OP_MOUNT`）
 
 ```
 vfs_server（启动时，或检测到热插拔）：
-  1. spawn_service("fs_mem_driver")            // 复用 manager 的 blob 拉起
-  2. 授权：通过 IPC 传递块设备能力 / 内存卷能力
+  1. （A1 实际流程）manager 拉起驱动（manager.c:481 SVC_FS_MEM），
+     驱动自挂载；A2（server-spawn）为 RESERVED 无代码（vfs_server.c:1774-1778/1803-1805）
+  2. 挂载握手无能力传递：MOUNT 请求只带 names/uuid/root/read_only
+     （vfs.h:410-417）——能力传递未实现
   3. 驱动初始化格式（Phase 0：内存卷直接布局；Phase 1：读分区表）
   4. 驱动 → vfs_server: VFS_OP_MOUNT { uuid, root_item_id, driver_name }
-  5. vfs_server 登记卷，绑定 mount_name，广播变更（notify）
+  5. vfs_server 登记卷，绑定 mount_name（无 notify/broadcast 机制，未实现）
 ```
 
 ### 7.3 Phase 0 的内存卷布局（无需驱动进程也可内嵌进 vfs_server）
@@ -426,7 +499,7 @@ Phase 0 允许两个实现二选一：
    `VFS_OP_*` 1~9（GET/CREATE/DELETE/OPEN/READ/WRITE/CLOSE/ENUM）。
 2. `user/services/vfs/fs_mem_driver.c`：blob 只读卷 + RAM 可写卷。
 3. `user/lib/libfs/fs.c` + `fs.h`：§4.3 全部接口。
-4. manager 服务表注册 `vfs`（manager.c:328 模式）；shell 增加测试命令
+4. manager 服务表注册 `vfs`（manager.c:336 模式）；shell 增加测试命令
    `vfs_ls <url>`、`vfs_cat <url>`（shell.c 注册命令表）。
 5. 系统卷预置内容：把现有 blob（hello.elf 等）映射为
    `/Volumes/System/Kernel/hello.elf`。
@@ -455,7 +528,8 @@ Phase 0 允许两个实现二选一：
    `fs_virtio_blk_driver`（用户态，内核只提供 DMA 能力）。
 2. `fs_virtio_blk_driver`：块读写 + 简单卷格式（自研 TFS 风格：
    超级块 + inode 区 + 数据区，itemID 即 inode 号）。
-3. `VFS_OP_MOUNT/UNMOUNT/STAT_VOLUME` 实装；挂载配置对象持久化。
+3. `VFS_OP_MOUNT/UNMOUNT/STAT_VOLUME` 实装；挂载配置对象持久化
+   （**未实现**，仍为编译期静态表 `s_mount_cfg`）。
 4. QEMU 启动参数加 `-drive file=disk.img,if=virtio`。
 
 **验证**：`vfs_cat` 读磁盘卷；写后重启 QEMU 数据仍在（持久性证明）；
@@ -493,7 +567,8 @@ Phase 0 允许两个实现二选一：
    （§5.2 格式，MAC 占位 0）。
 3. Powerbox：perm-manager → term 文本询问（"允许 app 访问 X？[y/n]"），
    shell 或 term 上应答。
-4. `.Trash/<uid>/` 隔离 + `com.apple.quarantine` 风格 xattr 位。
+4. `.Trash/<uid>/` 隔离 + `com.apple.quarantine` 风格 xattr 位
+   （**未实现**，全仓库无 Trash/quarantine 相关代码）。
 
 **验证**：
 - 授权前 resolve → `-EACCES`；授权后 resolve → 拿到句柄。
@@ -506,7 +581,8 @@ Phase 0 允许两个实现二选一：
   即 -EACCES，默认拒绝生效。
 - term 弹 Powerbox 文本询问：`perm: app 0x5e11e5 requests /Users/a.txt (R)
   - perm_answer 389 y/n`；`perm_answer 389 y` → `ALLOWED (0)`。
-- 再 `bm_create` → `ok, 88-byte bookmark cached`（授权后放行）。
+- 再 `bm_create` → `ok, 96-byte bookmark cached`（授权后放行，
+  sizeof(vfs_bookmark_t) = 96）。
 - `bm_resolve` → `handle -1380597971, item 'a.txt' (id 2), access 1`。
 - `move /Users/a.txt /Users b.txt` → `move: 'b.txt' -> item 2`（改名成功，
   itemID 稳定）。
@@ -594,7 +670,8 @@ term 文本询问；v0.4 图形服务落地后只换后端，接口不变。
 | 启动后空闲 | 62263 pages = **243MB** |
 | 内核 + 全部服务占用 | ≈ 13MB |
 
-**结论**：RAM 可写卷默认 32MB（`#define VFS_RAM_VOL_SIZE_MB 32`），通过
+**结论**：RAM 可写卷默认 32MB（`MEM_USERS_CAP = 32u*1024u*1024u`，
+fs_mem_driver.c:41；无 `VFS_RAM_VOL_SIZE_MB` 宏），通过
 用户态 `map_memory()`（`SYS_MAP_MEMORY`，已存在）按需分配物理页。32MB
 仅占空闲内存的 13%，余量充足；blob 只读卷（System）直接引用 `SYS_BLOB_GET`
 取回的 blob 缓冲区，不额外占 RAM 卷。

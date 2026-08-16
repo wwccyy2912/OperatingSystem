@@ -42,7 +42,7 @@
  * Constants
  * ==================================================================== */
 
-#define MAX_VOLS      4   /* mount slots */
+#define MAX_VOLS      VFS_MAX_VOLS /* mount slots (protocol constant) */
 #define MAX_HANDLES   64  /* open file handles */
 #define MAX_ENUMS     16  /* active enumerators */
 #define MAX_BOOKMARKS 32  /* security-scoped bookmarks */
@@ -94,6 +94,8 @@ typedef struct {
     vfs_uuid_t    uuid;
     vfs_item_id_t root_item_id;
     u32           read_only;
+    u64           owner_subject; /* subject of the MOUNT handshake — only
+                                  * it may UNMOUNT (§7.2 A1 binding) */
     int           drv_port; /* resolved lazily: "vfs.fs.<driver>" */
     u32           drv_vol;  /* driver-side volume index (§7.1:
                              * driver numbers its volumes 0,1,2…
@@ -579,7 +581,7 @@ static vfs_bookmark_ent_t *bookmark_validate(const vfs_bookmark_t *blob) {
  * Protocol handlers (each replies via the shared s_resp buffer)
  * ==================================================================== */
 
-static void do_mount(int token, int msg_len) {
+static void do_mount(int token, int msg_len, u64 caller_subject) {
     vfs_resp_mount_t *resp = (vfs_resp_mount_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_mount_t)) {
         resp->ret = ERR_INVAL;
@@ -623,7 +625,10 @@ static void do_mount(int token, int msg_len) {
             for (u32 j = 0; j < MAX_VOLS; j++)
                 if (s_vols[j].mounted && strcmp(s_vols[j].driver_name, req->driver_name) == 0)
                     v->drv_vol++;
-            v->mounted = 1;
+            v->mounted       = 1;
+            v->owner_subject = caller_subject; /* A1 identity binding:
+                                                * only this subject may
+                                                * UNMOUNT the volume */
             strncpy(v->mount_name, req->mount_name, sizeof(v->mount_name) - 1);
             strncpy(v->driver_name, req->driver_name, sizeof(v->driver_name) - 1);
             v->uuid         = req->uuid;
@@ -644,7 +649,7 @@ out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_unmount(int token, int msg_len) {
+static void do_unmount(int token, int msg_len, u64 caller_subject) {
     vfs_resp_unmount_t *resp = (vfs_resp_unmount_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_unmount_t)) {
         resp->ret = ERR_INVAL;
@@ -676,6 +681,16 @@ static void do_unmount(int token, int msg_len) {
     }
     if (vi < 0) {
         resp->ret = ERR_NOENT; /* not mounted */
+        goto out;
+    }
+
+    /* A1 identity binding: the volume was mounted by a specific kernel
+     * subject (recorded in do_mount).  Only that subject may unmount
+     * it — an arbitrary client must not be able to tear down a volume
+     * (a denial-of-service vector).  The subject comes from
+     * ipc_recv_from, never from the request bytes. */
+    if (s_vols[vi].owner_subject != 0 && s_vols[vi].owner_subject != caller_subject) {
+        resp->ret = VFS_ERR_ACCESS;
         goto out;
     }
 
@@ -940,6 +955,22 @@ static void do_open(int token, int msg_len, u64 caller_subject) {
     }
     fid = s_drv_resp.u.item_id;
 
+    /* OPEN_ITEM is a file open: directories are enumerated via
+     * VFS_OP_ENUM_BEGIN, never opened as file handles (a dir handle
+     * would carry READ/WRITE access against a non-file).  Reject a
+     * directory target with ERR_INVAL, matching do_enum_begin's
+     * file-vs-dir rule. */
+    vfs_item_info_t oinfo;
+    r = vfs_getattr(vi, fid, &oinfo);
+    if (r < 0) {
+        resp->ret = r;
+        goto out;
+    }
+    if (oinfo.type != VFS_ITEM_FILE) {
+        resp->ret = ERR_INVAL;
+        goto out;
+    }
+
     /* Read-only volume rejects any WRITE access at open time. */
     if (v->read_only && (req->access & VFS_ACCESS_WRITE)) {
         resp->ret = VFS_ERR_READONLY;
@@ -1136,7 +1167,7 @@ out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_close(int token, int msg_len) {
+static void do_close(int token, int msg_len, u64 caller_subject) {
     vfs_resp_close_t *resp = (vfs_resp_close_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_close_t)) {
         resp->ret = ERR_INVAL;
@@ -1144,14 +1175,26 @@ static void do_close(int token, int msg_len) {
     }
     vfs_req_close_t *req = (vfs_req_close_t *)s_req;
 
+    /* A leaked handle token must not let another process close the
+     * handle: bind CLOSE to the opener's kernel subject (same rule as
+     * do_read/do_write/do_enum_next).  The subject comes from
+     * ipc_recv_from, never from the request bytes. */
     vfs_handle_ent_t *h = handle_find(req->handle);
     if (h) {
+        if (caller_subject != h->subject_id) {
+            resp->ret = VFS_ERR_ACCESS;
+            goto out;
+        }
         memset(h, 0, sizeof(*h));
         resp->ret = 0;
         goto out;
     }
     for (int i = 0; i < MAX_ENUMS; i++) {
         if (s_enums[i].in_use && s_enums[i].token == req->handle) {
+            if (caller_subject != s_enums[i].subject_id) {
+                resp->ret = VFS_ERR_ACCESS;
+                goto out;
+            }
             memset(&s_enums[i], 0, sizeof(s_enums[i]));
             resp->ret = 0;
             goto out;
@@ -1333,6 +1376,31 @@ out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
+/* VFS_OP_LIST_VOLUMES — enumerate currently-mounted volumes.  There is
+ * no root item to enum_begin("/") on: URLs start at a volume name, so
+ * the "/" root view is served from the mount table itself. */
+static void do_list_volumes(int token, int msg_len) {
+    vfs_resp_list_volumes_t *resp = (vfs_resp_list_volumes_t *)s_resp;
+    (void)msg_len;
+    resp->ret   = 0;
+    resp->count = 0;
+    for (u32 i = 0; i < MAX_VOLS; i++) {
+        if (!s_vols[i].mounted)
+            continue;
+        if (resp->count >= VFS_MAX_VOLS)
+            break;
+        strncpy(resp->vols[resp->count].mount_name, s_vols[i].mount_name,
+                sizeof(resp->vols[resp->count].mount_name) - 1);
+        resp->vols[resp->count].mount_name[sizeof(resp->vols[resp->count].mount_name) - 1] = '\0';
+        strncpy(resp->vols[resp->count].driver_name, s_vols[i].driver_name,
+                sizeof(resp->vols[resp->count].driver_name) - 1);
+        resp->vols[resp->count].driver_name[sizeof(resp->vols[resp->count].driver_name) - 1] = '\0';
+        resp->vols[resp->count].read_only = s_vols[i].read_only;
+        resp->count++;
+    }
+    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+}
+
 /* ====================================================================
  * Bookmark handlers (design §5 — security-scoped bookmarks, Phase 2)
  *
@@ -1460,9 +1528,15 @@ static void do_resolve_bookmark(int token, int msg_len, u64 subject_id) {
     /* Locate the item.  itemID is stable across DRV_OP_MOVE, but a
      * driver may re-ID on move (copy+delete): fall back to the
      * parent_id chain + stored name (design §5: "用 parent_id 链重新
-     * 定位"). */
+     * 定位").  The relocated id is used for THIS resolve only — the
+     * record's item_id stays anchored to the original id so the
+     * client's blob (carrying the original resource.id) keeps matching
+     * bookmark_validate on every later resolve.  Mutating the record
+     * here would desync it from the blob and break the bookmark from
+     * the second resolve onward. */
+    vfs_item_id_t live_id = b->item_id;
     vfs_item_info_t info;
-    int             r = vfs_getattr(b->vol_index, b->item_id, &info);
+    int             r = vfs_getattr(b->vol_index, live_id, &info);
     if (r == ERR_NOENT && b->parent_id != 0) {
         memset(&s_drv_req, 0, sizeof(s_drv_req));
         s_drv_req.op        = DRV_OP_LOOKUP;
@@ -1472,8 +1546,8 @@ static void do_resolve_bookmark(int token, int msg_len, u64 subject_id) {
         s_drv_req.payload.name[DRV_PATH_MAX - 1] = '\0';
         int r2 = vfs_drv_call(b->vol_index, &s_drv_req, &s_drv_resp);
         if (r2 >= 0 && s_drv_resp.ret >= 0) {
-            b->item_id = s_drv_resp.u.item_id; /* re-anchor record */
-            r          = vfs_getattr(b->vol_index, b->item_id, &info);
+            live_id = s_drv_resp.u.item_id;
+            r       = vfs_getattr(b->vol_index, live_id, &info);
         }
     }
     if (r < 0) {
@@ -1487,8 +1561,8 @@ static void do_resolve_bookmark(int token, int msg_len, u64 subject_id) {
      * temporary handle carries ONLY the bits granted at resolve time. */
     vfs_resource_t res;
     memset(&res, 0, sizeof(res));
-    res.vol     = s_vols[b->vol_index].uuid;
-    res.id      = b->item_id;
+    res.vol = s_vols[b->vol_index].uuid;
+    res.id  = live_id;
     u32 granted = 0;
     r           = perm_check(&res, b->access, "", subject_id, &granted);
     if (r < 0) {
@@ -1500,7 +1574,7 @@ static void do_resolve_bookmark(int token, int msg_len, u64 subject_id) {
 
     vfs_handle_t      htok;
     vfs_handle_ent_t *h =
-        handle_alloc(b->vol_index, b->item_id, granted, 0, subject_id, &res, &htok);
+        handle_alloc(b->vol_index, live_id, granted, 0, subject_id, &res, &htok);
     if (!h) {
         resp->ret = ERR_NOMEM;
         goto out;
@@ -1515,7 +1589,7 @@ out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_revoke_bookmark(int token, int msg_len) {
+static void do_revoke_bookmark(int token, int msg_len, u64 caller_subject) {
     vfs_resp_revoke_bookmark_t *resp = (vfs_resp_revoke_bookmark_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_revoke_bookmark_t)) {
         resp->ret = ERR_INVAL;
@@ -1530,10 +1604,20 @@ static void do_revoke_bookmark(int token, int msg_len) {
     vfs_bookmark_t blob;
     memcpy(&blob, req->data, sizeof(blob));
 
+    /* A bookmark is bound to its creator's kernel subject (the record
+     * field is authoritative; the blob's own copy is client-held).  A
+     * leaked/copied blob must not let another process revoke it — that
+     * would be a denial-of-service on a still-valid grant.  Same
+     * identity rule as do_resolve_bookmark. */
     vfs_bookmark_ent_t *b = bookmark_validate(&blob);
-    if (b)
+    if (b) {
+        if (caller_subject != b->subject_id) {
+            resp->ret = VFS_ERR_ACCESS;
+            goto out;
+        }
         memset(b, 0, sizeof(*b)); /* drop the server-side record */
-    resp->ret = 0;                /* idempotent: revoke is revoke */
+    }
+    resp->ret = 0; /* idempotent: revoke is revoke */
 
 out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
@@ -1699,7 +1783,7 @@ static void vfs_handle_request(int token, u32 op, int msg_len, u64 caller_subjec
         do_write(token, msg_len, caller_subject);
         break;
     case VFS_OP_CLOSE:
-        do_close(token, msg_len);
+        do_close(token, msg_len, caller_subject);
         break;
     case VFS_OP_ENUM_BEGIN:
         do_enum_begin(token, msg_len, caller_subject);
@@ -1708,10 +1792,10 @@ static void vfs_handle_request(int token, u32 op, int msg_len, u64 caller_subjec
         do_enum_next(token, msg_len, caller_subject);
         break;
     case VFS_OP_MOUNT:
-        do_mount(token, msg_len);
+        do_mount(token, msg_len, caller_subject);
         break;
     case VFS_OP_UNMOUNT:
-        do_unmount(token, msg_len);
+        do_unmount(token, msg_len, caller_subject);
         break;
     case VFS_OP_STAT_VOLUME:
         do_stat_volume(token, msg_len);
@@ -1723,13 +1807,16 @@ static void vfs_handle_request(int token, u32 op, int msg_len, u64 caller_subjec
         do_resolve_bookmark(token, msg_len, caller_subject);
         break;
     case VFS_OP_REVOKE_BOOKMARK:
-        do_revoke_bookmark(token, msg_len);
+        do_revoke_bookmark(token, msg_len, caller_subject);
         break;
     case VFS_OP_MOVE:
         do_move(token, msg_len, caller_subject);
         break;
     case VFS_OP_WHOAMI:
         do_whoami(token, msg_len, caller_subject);
+        break;
+    case VFS_OP_LIST_VOLUMES:
+        do_list_volumes(token, msg_len);
         break;
     default: {
         i32 *resp = (i32 *)s_resp;

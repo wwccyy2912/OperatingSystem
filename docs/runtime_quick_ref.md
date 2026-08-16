@@ -123,7 +123,7 @@ int main(void)
 
 void *ptr = malloc(1 << 30);  /* 尝试 1 GB */
 if (!ptr && errno == ENOMEM) {
-    fprintf(stderr, "Out of memory\n");
+    printf("Out of memory\n");
 }
 ```
 
@@ -242,7 +242,6 @@ app.elf: $(RUNTIME_OBJ) app.o
 - 单线程（errno 全局）
 - 无 TLS（线程本地存储）
 - 无 malloc 钩子
-- 无 .fini_array（全局析构 via 属性工作）
 - 无命令行参数
 
 ### v1.0（计划）

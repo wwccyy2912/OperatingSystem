@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <libos/syscalls.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,7 +38,7 @@ __attribute__((constructor)) static void resource_construct(void) {
     resource.initialized = 1;
 }
 
-/* Global destructor: would be called by _fini() after main() (v1.0+) */
+/* Global destructor: called by _fini() after main() (via .fini_array) */
 __attribute__((destructor)) static void resource_destroy(void) {
     printf("[runtime_demo] Resource destructor called\n");
     resource.initialized = 0;
@@ -94,15 +95,15 @@ int main(void) {
     printf("Registering atexit handlers in order 1, 2, 3...\n");
 
     if (atexit(cleanup_handler_1) != 0) {
-        fprintf(stderr, "atexit(cleanup_handler_1) failed\n");
+        printf("atexit(cleanup_handler_1) failed\n");
         return 1;
     }
     if (atexit(cleanup_handler_2) != 0) {
-        fprintf(stderr, "atexit(cleanup_handler_2) failed\n");
+        printf("atexit(cleanup_handler_2) failed\n");
         return 1;
     }
     if (atexit(cleanup_handler_3) != 0) {
-        fprintf(stderr, "atexit(cleanup_handler_3) failed\n");
+        printf("atexit(cleanup_handler_3) failed\n");
         return 1;
     }
 
@@ -115,7 +116,7 @@ int main(void) {
     printf("Allocating 1024 bytes with malloc...\n");
     char *buf1 = malloc(1024);
     if (!buf1) {
-        fprintf(stderr, "malloc(1024) failed: %d\n", errno);
+        printf("malloc(1024) failed: %d\n", errno);
         return 1;
     }
     strcpy(buf1, "Hello from malloc!");
@@ -125,7 +126,7 @@ int main(void) {
     printf("Allocating 256 zeroed elements with calloc...\n");
     int *arr = calloc(256, sizeof(int));
     if (!arr) {
-        fprintf(stderr, "calloc(256, 4) failed: %d\n", errno);
+        printf("calloc(256, 4) failed: %d\n", errno);
         return 1;
     }
     printf("arr[0]=%d (should be 0), arr at %p\n", arr[0], (void *)arr);
@@ -134,7 +135,7 @@ int main(void) {
     printf("Growing buf1 from 1024 to 2048 bytes with realloc...\n");
     char *buf2 = realloc(buf1, 2048);
     if (!buf2) {
-        fprintf(stderr, "realloc(buf1, 2048) failed: %d\n", errno);
+        printf("realloc(buf1, 2048) failed: %d\n", errno);
         free(buf1);
         free(arr);
         return 1;
@@ -166,7 +167,7 @@ int main(void) {
     printf("Registering SIGUSR1 handler...\n");
     sighandler_t old_handler = signal(SIGUSR1, handle_sigusr1);
     if (old_handler == SIG_ERR) {
-        fprintf(stderr, "signal(SIGUSR1) failed\n");
+        printf("signal(SIGUSR1) failed\n");
         return 1;
     }
     printf("Previous SIGUSR1 handler: %p\n", (void *)old_handler);
@@ -174,7 +175,7 @@ int main(void) {
     printf("Registering SIGTERM handler for graceful exit...\n");
     old_handler = signal(SIGTERM, handle_sigterm);
     if (old_handler == SIG_ERR) {
-        fprintf(stderr, "signal(SIGTERM) failed\n");
+        printf("signal(SIGTERM) failed\n");
         return 1;
     }
     printf("Previous SIGTERM handler: %p\n", (void *)old_handler);
@@ -182,7 +183,7 @@ int main(void) {
     printf("Ignoring SIGPIPE...\n");
     old_handler = signal(SIGPIPE, SIG_IGN);
     if (old_handler == SIG_ERR) {
-        fprintf(stderr, "signal(SIGPIPE) failed\n");
+        printf("signal(SIGPIPE) failed\n");
         return 1;
     }
     printf("Previous SIGPIPE handler: %p\n", (void *)old_handler);
@@ -211,7 +212,7 @@ int main(void) {
     printf("\n[runtime_demo] Exiting main() with status 0\n");
     printf("[runtime_demo] The following should happen:\n");
     printf("  1. exit() calls atexit handlers in reverse order (3, 2, 1)\n");
-    printf("  2. Resource destructor is called (v1.0+)\n");
+    printf("  2. Resource destructor is called (via .fini_array)\n");
     printf("  3. Process terminates via SYS_THREAD_EXIT\n");
 
     return 0;

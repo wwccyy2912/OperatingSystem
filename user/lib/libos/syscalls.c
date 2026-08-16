@@ -68,12 +68,12 @@ int ipc_reply(int token, const void *resp, int resp_len) {
 
 /* ---- Memory ---- */
 
-void *map_memory(int cap, int offset, int size, int prot) {
-    return (void *)sys_call(SYS_MAP_MEMORY, cap, offset, size, prot, 0);
+void *map_memory(int cap, uint64_t offset, uint64_t size, int prot) {
+    return (void *)sys_call(SYS_MAP_MEMORY, cap, (long)offset, (long)size, prot, 0);
 }
 
-int unmap_memory(void *addr, int size) {
-    return (int)sys_call(SYS_UNMAP_MEMORY, (long)addr, size, 0, 0, 0);
+int unmap_memory(void *addr, uint64_t size) {
+    return (int)sys_call(SYS_UNMAP_MEMORY, (long)addr, (long)size, 0, 0, 0);
 }
 
 /* ---- Thread management ---- */
@@ -287,8 +287,9 @@ int mutex_destroy(int handle) {
  */
 sighandler_t signal(int signum, sighandler_t handler) {
     extern void __restore_rt(void);
-    return (sighandler_t)sys_call(
+    long ret = sys_call(
         SYS_SIGNAL, signum, (long)handler, (long)(uintptr_t)__restore_rt, 0, 0);
+    return (ret < 0) ? SIG_ERR : (sighandler_t)ret;
 }
 
 int kill(int pid, int signum) {

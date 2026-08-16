@@ -118,6 +118,7 @@ USER_C := \
     user/services/device_mgr/device_mgr.c \
     user/services/pkg/pkg_manager.c \
     user/services/sbox_demo/main.c \
+    user/services/runtime_demo/main.c \
     user/lib/libfs/fs.c \
     user/lib/libpkg/pkg.c
 
@@ -158,10 +159,11 @@ USER_SVC_ENTRY_OBJ := \
     build/user/services/perm/perm-manager.c.o \
     build/user/services/device_mgr/device_mgr.c.o \
     build/user/services/pkg/pkg_manager.c.o \
-    build/user/services/sbox_demo/main.c.o
+    build/user/services/sbox_demo/main.c.o \
+    build/user/services/runtime_demo/main.c.o
 USER_SHARED_OBJ := $(filter-out $(USER_SVC_ENTRY_OBJ), $(USER_OBJ))
 
-SVC_NAMES := init manager serial keyboard term shell flaky hello vfs fs_mem_driver fs_virtio_blk_driver perm device_mgr pkg sbox_demo
+SVC_NAMES := init manager serial keyboard term shell flaky hello vfs fs_mem_driver fs_virtio_blk_driver perm device_mgr pkg sbox_demo runtime_demo
 SVC_BLOBS := $(addprefix build/, $(addsuffix _blob.o, $(SVC_NAMES)))
 
 # ==============================================================================
@@ -233,6 +235,7 @@ $(eval $(call SVC_LINK_RULE,perm,perm/perm-manager.c.o))
 $(eval $(call SVC_LINK_RULE,device_mgr,device_mgr/device_mgr.c.o))
 $(eval $(call SVC_LINK_RULE,pkg,pkg/pkg_manager.c.o))
 $(eval $(call SVC_LINK_RULE,sbox_demo,sbox_demo/main.c.o))
+$(eval $(call SVC_LINK_RULE,runtime_demo,runtime_demo/main.c.o))
 
 # Embed each service ELF as a kernel blob object (symbols renamed to <svc>_elf_*).
 define SVC_BLOB_RULE

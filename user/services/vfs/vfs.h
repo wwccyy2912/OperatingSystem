@@ -161,9 +161,11 @@ enum {
     VFS_OP_STAT_VOLUME      = 15,
     VFS_OP_MOVE             = 16, /* Phase 2: move/rename item */
     VFS_OP_WHOAMI           = 17, /* P1 地基: caller → kernel subject_id */
+    VFS_OP_LIST_VOLUMES     = 18, /* enumerate mounted volumes (root "/" view) */
 };
 
 #define VFS_PATH_MAX 1024 /* URL string field size */
+#define VFS_MAX_VOLS 4    /* mount slots (matches vfs_server MAX_VOLS) */
 
 /* VFS_OP_GET_ITEM */
 typedef struct {
@@ -386,6 +388,23 @@ typedef struct {
     i32 ret;
     u64 subject_id; /* 0 = error/unknown */
 } vfs_resp_whoami_t;
+
+/* VFS_OP_LIST_VOLUMES — one mounted volume entry (root "/" view) */
+typedef struct {
+    char mount_name[64];   /* e.g. "System" */
+    char driver_name[64];  /* e.g. "mem" */
+    u32  read_only;
+} vfs_vol_info_t;
+
+typedef struct {
+    u32 op; /* = VFS_OP_LIST_VOLUMES */
+} vfs_req_list_volumes_t;
+
+typedef struct {
+    i32            ret;   /* 0 = ok */
+    u32            count; /* mounted volumes, ≤ VFS_MAX_VOLS */
+    vfs_vol_info_t vols[VFS_MAX_VOLS];
+} vfs_resp_list_volumes_t;
 
 /* VFS_OP_MOUNT — driver → vfs_server registration (design §7.2) */
 typedef struct {

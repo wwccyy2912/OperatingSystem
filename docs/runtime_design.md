@@ -2,7 +2,7 @@
 
 > 版本：v1.0  
 > 日期：2026-08-14  
-> 状态：Phase 2 完成  
+> 状态：核心运行库（init/exit/errno/malloc/crt0/sigrestore）已实现并编入构建；runtime_demo 未接入 Makefile，§12 测试计划未执行  
 > 关联：user/runtime/、user/lib/libos/syscalls.h
 
 ---
@@ -51,6 +51,7 @@ thread_exit()  → 系统调用终止
 
 ```asm
 _start:
+    and rsp, -16            ; 栈对齐（16 字节边界）
     call _init              ; 全局构造函数（.init_array）
     xor edi, edi            ; argc = 0
     xor esi, esi            ; argv = NULL
@@ -119,7 +120,7 @@ User process VA space:
   ├─────────────────────────────────────┤
   │ [stack region: 0x90000000-0x100000000] ← thread stacks, guard pages
   │ [vspace_alloc available]
-  │ [ASLR PIE: 0x40000000-0x70000000]   ← ELF 加载基址
+  │ [ELF: 0x400000（固定链接基址）]
   ├─────────────────────────────────────┤
   │ [heap high guard: heap_base+256MB]  │ <- [heap_max, unmappable]
   │ [heap region: heap_base+0 to +256MB]│ <- grows upward
@@ -141,13 +142,13 @@ User process VA space:
 ### 3.3 分配器数据结构
 
 ```c
-/* Block header (8 bytes) */
+/* Block header (16 bytes) */
 typedef struct block {
     size_t size;         /* Total block size (header + payload); bit 0 = FREE */
     struct block *next;  /* Free list link (valid only when free) */
 } block_t;
 
-#define BLOCK_HDR_SZ  8
+#define BLOCK_HDR_SZ  sizeof(block_t) /* 16 */
 #define MALLOC_ALIGN  16    /* payload alignment */
 #define MALLOC_MIN_SIZE  64 /* smallest useful block (avoids fragmentation) */
 #define CHUNK_SIZE    64 KB /* heap grow granule */
@@ -170,7 +171,7 @@ malloc(size):
      - 若找到大小 ≥ asize 的块：
        - 切割（如果余数 ≥ 64）
        - 从 free list 摘除
-       - 返回 (block + 8)
+       - 返回 (block + 16)
   4. 若 free list 无合适块：
      - heap_grow(asize)  → map_memory 系统调用
      - 循环回 3
@@ -184,7 +185,7 @@ malloc(size):
 free(ptr):
   1. ptr = NULL → 忽略（POSIX 标准）
   2. spin_lock(&s_heap_lock)
-  3. block = ptr - 8
+  3. block = ptr - 16
   4. MARK_FREE(block)
   5. 插入到 free list 头
   6. coalesce_after(block)  → 与后继块合并
@@ -227,7 +228,7 @@ realloc(ptr, size):
   if (!ptr) return malloc(size);
   if (size == 0) { free(ptr); return NULL; }
 
-  old_block = ptr - 8
+  old_block = ptr - 16
   if (size <= old_payload)
       return ptr;  // 已有足够空间
 
@@ -314,7 +315,7 @@ heap_grow(need):
 **v0.1（单线程）**：
 
 - 简单全局 `s_heap_lock` spinlock
-- Uncontended 路径不取锁（**待实现**：lockless fast path）
+- 无竞争时自旋锁 0 syscall（快路径）
 
 **v1.0+（多线程）**：
 
@@ -372,7 +373,7 @@ void _exit(int code)
 
 全局对象析构通过 \_\_cxa_finalize() 自动生成的函数集成：
 
-- 编译器在 .init_array 后添加 .fini_array（OpSys 暂不支持）
+- 编译器在 .init_array 后添加 .fini_array（OpSys 已支持）
 - 或通过 atexit() 注册析构函数
 
 **示例**：
@@ -454,6 +455,8 @@ OpenSys 实现了 POSIX 风格的进程级信号，支持：
 - Per-process handler table（`proc->sig_handlers[]`）
 - Process-wide pending bitmask（`proc->sig_pending`）
 - Lazy delivery via checkpoints（syscall return、interrupt return）
+
+> 注：用户态仅薄封装，内核 process/signal.c 仍为投递引擎；完整用户态信号库迁移 ⏸（见 kernel_roadmap §4.2 P2）
 
 ### 6.2 信号处理函数注册
 
@@ -584,8 +587,8 @@ user/runtime/include/
 ### 8.1 编译命令
 
 ```bash
-# 汇编
-gcc -c user/runtime/crt0.S -o build/crt0.o
+# 汇编（NASM，Makefile: AS := nasm, ASFLAGS := -f elf64）
+nasm -f elf64 user/runtime/crt0.S -o build/crt0.o
 
 # C 编译
 gcc -c user/runtime/init.c -o build/init.o
@@ -604,7 +607,7 @@ gcc build/crt0.o build/init.o build/malloc.o build/exit.o build/errno.o \
 ENTRY(_start)
 
 SECTIONS {
-    . = 0x400000;  /* PIE 基址 */
+    . = 0x400000;  /* 固定链接基址 */
 
     .text : { *(.text*) }
     .rodata : { *(.rodata*) }
@@ -671,10 +674,10 @@ malloc 首次调用成本：
 
 ### 10.1 v0.1 限制
 
-- ❌ 无多线程支持（errno 全局）
+- ❌ 无 pthread 风格线程 API（errno 为全局单例；有 C11 threads 库）
 - ❌ 无 TLS（thread-local storage）
 - ❌ 无信号安全的 malloc（SIGKILL 时泄漏内存）
-- ❌ 无 .fini_array（C++ 全局析构）
+- ✅ .fini_array 已支持（C++ 全局析构）
 - ❌ 无命令行参数（argc/argv）
 - ❌ 无环境变量（getenv/setenv）
 
@@ -725,7 +728,7 @@ int main(void)
 // 申请 1 MB 缓冲
 char *buf = malloc(1 << 20);
 if (!buf) {
-    fprintf(stderr, "malloc failed: %d\n", errno);
+    printf("malloc failed: %d\n", errno);
     return 1;
 }
 
@@ -812,15 +815,15 @@ int main(void)
 
 | 文件                             | 大小    | 说明          |
 | -------------------------------- | ------- | ------------- |
-| `user/runtime/crt0.S`            | 25 行   | 启动代码      |
-| `user/runtime/init.c`            | 17 行   | 全局构造      |
-| `user/runtime/exit.c`            | 40 行   | atexit + exit |
-| `user/runtime/errno.c`           | 5 行    | 全局 errno    |
-| `user/runtime/malloc.c`          | 400+ 行 | 堆分配器      |
-| `user/runtime/sigrestore.S`      | 25 行   | 信号返回跳板  |
-| `user/runtime/include/runtime.h` | 25 行   | 内部头        |
-| `user/runtime/include/errno.h`   | 35 行   | 错误码        |
-| `user/runtime/include/malloc.h`  | 15 行   | malloc API    |
+| `user/runtime/crt0.S`            | 41 行   | 启动代码      |
+| `user/runtime/init.c`            | 32 行   | 全局构造      |
+| `user/runtime/exit.c`            | 49 行   | atexit + exit |
+| `user/runtime/errno.c`           | 17 行   | 全局 errno    |
+| `user/runtime/malloc.c`          | 374 行  | 堆分配器      |
+| `user/runtime/sigrestore.S`      | 31 行   | 信号返回跳板  |
+| `user/runtime/include/runtime.h` | 35 行   | 内部头        |
+| `user/runtime/include/errno.h`   | 48 行   | 错误码        |
+| `user/runtime/include/malloc.h`  | 19 行   | malloc API    |
 | `user/runtime/include/signal.h`  | 新增    | 信号常数      |
 | `docs/runtime_design.md`         | 本文件  | 设计文档      |
 

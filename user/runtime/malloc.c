@@ -156,7 +156,7 @@ static int heap_grow(size_t need) {
 
     /* map_memory returns the virtual address on success, 0 on failure.
      * The second argument (offset) is the desired virtual address. */
-    void *addr = map_memory(cap, (int)s_next_virt, (int)chunk, PROT_READ | PROT_WRITE);
+    void *addr = map_memory(cap, s_next_virt, chunk, PROT_READ | PROT_WRITE);
     if (!addr) {
         cap_revoke(cap);
         return -1;

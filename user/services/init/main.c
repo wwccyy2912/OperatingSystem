@@ -611,7 +611,7 @@ static void test_vspace_smoke(void) {
     int mem_cap = cap_create(CAP_TYPE_MEM, RIGHT_WRITE);
     ASSERT(mem_cap > 0, "cap_create for MEM failed");
 
-    void *mapped = map_memory(mem_cap, (int)(long)base, 0x4000, PROT_READ | PROT_WRITE);
+    void *mapped = map_memory(mem_cap, (unsigned long)base, 0x4000, PROT_READ | PROT_WRITE);
     ASSERT(mapped != 0, "map_memory into vspace failed");
     ASSERT((unsigned long)mapped == (unsigned long)base, "map_memory returned wrong address");
 
@@ -1836,6 +1836,121 @@ static void run_p2_vfs_tests(void) {
     printf("=== P2 VFS: %d/%d passed ===\n", p2v_pass, p2v_run);
 }
 
+/* ====================================================================
+ * KBD focus: TAKE_FOCUS / RELEASE_FOCUS ownership round-trip
+ *
+ * No shell-level hook exists for keyboard focus (R2.1), so exercise the
+ * live keyboard service over IPC directly.  Separate counters keep the
+ * classic (31) / P1 (10) / P2 (3) / P2V (4) anchors untouched.
+ *
+ * Coverage split: the *ownership protocol* (take -> owned, retake ->
+ * idempotent, release-by-owner, release-by-non-owner -> ERR_NOCAP) is
+ * verified here deterministically.  The *physical key routing* while a
+ * holder owns focus is exercised by the QEMU-side smoke test (R2.2:
+ * sendkey characters reach the shell; R3.4: keyboard flood) — init
+ * cannot inject scancodes into its own IRQ line.
+ *
+ * Timing safety: init takes focus for a few IPC round-trips and always
+ * releases; TAKE_FOCUS never completes a parked read, so the shell's
+ * parked READ_BLOCK (if any) is untouched and resumes normal routing
+ * once focus is free again.  Keys typed by the smoke test arrive only
+ * after init reaches the idle loop, never while focus is held here.
+ * ==================================================================== */
+
+static int kbd_run  = 0;
+static int kbd_pass = 0;
+
+#define KBD_TEST(name)                  \
+    do {                                \
+        printf("  KBD: %s ... ", name); \
+        kbd_run++;                      \
+    } while (0)
+
+#define KBD_PASS()         \
+    do {                  \
+        kbd_pass++;       \
+        printf("PASS\n"); \
+    } while (0)
+
+#define KBD_FAIL(msg)               \
+    do {                            \
+        printf("FAIL: %s\n", msg);  \
+    } while (0)
+
+#define KBD_ASSERT(cond, msg) \
+    do {                      \
+        if (!(cond)) {        \
+            KBD_FAIL(msg);    \
+            return;           \
+        }                     \
+    } while (0)
+
+/* Keyboard focus protocol (mirrors user/services/keyboard/keyboard.c;
+ * same local-mirror pattern as shell.c's KBD_OP_READ_BLOCK). */
+#define KBD_OP_TAKE_FOCUS    3
+#define KBD_OP_RELEASE_FOCUS 4
+
+typedef struct {
+    u32 op;
+    u32 len;
+} kbd_req_t;
+
+typedef struct {
+    i32 ret;
+    u8  data[256]; /* receiver buffer; focus ops carry no payload */
+} kbd_resp_t;
+
+static void test_kbd_focus_roundtrip(void) {
+    KBD_TEST("TAKE_FOCUS/RELEASE_FOCUS ownership");
+    int kbd_port = p1_port_get("keyboard");
+    KBD_ASSERT(kbd_port > 0, "keyboard port unavailable");
+
+    kbd_req_t  req;
+    kbd_resp_t resp;
+    int        rlen = (int)sizeof(resp);
+
+    /* TAKE_FOCUS: init becomes the focus owner. */
+    memset(&req, 0, sizeof(req));
+    req.op = KBD_OP_TAKE_FOCUS;
+    rlen   = (int)sizeof(resp);
+    KBD_ASSERT(ipc_call(kbd_port, &req, (int)sizeof(req), &resp, &rlen) == 0 &&
+                   resp.ret == 0,
+               "TAKE_FOCUS failed");
+
+    /* Re-take by the same owner: idempotent no-op success. */
+    memset(&req, 0, sizeof(req));
+    req.op = KBD_OP_TAKE_FOCUS;
+    rlen   = (int)sizeof(resp);
+    KBD_ASSERT(ipc_call(kbd_port, &req, (int)sizeof(req), &resp, &rlen) == 0 &&
+                   resp.ret == 0,
+               "TAKE_FOCUS re-take not idempotent");
+
+    /* RELEASE_FOCUS by the owner: succeeds, focus free again. */
+    memset(&req, 0, sizeof(req));
+    req.op = KBD_OP_RELEASE_FOCUS;
+    rlen   = (int)sizeof(resp);
+    KBD_ASSERT(ipc_call(kbd_port, &req, (int)sizeof(req), &resp, &rlen) == 0 &&
+                   resp.ret == 0,
+               "RELEASE_FOCUS by owner failed");
+
+    /* RELEASE_FOCUS by a non-owner (focus free now): ERR_NOCAP — the
+     * kernel-filled caller subject must match the holder. */
+    memset(&req, 0, sizeof(req));
+    req.op = KBD_OP_RELEASE_FOCUS;
+    rlen   = (int)sizeof(resp);
+    KBD_ASSERT(ipc_call(kbd_port, &req, (int)sizeof(req), &resp, &rlen) == 0 &&
+                   resp.ret == ERR_NOCAP,
+               "non-owner RELEASE_FOCUS accepted");
+    printf("(non-owner release=%d) ", resp.ret);
+    KBD_PASS();
+}
+
+static void run_kbd_focus_tests(void) {
+    printf("\n=== KBD Focus (live keyboard service) ===\n");
+    test_kbd_focus_roundtrip();
+    printf("=== KBD Focus: %d/%d passed ===\n", kbd_pass, kbd_run);
+}
+
 /* ---- Entry point ---- */
 
 int main(void) {
@@ -1880,6 +1995,9 @@ int main(void) {
      * P2 gates the five remaining ops (create_dir/delete/enum_begin/
      * enum_next/move) and proves 能力化抹位 on the live vfs+perm stack. */
     run_p2_vfs_tests();
+
+    /* KBD focus ownership round-trip (R2.1) — live keyboard service. */
+    run_kbd_focus_tests();
 
     /* Idle forever — this thread stays alive as the last scheduler
      * participant while the manager and service processes run. */

@@ -6,7 +6,7 @@
  * the app is installed via the pkg port (shell: pkg install sbox_demo
  * --perms=...), reports APP_READY through libpkg so pkg-manager signs
  * the manifest atoms into OUR kernel cap table, then exercises the
- * ATOM_SYS_SET_TIME-gated os_set_time() syscall (syscall.c:780).
+ * ATOM_SYS_SET_TIME-gated os_set_time() syscall (syscall.c:818).
  *
  * The same ELF is installed twice — once with perms=sys.set_time
  * (expect set_time OK) and once with no permissions (expect DENIED) —

@@ -11,7 +11,7 @@
  * process creation from an ELF image in memory.
  *
  * NOTE: every printf is followed by sleep(50) — the kernel rate-limits
- * SYS_DEBUG_LOG to 512 bytes per scheduler tick (sys_debug_log in
+ * SYS_DEBUG_LOG to 2048 bytes per scheduler tick (sys_debug_log in
  * syscall.c), and the self-test emits ~700 bytes total; without the
  * sleep the last lines would be silently truncated by the budget.
  *

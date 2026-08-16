@@ -102,9 +102,13 @@ int ipc_call(int port, const void *req, int req_len, void *resp, int *resp_len);
 int ipc_port_create(void);
 int ipc_reply(int token, const void *resp, int resp_len);
 
-/* --- Memory --- */
-void *map_memory(int cap, int offset, int size, int prot);
-int   unmap_memory(void *addr, int size);
+/* --- Memory ---
+ * offset/size are uint64_t (not int): the kernel's SYS_MAP_MEMORY takes
+ * u64 args, and the heap's ASLR range ([0x70000000, 0x78000000) + 256 MB
+ * region) can exceed INT_MAX — an int offset would truncate and make the
+ * map fail or wrap into kernel half. */
+void *map_memory(int cap, uint64_t offset, uint64_t size, int prot);
+int   unmap_memory(void *addr, uint64_t size);
 
 /* --- Thread management --- */
 int  thread_create(void (*entry)(void *), void *arg, int priority);
@@ -240,10 +244,11 @@ typedef void (*sighandler_t)(int signum);
 #define SIGSTOP 19                /* reserved: cannot be caught/ignored */
 #define SIG_DFL ((sighandler_t)0) /* default action (terminate or ignore) */
 #define SIG_IGN ((sighandler_t)1) /* ignore */
+#define SIG_ERR ((sighandler_t)-1) /* error return from signal() */
 #define NSIG    64
 
 /* Register a handler for signum.  Returns the previous handler
- * (SIG_DFL if never set), or a negative error code. */
+ * (SIG_DFL if never set), or SIG_ERR on failure. */
 sighandler_t signal(int signum, sighandler_t handler);
 
 /* Send a signal to a process.  Returns 0 on success, or a negative

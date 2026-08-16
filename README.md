@@ -25,7 +25,7 @@ OpSys 是一个从零开始的 64 位微内核操作系统项目，采用「机�
 
 ### 微内核架构
 
-- **Ring 0 极简内核**（~9,500 行）：调度器、PMM/VMM、IPC 通道、能力表、中断转发、Mutex Fast-Path。
+- **Ring 0 极简内核**（~11,000 行 .c/.S，含头 ~14,000）：调度器、PMM/VMM、IPC 通道、能力表、中断转发、Mutex Fast-Path。
 - **Ring 3 全量服务**：所有设备驱动（串口、键盘、virtio-blk）与系统服务（VFS、权限、终端、shell、包管理）均为独立用户态进程。
 - **同步 IPC**：`ipc_call` / `ipc_recv`，服务间靠注册端口名寻址（`port_register` / `port_get`）。
 - **能力（Capability）系统**：所有资源访问通过能力句柄门控，新 syscall 必须经 `cap_lookup(RIGHT_*)` 校验。
@@ -128,13 +128,18 @@ OpSys/
 │       ├── pkg/              # 包管理器（.ops 安装/运行/沙盒授权）
 │       ├── hello/            # 示例应用
 │       ├── sbox_demo/        # 沙盒演示
+│       ├── runtime_demo/     # Runtime 演示（已实现，未接入 Makefile）
+│       ├── tui_demo/         # TUI 演示（已实现，未接入 Makefile）
 │       └── flaky/            # 故障测试服务
 ├── boot/                     # GRUB 引导配置
 ├── scripts/                  # 辅助脚本
 │   ├── accept.py             # QEMU 验收测试（sendkey + 串口镜像）
+│   ├── smoke_test.py         # 三轮回合冒烟测试（R1 基线 / R2 盲区 / R3 压力）
 │   ├── ops_pack.py           # .ops 包打包工具
 │   ├── build.sh / run.sh     # 构建运行快捷脚本
 │   └── user.ld               # 用户态链接脚本
+├── tools/                    # 测试工具
+│   └── vga_decode.py         # VGA screendump PPM 解码（8x16 字模 / 9x20 网格）
 ├── docs/                     # 设计文档（CC BY 4.0）
 │   ├── requirements.md       # 需求规格说明书
 │   ├── kernel_roadmap.md     # 内核开发路线图（Ring 0/3 归属定案）
@@ -238,7 +243,7 @@ QEMU 参数：`-nographic -serial mon:stdio`（串口输出即终端），virtio
 
 1. VFS → perm-manager 创建 PENDING query
 2. perm-manager → term 的 `perm.ui` 端口推送询问
-3. term 渲染 TUI 面板：`perm: <app_name> (PID n) requests <url> (<R/W>) - perm_answer <id> y/n`
+3. term 渲染 TUI 面板：`perm: <app_name> (PID n) 请求访问 <url> (<R/W>) — 输入 perm_answer <id> y/n`，面板显示 `Allow? (y/n)` 询问，确认后显示 `Result: ALLOWED/DENIED` 与 `Access: ...`
 4. 用户执行 `perm_answer <id> y` 授权或 `n` 拒绝
 
 ---
@@ -247,16 +252,17 @@ QEMU 参数：`-nographic -serial mon:stdio`（串口输出即终端），virtio
 
 ### 回归测试
 
-init 进程内置全套回归测试套件（31 项），涵盖：
+init 进程内置全套回归测试套件（49 项），涵盖：
 
-- 经典内核测试（IPC、内存映射、线程、能力）
+- 经典内核测试（31 项：IPC、内存映射、线程、能力）
 - P1 权限套件（10 项：角色解析、规则链、能力签发）
-- P2 权限门控（3 项 Gate + 4 项 VFS 能力抹位）
-- P2V 能力抹位验证
+- P2 权限门控（3 项 Gate）
+- P2V 能力抹位验证（4 项，即 P2 的 VFS 能力抹位套件）
+- KBD 焦点测试（1 项：TAKE_FOCUS/RELEASE_FOCUS 所有权往返，非 owner 释放返回 ERR_NOCAP）
 
 ```bash
 make iso && make run
-# 观察串口输出：31/31 passed
+# 观察串口输出：31/31 + 10/10 + 3/3 + 4/4 + KBD Focus: 1/1 全过
 ```
 
 ### 单文件快速编译验证
@@ -282,8 +288,10 @@ gdb kernel.elf -ex 'target remote :1234'
 ### 验收脚本
 
 ```bash
-python3 scripts/accept.py    # QEMU sendkey 注入 + 串口镜像日志
-python3 scripts/ops_pack.py  # 打包/校验 .ops 文件
+python3 scripts/smoke_test.py          # 三轮冒烟：R1 基线 + R2 盲区 + R3 压力
+python3 scripts/smoke_test.py --drive  # 追加磁盘卷持久化（R2.7/R3.5，需 disk.img）
+python3 scripts/accept.py              # QEMU sendkey 注入 + 串口镜像日志
+python3 scripts/ops_pack.py            # 打包/校验 .ops 文件
 ```
 
 ---
@@ -338,7 +346,7 @@ make format-check  # 检查格式是否合规（CI 用）
 
 1. 单文件编译验证（快速）
 2. `make iso` 全量构建（0 新警告）
-3. `make run` QEMU 回归（31/31 全过）
+3. `make run` QEMU 回归（49 项全过）
 
 详细规范见 [AGENTS.md](AGENTS.md) 与 [docs/](docs/) 目录。
 
@@ -366,7 +374,7 @@ make format-check  # 检查格式是否合规（CI 用）
 | v0.1            | 内核 + init + 串口 + IPC                         | 已完成 |
 | v0.2            | 能力系统 + 权限模型（P0/P1/P2）                  | 已完成 |
 | VFS Phase 0/1/2 | 对象模型 + 内存卷 + virtio-blk + 书签 + Powerbox | 已完成 |
-| v0.3            | 包管理器 + .ops 沙盒应用                         | 进行中 |
+| v0.3            | 包管理器 + .ops 沙盒应用                         | 已完成 |
 | v0.4            | 图形 + 窗口管理器                                | 规划   |
 | v0.5            | 音频 + 网络                                      | 规划   |
 | v1.0            | 稳定版（多核、性能优化、文档齐全）               | 规划   |

@@ -2,7 +2,7 @@
 
 > 版本：v1.0  
 > 日期：2026-08-14  
-> 状态：Phase 2 实装完成  
+> 状态：term 服务侧（term.c，TERM_OP_* 协议）已实现并接入构建；客户端库 user/lib/libtui/tui.c 与演示 user/services/tui_demo/main.c 已实现但**未接入 Makefile**（未编译/链接/spawn），§10 测试计划未执行  
 > 关联：user/services/term/term.c、user/lib/libtui/tui.h、user/lib/libtui/tui.c
 
 ---
@@ -37,7 +37,7 @@ OpSys 的 TUI 模块提供了一套完整的文本用户界面渲染和控制功
 │ ├─ tui_render_line_at                                      │
 │ └─ tui_set_cursor / tui_get_cursor                         │
 ├─────────────────────────────────────────────────────────────┤
-│ IPC 协议层 (perm.h 的 TERM_OP_* 操作码)                   │
+│ IPC 协议层 (term.c 的 TERM_OP_* 操作码，tui.h 镜像)          │
 │ ├─ TERM_OP_WRITE(1)           : 光标渲染                   │
 │ ├─ TERM_OP_CLEAR(2)           : 清屏                       │
 │ ├─ TERM_OP_STATUS(3)          : 状态栏                     │
@@ -67,7 +67,7 @@ OpSys 的 TUI 模块提供了一套完整的文本用户界面渲染和控制功
 
 ### 2.2 线程模型
 
-**term 服务**是一个用户态独立进程，包含两个线程：
+**term 服务**是一个用户态独立进程，包含三个线程：
 
 ```
 term 进程（PID = N）
@@ -78,16 +78,22 @@ term 进程（PID = N）
 │  └─ term_server_loop()
 │     └─ ipc_recv("term") → term_handle_request() → ipc_reply()
 │
-└─ 线程2: perm_ui_main()
-   ├─ ipc_port_create() + port_register("perm.ui", port)
-   └─ ipc_recv("perm.ui") → PERM_OP_UI_SHOW 处理
-      ├─ Powerbox 提示行渲染
-      ├─ mutex_lock(s_render_lock)
-      ├─ term_write_freshline()
-      └─ mutex_unlock(s_render_lock)
+├─ 线程2: perm_ui_main()
+│  ├─ ipc_port_create() + port_register("perm.ui", port)
+│  └─ ipc_recv("perm.ui") → PERM_OP_UI_SHOW 处理
+│     ├─ Powerbox 面板渲染（perm_ui_render_panel）
+│     ├─ mutex_lock(s_render_lock)
+│     ├─ 屏幕快照/恢复
+│     └─ mutex_unlock(s_render_lock)
+│
+└─ 线程3: perm_ui_input_main()
+   ├─ 轮询 s_ui_await，PENDING 期间持有键盘焦点
+   ├─ 读取 y/n 按键
+   ├─ ipc_send(PERM_OP_ANSWER)（非 ipc_call，避免与 UI_SHOW 死锁）
+   └─ 释放键盘焦点
 ```
 
-**同步机制**：两线程通过 `s_render_lock` Mutex 同步，防止光标状态机竞态。
+**同步机制**：三线程通过 `s_render_lock` Mutex 同步，防止光标状态机竞态。
 
 ---
 
@@ -326,6 +332,8 @@ snprintf(prompt, sizeof(prompt),
 tui_render_line_at(0, s_rows - 1, prompt, strlen(prompt));
 ```
 
+> 注：以上为先期设计示例。实际实现为居中面板 `perm_ui_render_panel()`（term.c:893-1005）：含标题（Permission Request）、请求方 `<name> (PID <pid>)`、资源 URL、访问类型、描述标签，以及 `Allow? (y/n)` / `Result: ALLOWED/DENIED` 提示行。
+
 ### 6.3 系统状态监控
 
 ```c
@@ -378,8 +386,8 @@ void update_status_bar(void) {
 | 文件                            | 说明                 | 行数  |
 | ------------------------------- | -------------------- | ----- |
 | `user/services/term/term.c`     | Framebuffer 终端服务 | 1000+ |
-| `user/lib/libtui/tui.h`         | TUI 客户端库头文件   | 130+  |
-| `user/lib/libtui/tui.c`         | TUI 客户端库实现     | 350+  |
+| `user/lib/libtui/tui.h`         | TUI 客户端库头文件   | 129   |
+| `user/lib/libtui/tui.c`         | TUI 客户端库实现     | 270   |
 | `user/services/tui_demo/main.c` | TUI 演示应用         | 60+   |
 | `docs/tui_design.md`            | 本文档               | —     |
 
@@ -419,9 +427,7 @@ void update_status_bar(void) {
    - 问题：实际行数由 framebuffer 高度决定
    - 修复：从 `s_rows` 动态计算
 
-3. **Powerbox 提示中的 subject_id**
-   - 当前显示：只取低 32 位的 16 进制
-   - 问题：潜在的 subject_id 碰撞
-   - 改进：显示进程名而非 ID
+3. **Powerbox 提示中的 subject_id**（已修复）
+   - 面板现渲染 `<name> (PID <pid>)`（term.c:943-961），不再显示 subject_id
 
 ---

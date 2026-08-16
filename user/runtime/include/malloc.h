@@ -3,7 +3,9 @@
  * Copyright (c) 2026 OpSys Project
  *
  * Simple free-list allocator backed by map_memory syscall.
- * Thread-safety: none (single-threaded user-space for v0.1).
+ * Thread-safety: the free list is guarded by a user-space spinlock
+ * (zero-syscall fast path, contention yields to the scheduler), so all
+ * entry points may be called from any thread.
  */
 
 #ifndef MALLOC_H

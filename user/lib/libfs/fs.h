@@ -57,6 +57,12 @@ int fs_stat_volume(const char *url, u64 *total_bytes, u64 *used_bytes, u32 *read
  * server, so the value is unforgeable).  Fills *out_subject. */
 int fs_whoami(u64 *out_subject);
 
+/* Enumerate currently-mounted volumes (the "/" root view).  Fills
+ * out_vols (up to VFS_MAX_VOLS entries) and sets *out_count.  There
+ * is no root item to enum "/" on — URLs start at a volume name, so
+ * the root view is served from the mount table. */
+int fs_list_volumes(vfs_vol_info_t *out_vols, u32 *out_count);
+
 /* ====================================================================
  * Phase 2: security-scoped bookmarks + move (design §5, §8)
  *

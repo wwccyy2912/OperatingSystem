@@ -102,20 +102,20 @@ OpSys/
 │   ├── process/              # 进程管理、信号
 │   └── include/kernel/       # 内核头文件
 ├── user/                     # 用户态
-│   ├── lib/                  # SDK / 客户端库（MIT）
-│   │   ├── libc/             # C 标准库子集（stdio/string/stdlib/...）
-│   │   ├── libos/            # 系统调用包装、ELF 解析、自旋锁
-│   │   ├── libipc/           # IPC 客户端
-│   │   ├── libfs/            # VFS 客户端
-│   │   ├── libpkg/           # 包管理客户端
-│   │   └── libtui/           # TUI 客户端库
-│   ├── runtime/              # C Runtime（MIT）
+│   ├── lib/                  # libc（LGPLv3）+ SDK 客户端库（GPLv3）
+│   │   ├── libc/             # C 标准库子集 — LGPLv3
+│   │   ├── libos/            # 系统调用包装、ELF 解析、自旋锁 — GPLv3
+│   │   ├── libipc/           # IPC 客户端 — GPLv3
+│   │   ├── libfs/            # VFS 客户端 — GPLv3
+│   │   ├── libpkg/           # 包管理客户端 — GPLv3
+│   │   └── libtui/           # TUI 客户端库 — GPLv3
+│   ├── runtime/              # C Runtime — LGPLv3
 │   │   ├── crt0.S            # 启动代码
 │   │   ├── malloc.c          # 堆分配器（ASLR + 就地扩展）
 │   │   ├── init.c / exit.c   # 全局构造/析构、atexit
 │   │   ├── errno.c           # 错误码
 │   │   └── sigrestore.S      # 信号返回跳板
-│   └── services/             # 用户态服务（Apache-2.0）
+│   └── services/             # 用户态服务 — 核心 GPLv3 / 扩展 LGPLv3
 │       ├── init/             # 第一个用户程序（含回归测试套件）
 │       ├── manager/          # 服务管理器（拉起全部服务）
 │       ├── shell/            # 命令行
@@ -356,14 +356,18 @@ make format-check  # 检查格式是否合规（CI 用）
 
 本项目采用多组件许可证模型，各组件的许可证独立适用：
 
-| 组件                     | 许可证                                                    | LICENSE 文件位置                                                                   | 适用范围                                      |
-| ------------------------ | --------------------------------------------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------- |
-| **Kernel**               | [GPLv3](https://www.gnu.org/licenses/gpl-3.0.html)        | [kernel/LICENSE](kernel/LICENSE)                                                   | `kernel/` 目录全部代码                        |
-| **User Services**        | [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0) | [user/services/LICENSE](user/services/LICENSE)                                     | `user/services/` 目录全部服务                 |
-| **SDK / libc / Runtime** | [MIT](https://opensource.org/licenses/MIT)                | [user/lib/LICENSE](user/lib/LICENSE)、[user/runtime/LICENSE](user/runtime/LICENSE) | `user/lib/` 与 `user/runtime/` 全部库与运行时 |
-| **Documentation**        | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) | [docs/LICENSE](docs/LICENSE)                                                       | `docs/` 目录全部文档                          |
+| 组件                        | 许可证                                                                   | LICENSE 文件位置                                                                   | 适用范围                                        |
+| --------------------------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- | ----------------------------------------------- |
+| **Kernel**                  | [GPLv3](https://www.gnu.org/licenses/gpl-3.0.html)                       | [kernel/LICENSE](kernel/LICENSE)                                                   | `kernel/` 目录全部代码                          |
+| **System Core**             | [GPLv3](https://www.gnu.org/licenses/gpl-3.0.html)                       | [user/services/LICENSE](user/services/LICENSE)                                     | init · manager · perm · vfs                     |
+| **System Extension**        | [LGPLv3](https://www.gnu.org/licenses/lgpl-3.0.html)                     | [user/services/LICENSE](user/services/LICENSE)                                     | serial · keyboard · term · device_mgr           |
+| **libc**                    | [LGPLv3](https://www.gnu.org/licenses/lgpl-3.0.html)                     | [user/lib/LICENSE](user/lib/LICENSE)                                               | `user/lib/libc/`                                |
+| **SDK**（libos/libipc/…）   | [GPLv3](https://www.gnu.org/licenses/gpl-3.0.html)                       | [user/lib/LICENSE](user/lib/LICENSE)                                               | `user/lib/libos/` ~ `libtui/`                  |
+| **Runtime**                 | [LGPLv3](https://www.gnu.org/licenses/lgpl-3.0.html)                     | [user/runtime/LICENSE](user/runtime/LICENSE)                                       | `user/runtime/` 全部运行时                      |
+| **Documentation**           | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)                | [docs/LICENSE](docs/LICENSE)                                                       | `docs/` 目录全部文档                            |
+| **Applications**            | 由作者自行决定                                                            | —                                                                                  | `hello/` · `sbox_demo/` · `runtime_demo/` 等   |
 
-> 引用或分发时，请严格遵守各组件对应的许可证条款。GPLv3 的传染性仅及于内核组件；用户态服务、SDK 与文档可独立使用。
+> **许可证逻辑**：核心系统组件（内核 + system core + SDK）采用 GPLv3，确保修改回馈社区；扩展组件与 libc/runtime 采用 LGPLv3，允许闭源应用链接；应用层由作者自行选择许可证。
 
 ---
 

@@ -123,7 +123,7 @@
 | **P0** | Mutex Fast-Path：用户态 spinlock 封装 | `libos` 提供 `user_spinlock`（原子 CAS，无竞争 0 syscall），竞争时 `thread_yield()` | ✅ 完成：`user/lib/libos/spinlock.h`（CAS+yield），`malloc` 无竞争 0 syscall |
 | **P3** | Futex 化内核 Mutex | 无竞争纯原子 + 竞争排队；**SMP 阶段实施** | 多核竞争基准 |
 | **P3** | IPC 多活动调用 | 当前 `s_active_call` 每端口单活动调用，多客户端排队 | vfs 并发基准 |
-| **P3** | 零拷贝读路径 | `CAP_TYPE_MEM` 映射文件页，绕开 4096 上限（vfs_design §8.4） | vfs_cat 大文件基准 |
+| **P3** | 零拷贝读路径 | `CAP_TYPE_MEM` 映射文件页，绕开 4096 上限（vfs_design §8.4） | cat 大文件基准 |
 | **P1 配套** | SYS_MAP_MEMORY 支持设备 MMIO | virtio-blk/net DMA 环前提 | virtio 驱动 |
 
 ### 4.2 实用性方向（可运行、可验证优先）
@@ -204,8 +204,8 @@
 ## 八、执行顺序总结
 
 ```
-P0（✅ 已完成 2026-08-07，QEMU 回归通过：vfs_fill NOSPC@32MiB err -101、
-    vfs_stat Users 32768 KB used、shell 事后可交互）
+P0（✅ 已完成 2026-08-07，QEMU 回归通过：fallocate NOSPC@32MiB err -101、
+    stat Users 32768 KB used、shell 事后可交互）
   ├─ Mutex Fast-Path：libos 用户态 spinlock 封装（spinlock.h，malloc 无竞争 0 syscall）
   ├─ Framebuffer：删 kernel_main.c 启动画面绘制，framebuffer.c 543→170 行
   └─ 统一 panic：kernel/panic.c 收敛 4 处裸 hlt 终止点；gdb 破 canary 实测 panic halt

@@ -2,7 +2,7 @@
 """OpSys Phase 2 acceptance: Powerbox-gated bookmarks + MOVE survival.
 
 Flow (docs/vfs_design.md §8):
-    1. vfs_write /Users/a.txt hello           → create the test file
+    1. tee /Users/a.txt hello           → create the test file
     2. bm_create /Users/a.txt r               → FAILED (-105) EACCES (授权前)
     3. parse query id from perm.ui prompt line (serial mirror)
     4. perm_answer <id> y                     → ALLOWED
@@ -174,8 +174,8 @@ def main():
 
         # --- 1. create the test file --------------------------------------------
         step(1, "create /Users/a.txt",
-         "vfs_write /Users/a.txt hello",
-         r"vfs_write: 5 bytes written to /Users/a\.txt")
+         "tee /Users/a.txt hello",
+         r"tee: 5 bytes written to /Users/a\.txt")
 
         # --- 2. bm_create without a grant → -105 --------------------------------
         step(2, "bm_create before auth → EACCES",

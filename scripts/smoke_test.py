@@ -20,7 +20,7 @@ Rounds (.omo/plans/full-test-plan.md):
      shell/VFS/Powerbox/pkg/bookmark scenarios, screendump baseline).
   R2 blind spots (keyboard focus via init KBD test, bookmark revoke,
      pkg remove, kill error path, virtio-blk persistence with --drive).
-  R3 pressure/edge (vfs_fill NOSPC, concurrent spawns, keyboard flood,
+  R3 pressure/edge (fallocate NOSPC, concurrent spawns, keyboard flood,
      system_reset persistence).
 
 Usage:
@@ -305,18 +305,18 @@ def cleanup():
 # --- scenario list ----------------------------------------------------------
 # VGA scenarios: type a command, expect text on screen (panels auto-answered).
 VGA_SCENARIOS = [
-    ("shell meminfo", "meminfo", r"Free memory: \d+ pages"),
+    ("shell free", "free", r"Free memory: \d+ pages"),
     ("shell ports",   "ports",   r"'init' port: \d+"),
     ("shell threads", "threads", r"TID=\d+, joining\.\.\."),
     ("shell uptime",  "uptime",  r"System ticks: \d+"),
     ("shell ps",      "ps",      r"PID\s+STATE"),
-    ("vfs_ls",        "vfs_ls /Users/", r"vfs_ls: \d+ entries"),
-    ("vfs_ls root",   "vfs_ls /", r"vfs_ls: \d+ volumes"),
-    ("vfs_write",     "vfs_write /Users/a.txt hello",
-     r"vfs_write: 5 bytes written to /Users/a\.txt"),
-    ("vfs_cat",       "vfs_cat /Users/a.txt",
+    ("ls",        "ls /Users/", r"ls: \d+ entries"),
+    ("ls root",   "ls /", r"ls: \d+ volumes"),
+    ("tee",     "tee /Users/a.txt hello",
+     r"tee: 5 bytes written to /Users/a\.txt"),
+    ("cat",       "cat /Users/a.txt",
      r"== /Users/a\.txt \(5 bytes\) =="),
-    ("vfs_stat",      "vfs_stat", r"read-write"),
+    ("stat",      "stat", r"read-write"),
 ]
 
 # Serial scenarios: no input, wait for service output in serial log.
@@ -370,7 +370,7 @@ def run_powerbox_flow():
          r"bm_create: ok, \d+-byte bookmark cached"),
         ("bm_resolve", "bm_resolve",
          r"bm_resolve: handle -?\d+, item 'a\.txt' \(id \d+\), access \d+"),
-        ("move", "move /Users/a.txt /Users b.txt",
+        ("mv", "move /Users/a.txt /Users b.txt",
          r"move: 'b\.txt' -> item \d+ \(size \d+\)"),
         ("bm_resolve after move", "bm_resolve",
          r"bm_resolve: handle -?\d+, item 'b\.txt'"),
@@ -378,7 +378,7 @@ def run_powerbox_flow():
         ("bm_resolve revoked", "bm_resolve",
          r"bm_resolve: FAILED \(-105\) \(EACCES\)"),
     ]
-    # step 0: drop grants the VGA scenarios left (vfs_write granted WRITE on
+    # step 0: drop grants the VGA scenarios left (tee granted WRITE on
     # /Users/a.txt) so the pre-auth probe starts from a clean default-deny
     passed = run_vga_cmd("perm_revoke", r"perm_revoke: \d+ grant\(s\) dropped",
                          15, "perm_revoke cleanup")
@@ -490,10 +490,10 @@ def run_round2_flow():
         ("bm_revoke", "bm_revoke", r"bm_revoke: ok \(0\)"),
         ("bm_resolve post-revoke", "bm_resolve",
          r"bm_resolve: no cached bookmark \(bm_create first\)"),
-        ("vfs_mkdir", "vfs_mkdir /Users/tmpdir",
-         r"vfs_mkdir: created /Users/tmpdir"),
-        ("vfs_rm", "vfs_rm /Users/tmpdir",
-         r"vfs_rm: removed /Users/tmpdir"),
+        ("mkdir", "mkdir /Users/tmpdir",
+         r"mkdir: created /Users/tmpdir"),
+        ("rm", "rm /Users/tmpdir",
+         r"rm: removed /Users/tmpdir"),
         ("pkg remove", "pkg remove hello", r"pkg remove: 'hello' removed"),
         ("pkg list post-remove", "pkg list", r"pkg list: 0 app\(s\) installed"),
         ("pkg remove error", "pkg remove hello",
@@ -514,7 +514,7 @@ def run_round3_flow():
     R3.1 IPC stress: init's 31/31 regression already runs a 100k IPC
     round-trip; the three concurrent hello spawns below add the
     multi-client angle on top.
-    R3.2: vfs_fill drives the 32 MiB Users volume to NOSPC (deterministic
+    R3.2: fallocate drives the 32 MiB Users volume to NOSPC (deterministic
     error path), then uptime proves the kernel survived the exhaustion.
     R3.3: three hello spawns run concurrently; count signal self-test
     PASSED (baseline + 3), then assert ps no longer lists hello — the
@@ -526,10 +526,10 @@ def run_round3_flow():
 
     # R3.2 first: it fills /Users, so nothing later in this flow may
     # write to the Users volume.
-    passed = run_vga_cmd("vfs_fill /Users/big.bin",
-                         r"vfs_fill: NOSPC at \d+ MiB \(err -\d+\)",
-                         60, "R3.2 vfs_fill NOSPC")
-    print("  %s R3.2 vfs_fill NOSPC" % ("OK" if passed else "FAIL"))
+    passed = run_vga_cmd("fallocate /Users/big.bin",
+                         r"fallocate: NOSPC at \d+ MiB \(err -\d+\)",
+                         60, "R3.2 fallocate NOSPC")
+    print("  %s R3.2 fallocate NOSPC" % ("OK" if passed else "FAIL"))
     ok = ok and passed
     if passed:
         passed = run_vga_cmd("uptime", r"System ticks: \d+", 20,
@@ -541,7 +541,7 @@ def run_round3_flow():
     # even after R2.4 removed hello from the store.
     base = len(re.findall(r"hello: signal self-test PASSED", read_log()))
     for i in range(3):
-        passed = run_vga_cmd("spawn", r"spawn: created PID \d+", 20,
+        passed = run_vga_cmd("exec", r"spawn: created PID \d+", 20,
                              "R3.3 spawn #%d" % (i + 1))
         print("  %s R3.3 spawn #%d" % ("OK" if passed else "FAIL", i + 1))
         ok = ok and passed
@@ -559,11 +559,11 @@ def run_round3_flow():
         print("  %s R3.3 ps shows no hello" % ("OK" if gone else "FAIL"))
         ok = ok and gone
 
-    # R3.4: flood a vfs_stat line at ~5 ms/key.  The full echo proves
+    # R3.4: flood a stat line at ~5 ms/key.  The full echo proves
     # every key survived; the stat line (used = 32768 KB after R3.2)
     # proves the command executed.
-    flood_command("vfs_stat /Volumes/Users")
-    passed = wait_vga(r"opsys\$ vfs_stat /Volumes/Users", 20, "R3.4 flood echo")
+    flood_command("stat /Volumes/Users")
+    passed = wait_vga(r"opsys\$ stat /Volumes/Users", 20, "R3.4 flood echo")
     if passed:
         passed = wait_vga(r"/Volumes/Users: \d+ KB total, \d+ KB used, read-write",
                           15, "R3.4 flood result")
@@ -581,12 +581,12 @@ def run_disk_persist_flow():
     boot.  Data surviving system_reset proves the block device is real.
     Only run with --drive (disk.img must be attached)."""
     print("[flow] R2.7/R3.5 disk persistence (--drive)")
-    ok = run_vga_cmd("vfs_write /Volumes/Disk/persist.txt hello",
-                     r"vfs_write: 5 bytes written to /Volumes/Disk/persist\.txt",
+    ok = run_vga_cmd("tee /Volumes/Disk/persist.txt hello",
+                     r"tee: 5 bytes written to /Volumes/Disk/persist\.txt",
                      30, "disk write")
     print("  %s disk write" % ("OK" if ok else "FAIL"))
     if ok:
-        ok = run_vga_cmd("vfs_cat /Volumes/Disk/persist.txt",
+        ok = run_vga_cmd("cat /Volumes/Disk/persist.txt",
                          r"== /Volumes/Disk/persist\.txt \(5 bytes\) ==",
                          30, "disk cat pre-reset")
         print("  %s disk cat pre-reset" % ("OK" if ok else "FAIL"))
@@ -604,7 +604,7 @@ def run_disk_persist_flow():
         print("  FAIL reboot (no prompt)")
         return False
     answer_panels()  # fresh boot: init's pending panel appears again
-    ok = run_vga_cmd("vfs_cat /Volumes/Disk/persist.txt",
+    ok = run_vga_cmd("cat /Volumes/Disk/persist.txt",
                      r"== /Volumes/Disk/persist\.txt \(5 bytes\) ==",
                      30, "disk cat post-reset")
     print("  %s disk cat post-reset" % ("OK" if ok else "FAIL"))

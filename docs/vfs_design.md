@@ -500,24 +500,24 @@ Phase 0 允许两个实现二选一：
 2. `user/services/vfs/fs_mem_driver.c`：blob 只读卷 + RAM 可写卷。
 3. `user/lib/libfs/fs.c` + `fs.h`：§4.3 全部接口。
 4. manager 服务表注册 `vfs`（manager.c:336 模式）；shell 增加测试命令
-   `vfs_ls <url>`、`vfs_cat <url>`（shell.c 注册命令表）。
+   `ls <url>`、`cat <url>`（shell.c 注册命令表）。
 5. 系统卷预置内容：把现有 blob（hello.elf 等）映射为
    `/Volumes/System/Kernel/hello.elf`。
 
 **验证**（QEMU，沿用串口 + screendump + 解码脚本流程）：
-- 串口：`vfs_ls /Volumes/System/` 列出 blob 名。
-- `vfs_cat /Volumes/System/Kernel/hello.elf` 输出字节数与 blob 大小一致。
+- 串口：`ls /Volumes/System/` 列出 blob 名。
+- `cat /Volumes/System/Kernel/hello.elf` 输出字节数与 blob 大小一致。
 - 写卷：`fs_open_item(..., VFS_OPEN_CREATE)` 建文件 → 写 → 读回一致。
 - 权限：以 WRITE 打开只读卷 → `-EROFS`。
 
 **验收记录（2026-08-07，QEMU 实测）✅**：
-- `vfs_ls /Volumes/System/` → `Kernel`（1 条目）；`vfs_ls /Volumes/System/Kernel/`
+- `ls /Volumes/System/` → `Kernel`（1 条目）；`ls /Volumes/System/Kernel/`
   列出全部 blob。
-- `vfs_cat /Volumes/System/Kernel/hello.elf` → `== read 35032 bytes ==`，
+- `cat /Volumes/System/Kernel/hello.elf` → `== read 35032 bytes ==`，
   与 build/user/services/hello.elf 实际大小 35032 字节一致。
-- `vfs_write /Volumes/System/test.txt hello` → `open FAILED (-100)`，
+- `tee /Volumes/System/test.txt hello` → `open FAILED (-100)`，
   VFS_ERR_READONLY 即 -EROFS，只读卷写路径正确拒绝。
-- 此前已验：`vfs_fill /Volumes/Users/` 触发 ENOSPC（-101）；`vfs_stat` 显示
+- 此前已验：`fallocate /Volumes/Users/` 触发 ENOSPC（-101）；`stat` 显示
   System 只读 / Users 32768 KB（32 MiB）；shell 事后可继续交互（无崩溃）。
 
 ### Phase 1 —— 真实存储：virtio-blk + 简单磁盘格式
@@ -532,20 +532,20 @@ Phase 0 允许两个实现二选一：
    （**未实现**，仍为编译期静态表 `s_mount_cfg`）。
 4. QEMU 启动参数加 `-drive file=disk.img,if=virtio`。
 
-**验证**：`vfs_cat` 读磁盘卷；写后重启 QEMU 数据仍在（持久性证明）；
-`vfs_stat_volume` 显示空间占用。
+**验证**：`cat` 读磁盘卷；写后重启 QEMU 数据仍在（持久性证明）；
+`stat_volume` 显示空间占用。
 
 **验收记录（2026-08-14，QEMU 实测，sendkey 注入 + screendump OCR 解码）✅**：
-- `vfs_write /Volumes/Disk/hello.txt hello-disk-123` 首次 → `open FAILED (-105)`
+- `tee /Volumes/Disk/hello.txt hello-disk-123` 首次 → `open FAILED (-105)`
   = VFS_ERR_ACCESS；term 弹 Powerbox 文本询问：`perm: app 0x5e11e5 requests
   /Volumes/Disk/hello.txt (W) - perm_answer 513 y/n` —— shell（Standard 角色）
   的 WRITE 无链规则，按默认拒绝走 Powerbox 授权流（§九 与 shell.c 注释一致）。
 - `perm_answer 513 y` → `[ALLOWED] ... query 513 -> ALLOWED (0)`（grant 写入）。
-- 重试 `vfs_write` → `14 bytes written to /Volumes/Disk/hello.txt`（授权后放行）。
+- 重试 `tee` → `14 bytes written to /Volumes/Disk/hello.txt`（授权后放行）。
 - host 侧 `xxd disk.img` → 偏移 0x8200 见 `hello-disk-123` 数据块（真实落盘）。
-- **冷重启 QEMU**（保留 disk.img）→ `vfs_cat /Volumes/Disk/hello.txt` →
+- **冷重启 QEMU**（保留 disk.img）→ `cat /Volumes/Disk/hello.txt` →
   `== read 14 bytes ==` + `hello-disk-123` —— **持久性证明成立**。
-- `vfs_stat /Volumes/Disk` → `8159 KB total, 0 KB used, read-write`
+- `stat /Volumes/Disk` → `8159 KB total, 0 KB used, read-write`
   （14 字节不足 1 KB 取整为 0 used，正确）。
 - 回归：31/31 passed，0 PANIC/FATAL；Disk 卷跨重启同 UUID
   （6f707379-732d7666-1be-564245f5）未重格式化。
@@ -556,7 +556,7 @@ Phase 0 允许两个实现二选一：
 > perm_answer → 重试成功）自相矛盾。已移除该链规则（perm-manager.c
 > seed_rules），Standard 的 WRITE 走默认拒绝 → Powerbox 用户授权流，
 > 与 docs/permission_model.md §2.6「Powerbox 是唯一授权入口」一致；
-> READ 仍链 ALLOW 直通（vfs_cat/vfs_stat 无需授权）。所有 P1 测试
+> READ 仍链 ALLOW 直通（cat/stat 无需授权）。所有 P1 测试
 > 均基于 OWNER/GUEST 角色（chain DENY 语义未变），31/31 回归通过。
 
 ### Phase 2 —— 书签 + 权限管理器 + Powerbox（文本版）
@@ -576,7 +576,7 @@ Phase 0 允许两个实现二选一：
 - 撤销后 resolve → `-EACCES`。
 
 **验收记录（2026-08-08，QEMU 实测，sendkey 注入 + 串口镜像日志）✅**：
-- `vfs_write /Users/a.txt hello` → `5 bytes written`（测试文件就绪）。
+- `tee /Users/a.txt hello` → `5 bytes written`（测试文件就绪）。
 - `bm_create /Users/a.txt r`（未授权）→ `FAILED (-105)` = VFS_ERR_ACCESS
   即 -EACCES，默认拒绝生效。
 - term 弹 Powerbox 文本询问：`perm: app 0x5e11e5 requests /Users/a.txt (R)
@@ -676,7 +676,7 @@ fs_mem_driver.c:41；无 `VFS_RAM_VOL_SIZE_MB` 宏），通过
 仅占空闲内存的 13%，余量充足；blob 只读卷（System）直接引用 `SYS_BLOB_GET`
 取回的 blob 缓冲区，不额外占 RAM 卷。
 
-**验证方法**（Phase 0 验收）：`vfs_stat_volume` 显示 RAM 卷容量 = 32MB；
+**验证方法**（Phase 0 验收）：`stat_volume` 显示 RAM 卷容量 = 32MB；
 连续写入 >32MB 应返回 `-ENOSPC` 且系统其余功能正常（内存水位无异常）。
 
 ---
@@ -695,7 +695,7 @@ fs_mem_driver.c:41；无 `VFS_RAM_VOL_SIZE_MB` 宏），通过
 |-------|-----------|------|
 | 0 | vfs_server / fs_mem_driver / libfs | `user/services/vfs/`、`user/lib/libfs/` |
 | 0 | manager 服务表注册 vfs | `user/services/manager/manager.c` |
-| 0 | shell 测试命令 vfs_ls / vfs_cat | `user/services/shell/shell.c` |
+| 0 | shell 测试命令 ls / cat | `user/services/shell/shell.c` |
 | 0 | Makefile 服务列表扩展 | `Makefile`（SVC_NAMES 加 vfs） |
 | 1 | virtio-blk 驱动 | `kernel/arch/x86_64/virtio_blk.c` + `kernel/include/kernel/` |
 | 1 | fs_virtio_blk_driver + 卷格式 | `user/services/vfs/` |

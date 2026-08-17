@@ -225,10 +225,10 @@ QEMU 参数：`-nographic -serial mon:stdio`（串口输出即终端），virtio
 
 | 命令                      | 说明                                         |
 | ------------------------- | -------------------------------------------- |
-| `vfs_ls <url>`            | 列出目录内容（如 `vfs_ls /Volumes/System/`） |
-| `vfs_cat <url>`           | 查看文件内容                                 |
-| `vfs_write <url> <text>`  | 写入文件（首次写磁盘卷触发 Powerbox 授权）   |
-| `vfs_stat <url>`          | 查看卷/文件信息                              |
+| `ls <url>`               | 列出目录内容（如 `ls /Volumes/System/`）     |
+| `cat <url>`              | 查看文件内容                                 |
+| `tee <url> <text>`       | 写入文件（首次写磁盘卷触发 Powerbox 授权）   |
+| `stat <url>`             | 查看卷/文件信息                              |
 | `bm_create <url> <r\|w>`  | 创建书签                                     |
 | `bm_resolve`              | 解析书签                                     |
 | `perm_answer <id> <y\|n>` | 响应 Powerbox 权限询问                       |

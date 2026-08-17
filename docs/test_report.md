@@ -26,7 +26,7 @@
 | R1.3 | 服务启动序列 | wait_for 7 个 `svc * started` | ✅（串口） |
 | R1.4 | serial-test 自检 | wait_for `serial-test: PASS` | ✅（串口） |
 | R1.5 | shell 冒烟（meminfo/ports/threads/uptime/ps） | sendkey + 响应关键字 | ✅（5/5，VGA） |
-| R1.6 | VFS 内存卷 + 卷枚举（ls/ls-root/write/cat/stat） | sendkey + 写读一致 + `vfs_ls /` 列卷 | ✅（5/5，VGA） |
+| R1.6 | VFS 内存卷 + 卷枚举（ls/ls-root/write/cat/stat） | sendkey + 写读一致 + `ls /` 列卷 | ✅（5/5，VGA） |
 | R1.7 | Powerbox 书签流（授权/拒绝往返） | 8 步：pre-auth -105 → panel y → 授权 → revoke → -105 | ✅（8/8） |
 | R1.8 | pkg 流（install/list/run + hello 信号自测） | 4 步 | ✅（4/4） |
 | R1.9 | pkg 沙盒（manifest 权限签发/拒绝 + 自授失败） | install sbox_demo --perms → `set_time OK`；sbox_demo_noperm → `DENIED` + `self-grant = -3` | ✅（10/10，串口） |
@@ -41,7 +41,7 @@
 |---|---|---|---|
 | R2.1 | keyboard 焦点（TAKE/RELEASE_FOCUS） | init KBD_OP 直调：TAKE→0、重取幂等、owner RELEASE→0、非 owner→-3 | ✅ `=== KBD Focus: 1/1 passed ===` |
 | R2.2 | IRQ/通知路径（keyboard IRQ1） | sendkey 注入后字符回显 | ✅（R1.5/R3.4 隐式覆盖） |
-| R2.3 | VFS 余下 op（REVOKE_BM/CREATE_DIR/DELETE） | bm_revoke→resolve 无缓存；vfs_mkdir/rm 往返 | ✅（4/4） |
+| R2.3 | VFS 余下 op（REVOKE_BM/CREATE_DIR/DELETE） | bm_revoke→resolve 无缓存；mkdir/rm 往返 | ✅（4/4） |
 | R2.4 | pkg REMOVE + install 错误路径 | remove hello → list 0 → 二次 remove FAILED | ✅（3/3） |
 | R2.5 | 信号（SIGNAL/KILL/SIGRETURN） | hello 7 段信号自测 | ✅（R1.8 覆盖） |
 | R2.6 | 进程监控（PROCESS_WAIT/LIST/KILL） | ps 列表 + kill 错误路径 + flaky 重启策略 | ✅（flaky FAILED 锚点命中） |
@@ -57,13 +57,13 @@
 | # | 测试项 | 方法 | 结果 |
 |---|---|---|---|
 | R3.1 | IPC 压力（多客户端） | init 100k 往返 + 3 并发 hello spawn | ✅（并入 R3.3） |
-| R3.2 | 内存边界/耗尽 | `vfs_fill /Users/big.bin` → 32 MiB 卷 NOSPC → uptime 存活 | ✅（NOSPC at 32 MiB） |
+| R3.2 | 内存边界/耗尽 | `fallocate /Users/big.bin` → 32 MiB 卷 NOSPC → uptime 存活 | ✅（NOSPC at 32 MiB） |
 | R3.3 | 多进程并发 | spawn×3 → 计数 `hello: signal self-test PASSED` baseline+3 → ps 无 hello | ✅（5/5） |
-| R3.4 | 键盘洪水 | `flood_command` 5ms/键注入 vfs_stat → 回显完整 + 结果出现 | ✅（2/2） |
+| R3.4 | 键盘洪水 | `flood_command` 5ms/键注入 stat → 回显完整 + 结果出现 | ✅（2/2） |
 | R3.5 | 持久化重启 | `--drive`：write persist.txt → `system_reset` → 复启后 cat 5 bytes | ✅（5/5） |
 | R3.6 | 全量回归确认 | 第一轮全部重跑 | ✅（63 项重跑全过） |
 
-**R3 新增检查**：vfs_fill 2 + spawn/ps 5 + flood 2 + 磁盘持久化 5 = 14 项（含 `--drive` 模式）。
+**R3 新增检查**：fallocate 2 + spawn/ps 5 + flood 2 + 磁盘持久化 5 = 14 项（含 `--drive` 模式）。
 
 ## 五、已知记录
 
@@ -71,7 +71,7 @@
    有载）。malloc/realloc 已由 init 堆守卫测试与 hello 信号自测隐式覆盖，专项补测待 demo
    接入后执行。
 2. **`--drive` 复启后 `answer_panels` 报 `TIMEOUT[vga] panel 2`**：良性。复启仅 1 个 init
-   待决面板，`answer_panels` 应答后继续等待第 2 个面板直至超时；`vfs_cat` 复查不受影响
+   待决面板，`answer_panels` 应答后继续等待第 2 个面板直至超时；`cat` 复查不受影响
    （READ 走角色链授权，无面板）。已计入 R3.5 通过。
 3. **`SERIAL_ANCHORS` 的 P2 gate/P2V/KBD 锚点用正则交替**（摘要行 | 首测试行）：守护
    `sys_debug_log` token bucket（512/tick、桶上限 1024）未来回退时摘要行被截断的情况；
@@ -85,7 +85,7 @@
   10/10 passed ===`、`=== P2 Gate: 3/3 passed ===`、`=== P2 VFS: 4/4 passed ===`、
   `=== KBD Focus: 1/1 passed ===` 各 2 次（两轮启动）；`serial-test: PASS` ×2；
   `manager: flaky marked FAILED` ×2；崩溃标记 0。
-- VGA 解码：Powerbox 面板文本、shell 回显、`vfs_fill: NOSPC at 32 MiB`、`ps` 无 hello 行。
+- VGA 解码：Powerbox 面板文本、shell 回显、`fallocate: NOSPC at 32 MiB`、`ps` 无 hello 行。
 - 最终消息：`=== SMOKE PASSED (R1 + R2 + R3) ===`（VGA，仅 shell 通道）。
 
 ## 七、结论

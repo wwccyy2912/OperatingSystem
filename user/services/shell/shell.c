@@ -29,7 +29,7 @@
 #include "../lib/libc/stdio.h"  /* printf -> SYS_DEBUG_LOG (serial) */
 #include "../lib/libc/stdlib.h" /* atoi */
 #include "../lib/libc/string.h" /* strcmp, strlen, strdup */
-#include "../lib/libfs/fs.h"    /* libfs VFS client (vfs_ls/vfs_cat/vfs_stat) */
+#include "../lib/libfs/fs.h"    /* libfs VFS client (ls/cat/stat/tee/fallocate/mkdir/rm) */
 #include "../lib/libpkg/pkg.h"  /* libpkg pkg-manager client (pkg_*) */
 #include "../lib/libos/syscalls.h"
 #include "../perm/perm.h" /* Powerbox protocol (perm_answer/perm_revoke) */
@@ -72,35 +72,35 @@ typedef int32_t  i32;
 static int cmd_help(int argc, char *argv[]);
 static int cmd_echo(int argc, char *argv[]);
 static int cmd_pid(int argc, char *argv[]);
-static int cmd_meminfo(int argc, char *argv[]);
+static int cmd_free(int argc, char *argv[]);
 static int cmd_clear(int argc, char *argv[]);
 static int cmd_cap(int argc, char *argv[]);
 static int cmd_ports(int argc, char *argv[]);
 static int cmd_sleep(int argc, char *argv[]);
 static int cmd_threads(int argc, char *argv[]);
 static int cmd_mutex(int argc, char *argv[]);
-static int cmd_spawn(int argc, char *argv[]);
+static int cmd_exec(int argc, char *argv[]);
 static int cmd_uptime(int argc, char *argv[]);
 static int cmd_exit(int argc, char *argv[]);
 static int cmd_reboot(int argc, char *argv[]);
 static int cmd_panic(int argc, char *argv[]); /* TEMP test hook */
 static int cmd_kill(int argc, char *argv[]);
 static int cmd_ps(int argc, char *argv[]);
-static int cmd_vfs_ls(int argc, char *argv[]);
-static int cmd_vfs_cat(int argc, char *argv[]);
-static int cmd_vfs_stat(int argc, char *argv[]);
-static int cmd_vfs_write(int argc, char *argv[]);
-static int cmd_vfs_fill(int argc, char *argv[]);
-static int cmd_vfs_mkdir(int argc, char *argv[]);
-static int cmd_vfs_rm(int argc, char *argv[]);
-/* Phase 2: bookmarks + Powerbox + move (design §8) */
+static int cmd_ls(int argc, char *argv[]);
+static int cmd_cat(int argc, char *argv[]);
+static int cmd_stat(int argc, char *argv[]);
+static int cmd_tee(int argc, char *argv[]);
+static int cmd_fallocate(int argc, char *argv[]);
+static int cmd_mkdir(int argc, char *argv[]);
+static int cmd_rm(int argc, char *argv[]);
+/* Phase 2: bookmarks + Powerbox + mv (design §8) */
 static int cmd_bm_create(int argc, char *argv[]);
 static int cmd_bm_resolve(int argc, char *argv[]);
 static int cmd_bm_revoke(int argc, char *argv[]);
 static int cmd_perm_answer(int argc, char *argv[]);
 static int cmd_perm_query(int argc, char *argv[]);
 static int cmd_perm_revoke(int argc, char *argv[]);
-static int cmd_move(int argc, char *argv[]);
+static int cmd_mv(int argc, char *argv[]);
 static int cmd_pkg(int argc, char *argv[]);
 
 /* ====================================================================
@@ -525,26 +525,26 @@ static int cmd_pid(int argc, char *argv[]) {
  * image (hello, runtime_demo, sbox_demo, ...) is fetchable via
  * SYS_BLOB_GET and spawnable via SYS_PROCESS_CREATE.
  */
-static int cmd_spawn(int argc, char *argv[]) {
+static int cmd_exec(int argc, char *argv[]) {
     const char *name = (argc > 1) ? argv[1] : "hello";
     static char blob_buf[131072]; /* must hold the largest demo ELF */
     int         size = blob_get(name, blob_buf, sizeof(blob_buf));
     if (size < 0) {
-        shell_printf("spawn: blob_get(%s) FAILED (%d)\n", name, size);
+        shell_printf("exec: blob_get(%s) FAILED (%d)\n", name, size);
         return 1;
     }
-    shell_printf("spawn: fetched %s.elf blob from kernel (%d bytes)\n", name, size);
+    shell_printf("exec: fetched %s.elf blob from kernel (%d bytes)\n", name, size);
     int pid = process_create(name, blob_buf, size);
     if (pid < 0) {
-        shell_printf("spawn: FAILED (%d)\n", pid);
+        shell_printf("exec: FAILED (%d)\n", pid);
         return 1;
     }
-    shell_printf("spawn: created PID %d\n", pid);
-    printf("[shell] cmd_spawn: pid=%d tick=%d\n", pid, get_time());
+    shell_printf("exec: created PID %d\n", pid);
+    printf("[shell] cmd_exec: pid=%d tick=%d\n", pid, get_time());
     return 0;
 }
 
-static int cmd_meminfo(int argc, char *argv[]) {
+static int cmd_free(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
     int free_pages = get_free_pages();
@@ -900,14 +900,14 @@ static int cmd_kill(int argc, char *argv[]) {
  * ==================================================================== */
 
 /*
- * vfs_ls <url> — enumerate a directory.  URL like "/Volumes/System/"
+ * ls <url> — enumerate a directory.  URL like "/Volumes/System/"
  * or "Users".  "/" and "/Volumes" enumerate the mounted volumes (the
  * root view: there is no root item, the server answers from the mount
  * table).  Prints one child name per line, then the entry count.
  */
-static int cmd_vfs_ls(int argc, char *argv[]) {
+static int cmd_ls(int argc, char *argv[]) {
     if (argc < 2) {
-        shell_write("Usage: vfs_ls <dir-url>\n");
+        shell_write("Usage: ls <dir-url>\n");
         return -1;
     }
     if (strcmp(argv[1], "/") == 0 || strcmp(argv[1], "/Volumes") == 0 ||
@@ -916,28 +916,28 @@ static int cmd_vfs_ls(int argc, char *argv[]) {
         u32                   count = 0;
         int                   r     = fs_list_volumes(vols, &count);
         if (r < 0) {
-            shell_printf("vfs_ls: %s FAILED (%d)\n", argv[1], r);
+            shell_printf("ls: %s FAILED (%d)\n", argv[1], r);
             return -1;
         }
         for (u32 i = 0; i < count; i++) {
             shell_write(vols[i].mount_name);
             shell_write(vols[i].read_only ? " (ro)\n" : "\n");
         }
-        shell_printf("vfs_ls: %d volumes\n", count);
+        shell_printf("ls: %d volumes\n", count);
         return 0;
     }
     static vfs_enum_batch_t batch; /* ~16.5 KB — keep off the stack */
     vfs_handle_t            e;
     int                     r = fs_enum_begin(argv[1], &e);
     if (r < 0) {
-        shell_printf("vfs_ls: %s FAILED (%d)\n", argv[1], r);
+        shell_printf("ls: %s FAILED (%d)\n", argv[1], r);
         return -1;
     }
     int total = 0;
     for (;;) {
         r = fs_enum_next(e, &batch);
         if (r < 0) {
-            shell_printf("vfs_ls: enum FAILED (%d)\n", r);
+            shell_printf("ls: enum FAILED (%d)\n", r);
             fs_enum_end(e);
             return -1;
         }
@@ -950,25 +950,25 @@ static int cmd_vfs_ls(int argc, char *argv[]) {
         }
     }
     fs_enum_end(e);
-    shell_printf("vfs_ls: %d entries\n", total);
+    shell_printf("ls: %d entries\n", total);
     return 0;
 }
 
 /*
- * vfs_cat <url> — read and display a file.  Non-printable bytes are
+ * cat <url> — read and display a file.  Non-printable bytes are
  * shown as '.' so binary blobs do not corrupt the terminal.  Ends with
  * a byte-count line so the content length can be verified against the
  * source blob.
  */
-static int cmd_vfs_cat(int argc, char *argv[]) {
+static int cmd_cat(int argc, char *argv[]) {
     if (argc < 2) {
-        shell_write("Usage: vfs_cat <file-url>\n");
+        shell_write("Usage: cat <file-url>\n");
         return -1;
     }
     vfs_item_info_t info;
     int             r = fs_get_item(argv[1], &info);
     if (r < 0) {
-        shell_printf("vfs_cat: %s FAILED (%d)\n", argv[1], r);
+        shell_printf("cat: %s FAILED (%d)\n", argv[1], r);
         return -1;
     }
     shell_printf("== %s (%d bytes) ==\n", argv[1], (int)info.size);
@@ -976,7 +976,7 @@ static int cmd_vfs_cat(int argc, char *argv[]) {
     vfs_handle_t h;
     r = fs_open_item(argv[1], VFS_OPEN_READONLY, VFS_ACCESS_READ, &h);
     if (r < 0) {
-        shell_printf("vfs_cat: open FAILED (%d)\n", r);
+        shell_printf("cat: open FAILED (%d)\n", r);
         return -1;
     }
     static u8 buf[1024];
@@ -985,7 +985,7 @@ static int cmd_vfs_cat(int argc, char *argv[]) {
         u32 got = 0;
         r       = fs_read(h, total, buf, sizeof(buf), &got);
         if (r < 0) {
-            shell_printf("vfs_cat: read FAILED (%d)\n", r);
+            shell_printf("cat: read FAILED (%d)\n", r);
             fs_close(h);
             return -1;
         }
@@ -1008,10 +1008,10 @@ static int cmd_vfs_cat(int argc, char *argv[]) {
 }
 
 /*
- * vfs_stat [url] — volume capacity/usage.  With no argument, stats
+ * stat [url] — volume capacity/usage.  With no argument, stats
  * both configured volumes (System read-only, Users 32 MiB RAM).
  */
-static int cmd_vfs_stat(int argc, char *argv[]) {
+static int cmd_stat(int argc, char *argv[]) {
     static const char *vols[2] = {"/Volumes/System", "/Volumes/Users"};
     int                count   = (argc >= 2) ? 1 : 2;
     for (int v = 0; v < count; v++) {
@@ -1020,7 +1020,7 @@ static int cmd_vfs_stat(int argc, char *argv[]) {
         u32         ro = 0;
         int         r  = fs_stat_volume(url, &total, &used, &ro);
         if (r < 0) {
-            shell_printf("vfs_stat: %s FAILED (%d)\n", url, r);
+            shell_printf("stat: %s FAILED (%d)\n", url, r);
             continue;
         }
         shell_printf("%s: %d KB total, %d KB used, %s\n",
@@ -1033,14 +1033,14 @@ static int cmd_vfs_stat(int argc, char *argv[]) {
 }
 
 /*
- * vfs_write <url> <text> — write text to a file (create/truncate,
+ * tee <url> <text> — write text to a file (create/truncate,
  * VFS_ACCESS_WRITE).  Exercises the write path: on the read-only System
  * volume the server must reject the open with VFS_ERR_READONLY (-100);
- * on the RAM volume the bytes must land so vfs_cat can read them back.
+ * on the RAM volume the bytes must land so cat can read them back.
  */
-static int cmd_vfs_write(int argc, char *argv[]) {
+static int cmd_tee(int argc, char *argv[]) {
     if (argc < 3) {
-        shell_write("Usage: vfs_write <file-url> <text>\n");
+        shell_write("Usage: tee <file-url> <text>\n");
         return -1;
     }
     const char *url  = argv[1];
@@ -1050,30 +1050,30 @@ static int cmd_vfs_write(int argc, char *argv[]) {
     vfs_handle_t h;
     int          r = fs_open_item(url, VFS_OPEN_CREATE | VFS_OPEN_TRUNCATE, VFS_ACCESS_WRITE, &h);
     if (r < 0) {
-        shell_printf("vfs_write: open %s FAILED (%d)\n", url, r);
+        shell_printf("tee: open %s FAILED (%d)\n", url, r);
         return -1;
     }
     r = fs_write(h, 0, text, len);
     if (r < 0) {
-        shell_printf("vfs_write: write FAILED (%d)\n", r);
+        shell_printf("tee: write FAILED (%d)\n", r);
         fs_close(h);
         return -1;
     }
     fs_close(h);
-    shell_printf("vfs_write: %d bytes written to %s\n", (int)len, url);
+    shell_printf("tee: %d bytes written to %s\n", (int)len, url);
     return 0;
 }
 
 /*
- * vfs_fill <url> — grow a file in 4 KiB chunks until the volume is
+ * fallocate <url> — grow a file in 4 KiB chunks until the volume is
  * full.  Exercises the ENOSPC path: the fs_mem_driver capacity check
  * must reject the write that would exceed the 32 MiB Users volume with
  * VFS_ERR_NOSPC (-101).  Prints progress every 8 MiB and the failing
  * offset + error code.
  */
-static int cmd_vfs_fill(int argc, char *argv[]) {
+static int cmd_fallocate(int argc, char *argv[]) {
     if (argc < 2) {
-        shell_write("Usage: vfs_fill <file-url>\n");
+        shell_write("Usage: fallocate <file-url>\n");
         return -1;
     }
     const char *url = argv[1];
@@ -1081,7 +1081,7 @@ static int cmd_vfs_fill(int argc, char *argv[]) {
     vfs_handle_t h;
     int          r = fs_open_item(url, VFS_OPEN_CREATE | VFS_OPEN_TRUNCATE, VFS_ACCESS_WRITE, &h);
     if (r < 0) {
-        shell_printf("vfs_fill: open %s FAILED (%d)\n", url, r);
+        shell_printf("fallocate: open %s FAILED (%d)\n", url, r);
         return -1;
     }
 
@@ -1092,60 +1092,60 @@ static int cmd_vfs_fill(int argc, char *argv[]) {
     for (;;) {
         r = fs_write(h, off, s_fill_buf, sizeof(s_fill_buf));
         if (r < 0) {
-            shell_printf("vfs_fill: NOSPC at %d MiB (err %d)\n", (int)(off >> 20), r);
+            shell_printf("fallocate: NOSPC at %d MiB (err %d)\n", (int)(off >> 20), r);
             fs_close(h);
             return 0;
         }
         off += sizeof(s_fill_buf);
         if ((off & 0x7FFFFF) == 0) /* every 8 MiB */
-            shell_printf("vfs_fill: %d MiB\n", (int)(off >> 20));
+            shell_printf("fallocate: %d MiB\n", (int)(off >> 20));
     }
 }
 
 /*
- * vfs_mkdir <url> — create an empty directory (fs_create_dir).
+ * mkdir <url> — create an empty directory (fs_create_dir).
  * Fails with VFS_ERR_EXISTS (-104) if the directory already exists.
  */
-static int cmd_vfs_mkdir(int argc, char *argv[]) {
+static int cmd_mkdir(int argc, char *argv[]) {
     if (argc < 2) {
-        shell_write("Usage: vfs_mkdir <dir-url>\n");
+        shell_write("Usage: mkdir <dir-url>\n");
         return -1;
     }
     int r = fs_create_dir(argv[1]);
     if (r < 0) {
-        shell_printf("vfs_mkdir: %s FAILED (%d)\n", argv[1], r);
+        shell_printf("mkdir: %s FAILED (%d)\n", argv[1], r);
         return -1;
     }
-    shell_printf("vfs_mkdir: created %s\n", argv[1]);
+    shell_printf("mkdir: created %s\n", argv[1]);
     return 0;
 }
 
 /*
- * vfs_rm <url> — delete an item (fs_delete_item, non-recursive).  A
+ * rm <url> — delete an item (fs_delete_item, non-recursive).  A
  * non-empty directory fails with ERR_BUSY.
  */
-static int cmd_vfs_rm(int argc, char *argv[]) {
+static int cmd_rm(int argc, char *argv[]) {
     if (argc < 2) {
-        shell_write("Usage: vfs_rm <url>\n");
+        shell_write("Usage: rm <url>\n");
         return -1;
     }
     int r = fs_delete_item(argv[1], 0);
     if (r < 0) {
-        shell_printf("vfs_rm: %s FAILED (%d)\n", argv[1], r);
+        shell_printf("rm: %s FAILED (%d)\n", argv[1], r);
         return -1;
     }
-    shell_printf("vfs_rm: removed %s\n", argv[1]);
+    shell_printf("rm: removed %s\n", argv[1]);
     return 0;
 }
 
 /* ====================================================================
- * Phase 2 test commands: security-scoped bookmarks + Powerbox + move
+ * Phase 2 test commands: security-scoped bookmarks + Powerbox + mv
  * (design §8).  Acceptance flow:
  *   bm_create <url> r        → -105 (no grant; term shows the prompt)
  *   perm_answer <id> y       → grant upserted, UI_SHOW update pushed
  *   bm_create <url> r        → ok, blob cached
  *   bm_resolve               → handle (授权后 → 句柄)
- *   move <url> <dst> [name]  → itemID stable, bookmark still valid
+ *   mv <url> <dst> [name]  → itemID stable, bookmark still valid
  *   bm_resolve               → still resolves (移动后仍有效)
  *   perm_revoke [subject_id] → grants dropped (or bm_revoke)
  *   bm_resolve               → -105 again (撤销后 → -EACCES)
@@ -1370,18 +1370,18 @@ static int cmd_perm_revoke(int argc, char *argv[]) {
 
 /* move <src-url> <dst-dir-url> [new-name] — move/rename an item.  The
  * fs_mem_driver keeps itemID stable, so cached bookmarks survive. */
-static int cmd_move(int argc, char *argv[]) {
+static int cmd_mv(int argc, char *argv[]) {
     if (argc < 3) {
-        shell_write("Usage: move <src-url> <dst-dir-url> [new-name]\n");
+        shell_write("Usage: mv <src-url> <dst-dir-url> [new-name]\n");
         return -1;
     }
     vfs_item_info_t item;
     int             r = fs_move_item(argv[1], argv[2], (argc >= 4) ? argv[3] : "", &item);
     if (r < 0) {
-        shell_printf("move: FAILED (%d)\n", r);
+        shell_printf("mv: FAILED (%d)\n", r);
         return -1;
     }
-    shell_printf("move: '%s' -> item %d (size %d)\n", item.name, (int)item.item_id, (int)item.size);
+    shell_printf("mv: '%s' -> item %d (size %d)\n", item.name, (int)item.item_id, (int)item.size);
     return 0;
 }
 
@@ -1480,14 +1480,14 @@ static void shell_main(void *arg) {
     shell_register_command("help", "Show this help", cmd_help);
     shell_register_command("echo", "Print text: echo <message>", cmd_echo);
     shell_register_command("pid", "Show current process PID", cmd_pid);
-    shell_register_command("meminfo", "Show free physical memory", cmd_meminfo);
+    shell_register_command("free", "Show free physical memory", cmd_free);
     shell_register_command("clear", "Clear the terminal", cmd_clear);
     shell_register_command("cap", "Create a capability (test)", cmd_cap);
     shell_register_command("ports", "List registered IPC ports", cmd_ports);
     shell_register_command("sleep", "Sleep for N ticks: sleep <ticks>", cmd_sleep);
     shell_register_command("threads", "Spawn a test worker thread", cmd_threads);
     shell_register_command("mutex", "Mutex demo: N threads on a counter", cmd_mutex);
-    shell_register_command("spawn", "Spawn an embedded demo (spawn [blob_name])", cmd_spawn);
+    shell_register_command("exec", "Spawn an embedded demo (exec [blob_name])", cmd_exec);
     shell_register_command("uptime", "Show system tick count", cmd_uptime);
     shell_register_command("exit", "Exit the shell", cmd_exit);
     shell_register_command("reboot", "Halt the system", cmd_reboot);
@@ -1495,13 +1495,13 @@ static void shell_main(void *arg) {
     shell_register_command("kill", "Send a signal: kill <pid> [signum]", cmd_kill);
     shell_register_command("ps", "List running processes", cmd_ps);
     shell_register_command(
-        "vfs_ls", "List a VFS dir: vfs_ls <url> (/ or /Volumes = volumes)", cmd_vfs_ls);
-    shell_register_command("vfs_cat", "Show a VFS file: vfs_cat <url>", cmd_vfs_cat);
-    shell_register_command("vfs_stat", "VFS volume stats: vfs_stat [url]", cmd_vfs_stat);
-    shell_register_command("vfs_write", "Write a VFS file: vfs_write <url> <text>", cmd_vfs_write);
-    shell_register_command("vfs_fill", "Fill a volume until ENOSPC: vfs_fill <url>", cmd_vfs_fill);
-    shell_register_command("vfs_mkdir", "Create a VFS dir: vfs_mkdir <url>", cmd_vfs_mkdir);
-    shell_register_command("vfs_rm", "Delete a VFS item: vfs_rm <url>", cmd_vfs_rm);
+        "ls", "List a VFS dir: ls <url> (/ or /Volumes = volumes)", cmd_ls);
+    shell_register_command("cat", "Show a VFS file: cat <url>", cmd_cat);
+    shell_register_command("stat", "VFS volume stats: stat [url]", cmd_stat);
+    shell_register_command("tee", "Write a VFS file: tee <url> <text>", cmd_tee);
+    shell_register_command("fallocate", "Fill a volume until ENOSPC: fallocate <url>", cmd_fallocate);
+    shell_register_command("mkdir", "Create a VFS dir: mkdir <url>", cmd_mkdir);
+    shell_register_command("rm", "Delete a VFS item: rm <url>", cmd_rm);
     shell_register_command(
         "bm_create", "Powerbox-gated bookmark: bm_create <url> [r|w|rw]", cmd_bm_create);
     shell_register_command("bm_resolve", "Resolve cached bookmark to a handle", cmd_bm_resolve);
@@ -1511,7 +1511,7 @@ static void shell_main(void *arg) {
     shell_register_command(
         "perm_query", "Show pending Powerbox query: perm_query [id]", cmd_perm_query);
     shell_register_command("perm_revoke", "Drop grants: perm_revoke [subject_id]", cmd_perm_revoke);
-    shell_register_command("move", "Move/rename: move <src> <dst-dir> [new-name]", cmd_move);
+    shell_register_command("mv", "Move/rename: mv <src> <dst-dir> [new-name]", cmd_mv);
     shell_register_command("pkg", "pkg-manager: pkg <install|list|run|remove>", cmd_pkg);
 
     shell_loop();

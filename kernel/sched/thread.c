@@ -21,6 +21,7 @@
 /* Kernel stack size for each thread (8 pages = 32 KiB) */
 #define KSTACK_PAGES 8
 
+
 /* ------------------------------------------------------------------ */
 /*  Internal data                                                      */
 /* ------------------------------------------------------------------ */
@@ -245,8 +246,10 @@ static void free_thread(thread_t *t) {
      */
     if (t->user_stack_phys) {
         if (t->user_rsp && t->addr_space)
-            vmm_unmap(t->addr_space, t->user_rsp - PAGE_SIZE);
-        pmm_free_page(t->user_stack_phys);
+            vmm_unmap_range(t->addr_space,
+                            t->user_rsp - (u64)USER_STACK_PAGES * PAGE_SIZE,
+                            USER_STACK_PAGES);
+        pmm_free_pages(t->user_stack_phys, USER_STACK_PAGES);
         t->user_stack_phys = 0;
         t->user_rsp        = 0;
     }
@@ -397,30 +400,32 @@ tid_t thread_create_user(u64 entry, u64 arg, addr_space_t *as, int priority) {
     t->addr_space = as;
 
     /*
-     * Allocate a dedicated user-stack page for this thread.
-     * Virtual address: as->stack_base + tid * PAGE_SIZE, where
-     * stack_base is a random 1 MB-aligned region base chosen per
-     * address space at creation (ASLR, design item ⑭ — see rng.h).
-     * The per-tid offset guarantees threads of one process never
-     * collide; the random base makes the layout unpredictable.
-     * Top of stack (RSP starts here, grows downward).
+     * Allocate a dedicated USER_STACK_PAGES-page user stack.
+     * Virtual address: as->stack_base + tid*USER_STACK_PAGES*PAGE_SIZE,
+     * where stack_base is a random ASLR_STACK_BLOCK-aligned region base
+     * chosen per address space (ASLR, rng.h).  The per-tid offset
+     * guarantees threads of one process never collide.  Top of stack
+     * (RSP starts here, grows downward).
      */
-    u64 user_stack_phys = pmm_alloc_page();
+    u64 user_stack_phys = pmm_alloc_pages(USER_STACK_PAGES);
     if (!user_stack_phys) {
         free_thread(t);
         return ERR_NOMEM;
     }
     t->user_stack_phys      = user_stack_phys;
-    u64     user_stack_virt = as->stack_base + (u64)t->tid * PAGE_SIZE;
-    error_t err             = vmm_map(as,
-                                      user_stack_virt,
-                                      user_stack_phys,
-                                      PTE_PRESENT | PTE_WRITABLE | PTE_USER | PTE_NO_EXECUTE);
+    u64     user_stack_virt =
+        as->stack_base + (u64)t->tid * USER_STACK_PAGES * PAGE_SIZE;
+    error_t err             = vmm_map_range(as,
+                                            user_stack_virt,
+                                            user_stack_phys,
+                                            USER_STACK_PAGES,
+                                            PTE_PRESENT | PTE_WRITABLE | PTE_USER |
+                                                PTE_NO_EXECUTE);
     if (err != OK) {
         free_thread(t);
         return err;
     }
-    t->user_rsp = user_stack_virt + PAGE_SIZE; /* top of page */
+    t->user_rsp = user_stack_virt + (u64)USER_STACK_PAGES * PAGE_SIZE; /* top */
 
     int rc = setup_thread_stack(t, (void (*)(void *))entry, (void *)(uptr)arg);
     if (rc != OK) {

@@ -80,8 +80,15 @@ typedef int32_t  i32;
 #define TERM_OP_RENDER_LINE 5 /* render line at (x,y) without cursor change */
 #define TERM_OP_SET_CURSOR  6 /* set cursor position */
 #define TERM_OP_GET_CURSOR  7 /* query cursor position */
+#define TERM_OP_SNAPSHOT    8 /* save a cell region: {x,y,w,h} -> cells[] */
+#define TERM_OP_RESTORE     9 /* redraw a saved cell region: {x,y,w,h,cells} */
 
 #define TERM_MAX_DATA 256 /* max payload bytes per request */
+
+/* Snapshot/restore region cap: cells moved per op.  A 113x38 screen is
+ * 4294 cells; dialogs/panels are far smaller, so 2048 cells (e.g.
+ * 64x32 or a 100x20 box) is generous and keeps the IPC copy bounded. */
+#define TERM_MAX_REGION_CELLS 2048
 
 /* Virtual address for the framebuffer mapping.  Must be page-aligned,
  * below USER_PTR_MAX (0x0000800000000000), and must not collide with
@@ -132,9 +139,12 @@ typedef struct {
  * Terminal state
  * ==================================================================== */
 
-static u8 s_req_buf[TERM_REQ_HDR + TERM_MAX_DATA];
-/* +8: TERM_OP_GET_CURSOR packs {i32 ret; u32 x; u32 y} (12 bytes). */
-static u8 s_resp_buf[TERM_RESP_HDR + 8];
+/* RESTORE payload = {x,y,w,h} + cells, so the req buffer must hold the
+ * region header plus the cells (bounded by TERM_MAX_REGION_CELLS). */
+static u8 s_req_buf[TERM_REQ_HDR + 16 + TERM_MAX_REGION_CELLS];
+/* GET_CURSOR packs {i32 ret; u32 x; u32 y} (12 bytes); SNAPSHOT returns
+ * the region cells after ret (TERM_RESP_HDR + TERM_MAX_REGION_CELLS). */
+static u8 s_resp_buf[TERM_RESP_HDR + TERM_MAX_REGION_CELLS];
 
 /* Framebuffer descriptor (from SYS_FB_GET_INFO) */
 static u64 s_fb_va;     /* mapped virtual address        */
@@ -754,6 +764,65 @@ static void term_handle_request(int token, int msg_len) {
         int resp_len = (int)(sizeof(term_resp_t) + 8);
         (void)ipc_reply(token, resp, resp_len);
         return;
+    } else if (req->op == TERM_OP_SNAPSHOT) {
+        /* SNAPSHOT: {x, y, w, h} -> response = {ret; cells[w*h]} */
+        if (req->len < 16) {
+            term_reply(token, ERR_INVAL);
+            return;
+        }
+        u32 *snap    = (u32 *)req->data;
+        u32  x       = snap[0];
+        u32  y       = snap[1];
+        u32  w       = snap[2];
+        u32  h       = snap[3];
+        if (w == 0 || h == 0 || (u64)w * h > TERM_MAX_REGION_CELLS) {
+            term_reply(token, ERR_INVAL);
+            return;
+        }
+        term_resp_t *resp = (term_resp_t *)s_resp_buf;
+        resp->ret         = 0;
+        u8 *dst           = (u8 *)(resp + 1);
+        if (s_render_lock >= 0)
+            (void)mutex_lock(s_render_lock);
+        u32 n = 0;
+        for (u32 r = 0; r < h && y + r < s_rows; r++)
+            for (u32 c = 0; c < w && x + c < s_cols; c++)
+                dst[n++] = s_cells[y + r][x + c];
+        if (s_render_lock >= 0)
+            (void)mutex_unlock(s_render_lock);
+        (void)ipc_reply(token, s_resp_buf, (int)(sizeof(term_resp_t) + n));
+        return;
+    } else if (req->op == TERM_OP_RESTORE) {
+        /* RESTORE: {x, y, w, h, cells[w*h]} — redraw a saved region. */
+        if (req->len < 16) {
+            term_reply(token, ERR_INVAL);
+            return;
+        }
+        u32 *snap = (u32 *)req->data;
+        u32  x    = snap[0];
+        u32  y    = snap[1];
+        u32  w    = snap[2];
+        u32  h    = snap[3];
+        if (w == 0 || h == 0 || (u64)w * h > TERM_MAX_REGION_CELLS ||
+            req->len < 16 + (u32)(w * h)) {
+            term_reply(token, ERR_INVAL);
+            return;
+        }
+        const u8 *cells = (const u8 *)(snap + 4);
+        if (s_render_lock >= 0)
+            (void)mutex_lock(s_render_lock);
+        u32 n = 0;
+        for (u32 r = 0; r < h && y + r < s_rows; r++)
+            for (u32 c = 0; c < w && x + c < s_cols; c++) {
+                u8 ch = cells[n++];
+                if (ch < 0x20 || ch > 0x7E)
+                    ch = ' ';
+                s_cells[y + r][x + c] = ch;
+                term_draw_cell(x + c, y + r, ch, TERM_FG, TERM_BG);
+            }
+        if (s_render_lock >= 0)
+            (void)mutex_unlock(s_render_lock);
+        term_reply(token, 0);
     } else {
         term_reply(token, ERR_INVAL);
     }

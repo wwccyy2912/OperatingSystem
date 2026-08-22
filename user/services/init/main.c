@@ -599,7 +599,7 @@ static void test_ipc_call_err(void) {
  */
 static void test_ipc_peer_death(void) {
     TEST("ipc_call to dead peer wakes with ERR_NOENT");
-    static char blob[131072]; /* must hold crashpeer.elf */
+    static char blob[262144]; /* must hold crashpeer.elf */
     int size = blob_get("crashpeer", blob, sizeof(blob));
     ASSERT(size > 0, "blob_get(crashpeer) failed");
 
@@ -2232,16 +2232,18 @@ static void test_ipc_msg_size_boundary(void) {
     P4_PASS();
 }
 
-/* Thread table (MAX_THREADS = 1024): creating until the table is full
+/* Thread table (MAX_THREADS = 2048): creating until the table is full
  * must return ERR_NOMEM (never crash), and joining every worker must
- * free the slots so the system can create threads again. */
+ * free the slots so the system can create threads again.  The fill
+ * bound is deliberately looser than MAX_THREADS: ~24 live service
+ * threads occupy slots at P4 time, so "nearly full" is the goal. */
 static void test_thread_table_exhaustion(void) {
     P4_TEST("thread table exhaustion -> ERR_NOMEM, recoverable");
-    /* Static: 1024 tids × 4 B; a stack-allocated array this size is
+    /* Static: 2048 tids × 4 B; a stack-allocated array this size is
      * fine for init's stack, but static keeps the stack lean. */
-    static int tids[1024];
+    static int tids[2048];
     int        n = 0;
-    for (int i = 0; i < 1100; i++) {
+    for (int i = 0; i < 2100; i++) {
         int tid = thread_create(p4_worker_exit, 0, 10);
         if (tid < 0) {
             P4_ASSERT(tid == ERR_NOMEM, "unexpected thread_create error");
@@ -2249,7 +2251,7 @@ static void test_thread_table_exhaustion(void) {
         }
         tids[n++] = tid;
     }
-    P4_ASSERT(n >= 1000, "could not fill thread table (%d)", n);
+    P4_ASSERT(n >= 2000, "could not fill thread table (%d)", n);
 
     for (int i = 0; i < n; i++)
         thread_join(tids[i], NULL);
@@ -2383,7 +2385,7 @@ int main(void) {
      * and spawn it via SYS_PROCESS_CREATE.  The manager in turn
      * spawns the serial / flaky / shell services as processes. */
     printf("init: spawning service manager process...\n");
-    static char mgr_blob[131072]; /* must hold manager.elf (grew after libc
+    static char mgr_blob[262144]; /* must hold manager.elf (grew after libc
                                      migration: math/time/threads/wchar etc.) */
     int size = blob_get("manager", mgr_blob, sizeof(mgr_blob));
     if (size < 0) {

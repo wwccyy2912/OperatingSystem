@@ -266,7 +266,7 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
         cap_lookup_by_atom(cur->cap_table, cur->subject_id, ATOM_SERVICE_MANAGE, 0) !=
             CAP_NULL) {
         static const char *const s_svc_blobs[] = {
-            "manager", "perm", "pkg", "term", "vfs", "fs_mem_driver"};
+            "manager", "perm", "pkg", "term", "vfs", "fs_mem_driver", "user"};
         for (u64 bi = 0; bi < sizeof(s_svc_blobs) / sizeof(s_svc_blobs[0]); bi++) {
             const void *blob_data = NULL;
             u64         blob_sz   = 0;

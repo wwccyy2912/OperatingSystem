@@ -978,9 +978,23 @@ out:
 }
 
 /* ROLE_SET: management-plane hot reload (§二.2).  The caller's subject
- * comes from ipc_recv_from (the kernel — unforgeable); only OWNER/ADMIN
- * callers may change roles.  Applied immediately; grants are NOT
- * rewritten (grants beat role defaults — §四). */
+ * comes from ipc_recv_from (the kernel — unforgeable); callers may
+ * change roles when they are OWNER/ADMIN by role (the classic
+ * management plane: init is seeded OWNER), or when they are the user
+ * account service itself (SERVICE_MANAGE atom + kernel-issued process
+ * name "user" — init, which also holds the atom, stays gated by role
+ * so a demoted init cannot self-repromote, P1 test 8).  Applied
+ * immediately; grants are NOT rewritten (grants beat role defaults —
+ * §四). */
+static int caller_is_user_service(u64 subject) {
+    if (cap_has_atom(subject, ATOM_SERVICE_MANAGE) != 1)
+        return 0;
+    proc_ident_t ident;
+    if (proc_info_by_subject(subject, &ident) != 0)
+        return 0;
+    return strcmp(ident.name, "user") == 0;
+}
+
 static void do_role_set(int token, int msg_len, u64 caller_subject) {
     perm_resp_role_set_t *resp = (perm_resp_role_set_t *)s_resp;
     if (msg_len < (int)sizeof(perm_req_role_set_t)) {
@@ -989,7 +1003,7 @@ static void do_role_set(int token, int msg_len, u64 caller_subject) {
     }
     perm_req_role_set_t *req = (perm_req_role_set_t *)s_req;
 
-    if (!role_is_management(caller_subject)) {
+    if (!role_is_management(caller_subject) && !caller_is_user_service(caller_subject)) {
         resp->ret = ERR_DENIED; /* apps cannot change policy */
         goto out;
     }

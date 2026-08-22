@@ -342,7 +342,7 @@ static void mem_vol_init(mem_vol_t *vol, const char *mount_name,
  */
 static int mem_sys_load(void)
 {
-        static char blob_buf[131072];
+        static char blob_buf[262144];
 
         mem_vol_init(&s_sys, "System", 1, 0);
 

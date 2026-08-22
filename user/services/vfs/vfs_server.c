@@ -285,7 +285,16 @@ static int vfs_drv_call(u32 vol_index, drv_req_t *req, drv_resp_t *resp) {
 static int
 perm_check(const vfs_resource_t *res, u32 access, const char *url, u64 subject_id, u32 *granted) {
     if (s_perm_port < 0) {
-        s_perm_port = port_get(PERM_PORT_NAME);
+        /* The perm service boots CONCURRENTLY with vfs (manager spawns
+         * them back-to-back).  A request that arrives before perm
+         * registers its port must retry, not fail: this is a startup
+         * race, and the tests exercise the live path immediately. */
+        for (int i = 0; i < 200; i++) {
+            s_perm_port = port_get(PERM_PORT_NAME);
+            if (s_perm_port >= 0)
+                break;
+            sleep(1);
+        }
         if (s_perm_port < 0)
             return s_perm_port;
     }

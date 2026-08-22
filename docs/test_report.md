@@ -129,7 +129,21 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | smoke `--drive`（R3.5 跨重启持久化） | ✅ 65/65 |
 | P4 资源耗尽（2026-08-21 第三轮）：IPC 超长消息边界 ERR_INVAL；线程表 1024 耗尽 ERR_NOMEM + join 释放后恢复 | ✅ 2/2 |
 | P5 零拷贝读路径（2026-08-22）：System blob 经共享池 READ_ONLY 映射，内容与 chunked 读一致 | ✅ 1/1 |
+| 用户账户 + 退出保护（2026-08-22，`scripts/verify_users.py`）：login admin / whoami / useradd bob / users / logout / login bob / bob 越权 stop 被拒(-9) / admin stop pkg 成功 | ✅ 8/8 |
+| 全量回归 + smoke（2026-08-22，MAX_THREADS 1024→2048 后）：classic 33/33 + P1 10/10 + P2 5/5 + P2V 4/4 + KBD 1/1 + P3 1/1 + P4 2/2 + P5 1/1；smoke R1-R3 全量 + `--drive` | ✅ 全绿 |
 
 关键修复：`alloc_thread` 漏清 `force_exit`（SIGKILL 线程槽位回收后新进程在首个
 检查点被静默杀死，code 0）；`ipc_cleanup_process`/`irq_cleanup_process`（进程死亡
 时销毁端口/唤醒阻塞对端/释放注册名与 IRQ 线）；blob 注册 fail-fast。
+
+2026-08-22 追加修复：
+- **login -9 根因**：ROLE_SET 原按调用方角色门控（`role_is_management`），user 账户
+  服务（STANDARD 角色）被拒 → 登录绑定后角色同步失败。改为「OWNER/ADMIN 角色
+  **或**（ATOM_SERVICE_MANAGE + 内核进程名 `user`）」双门控；P1 test 8（降级 init
+  不可自我提权）与 login 角色同步同时满足。
+- **shell `users` 显示 `(%u)` 字面量**：shell_printf 不支持 `%u`，改用 `%d`。
+- **输出字符串 em-dash**：VGA 字体仅覆盖 0x20–0x7E，`—` 渲染为空格，全部改为 ASCII `-`。
+- **TUI 非破坏性弹框**：term 新增 TERM_OP_SNAPSHOT/RESTORE；`tui_confirm` /
+  `tui_input_line` 弹框前后保存/恢复屏幕区域与光标，不再残留对话框边框。
+- **MAX_THREADS 1024→2048**：P4 断言需 1000/1023 槽，user 服务 +1 线程后仅余 999；
+  扩表 + P4 测试同步更新（≥2000）。

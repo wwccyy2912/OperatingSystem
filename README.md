@@ -48,7 +48,20 @@ OpSys 是一个从零开始的 64 位微内核操作系统项目，采用「机�
 
 - VGA 文本模式 + Linear RGB 双模式支持。
 - 状态栏、边框盒子、任意位置文本渲染、光标控制。
+- 交互组件（v1.1）：掩码输入行 `tui_input_line`、确认框 `tui_confirm` —
+  非破坏性覆盖（v1.2 区域快照/恢复：TERM_OP_SNAPSHOT/RESTORE），弹框关闭后
+  底层屏幕原样恢复。
 - Powerbox 权限询问面板集成。
+
+### 用户账户与系统程序退出保护
+
+- **user 账户服务**（独立 Ring 3 进程）：登录/登出/改密/建号/删号/列表；
+  登录把内核签发的 subject 绑定到账户并把角色同步进权限引擎（ROLE_SET）。
+- **角色同步门控**：ROLE_SET 仅放行 OWNER/ADMIN 角色调用方，或持有
+  `ATOM_SERVICE_MANAGE` 且进程名为 `user` 的账户服务（防降级 init 自我提权）。
+- **退出保护**：`stop <svc>` — TUI 确认框 → 当前账户 whoami → 掩码密码 →
+  VERIFY → STOP（user 服务二次校验 OWNER/ADMIN 并拒绝关闭关键服务）。
+- 默认账户 `admin/admin`（OWNER），首次登录后建议 `passwd` 改密。
 
 ### 自有 C Runtime
 
@@ -69,7 +82,7 @@ OpSys 是一个从零开始的 64 位微内核操作系统项目，采用「机�
 │ 用户态服务（Ring 3，独立进程）                                │
 │  init · manager · shell · term · serial · keyboard          │
 │  vfs · fs_mem_driver · fs_virtio_blk_driver                 │
-│  perm · device_mgr · pkg                                    │
+│  perm · device_mgr · pkg · user                             │
 ├─────────────────────────────────────────────────────────────┤
 │ 客户端库（libipc · libos · libc · libfs · libpkg · libtui）  │
 ├─────────────────────────────────────────────────────────────┤

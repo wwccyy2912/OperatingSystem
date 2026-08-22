@@ -50,16 +50,17 @@ u64 rng_range(u64 limit);
 
 /*
  * User thread stack region: [0x90000000, 0x100000000).
- * Each address space gets one MAX_THREADS-page-aligned block
- * (ASLR_STACK_BLOCK = MAX_THREADS * PAGE_SIZE; 4 MB at MAX_THREADS=1024);
- * thread TID maps its single stack page at block_base + tid*PAGE_SIZE,
- * so threads never collide and the base varies per address space.
+ * Each address space gets one MAX_THREADS-block-aligned block
+ * (ASLR_STACK_BLOCK = MAX_THREADS * USER_STACK_PAGES * PAGE_SIZE;
+ * 32 MB at MAX_THREADS=2048); thread TID maps its USER_STACK_PAGES
+ * stack pages at block_base + tid*USER_STACK_PAGES*PAGE_SIZE, so
+ * threads never collide and the base varies per address space.
  * Clear of the ELF image, the fixed test mappings (0x10000000-0x30000000)
  * and the per-process heap region ([heap_base, heap_base+256 MB)).
  */
 #define ASLR_STACK_BASE  0x90000000ULL
 #define ASLR_STACK_END   0x100000000ULL
-#define ASLR_STACK_BLOCK (MAX_THREADS * PAGE_SIZE) /* 4 MB at 1024 */
+#define ASLR_STACK_BLOCK (MAX_THREADS * USER_STACK_PAGES * PAGE_SIZE)
 
 /**
  * Random ASLR_STACK_BLOCK-aligned base for a process's user thread stacks.

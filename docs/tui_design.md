@@ -1,8 +1,8 @@
 # OpSys TUI (Text User Interface) 设计文档
 
-> 版本：v1.0  
-> 日期：2026-08-14  
-> 状态：term 服务侧（term.c，TERM_OP_* 协议）已实现并接入构建；客户端库 user/lib/libtui/tui.c 与演示 user/services/tui_demo/main.c 已实现但**未接入 Makefile**（未编译/链接/spawn），§10 测试计划未执行  
+> 版本：v1.2  
+> 日期：2026-08-22  
+> 状态：term 服务侧（term.c，TERM_OP_* 协议）已实现并接入构建；客户端库 user/lib/libtui/tui.c 已接入（shell 的 login/stop 交互组件、window_demo 等使用）；v1.1 交互组件（输入行/密码行/确认框）与 v1.2 区域快照/恢复已实现并通过 verify_users.py 验证  
 > 关联：user/services/term/term.c、user/lib/libtui/tui.h、user/lib/libtui/tui.c
 
 ---
@@ -208,6 +208,38 @@ term 进程（PID = N）
 - **返回值**：端口号 on success，负数 on error
 - **说明**：自动缓存，无需重复调用
 
+### 3.6 区域快照/恢复（v1.2）
+
+#### `int tui_region_save(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t *cells)`
+
+- **功能**：保存 (x,y) 起 w×h 矩形区域的字符单元格
+- **参数**：
+  - `cells`：输出缓冲，至少 w*h 字节
+- **返回值**：0 on success，负数 on error
+- **限制**：w*h ≤ TUI_MAX_REGION_CELLS (2048)
+
+#### `int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *cells)`
+
+- **功能**：把之前保存的单元格重绘回 (x,y)
+- **返回值**：0 on success，负数 on error
+
+### 3.7 交互组件（v1.1，键盘驱动）
+
+#### `int tui_input_line(int x, int y, const char *prompt, char *buf, int maxlen, int mask)`
+
+- **功能**：在 (x,y) 渲染带提示的输入行，从键盘读一行
+- **参数**：
+  - `mask`：非 0 时每个字符回显为 `*`（密码输入）
+  - `buf`：接收 NUL 结尾字符串
+- **返回值**：读入字符数（≥0），负数 on error
+- **说明**：内部自动保存/恢复被覆盖区域与光标（非破坏性）
+
+#### `int tui_confirm(int x, int y, int w, const char *title, const char *msg, const char *hint)`
+
+- **功能**：渲染带标题/消息/提示行的确认框，读 y/n
+- **返回值**：1（yes）/ 0（no），负数 on error
+- **说明**：内部自动保存/恢复被覆盖区域与光标（非破坏性）
+
 ---
 
 ## 四、协议定义
@@ -240,6 +272,13 @@ typedef struct {
 | 5   | RENDER_LINE | x(u32) + y(u32) + text                                | ret                   | 位置渲染（无光标） |
 | 6   | SET_CURSOR  | x(u32) + y(u32)                                       | ret                   | 设光标             |
 | 7   | GET_CURSOR  | 无                                                    | ret + x(u32) + y(u32) | 查光标             |
+| 8   | SNAPSHOT    | x(u32) + y(u32) + w(u32) + h(u32)                    | ret + cells[w*h]      | 保存单元格区域     |
+| 9   | RESTORE     | x(u32) + y(u32) + w(u32) + h(u32) + cells[w*h]       | ret                   | 恢复单元格区域     |
+
+> **SNAPSHOT/RESTORE（v1.2）**：`w*h ≤ TERM_MAX_REGION_CELLS (2048)`。SNAPSHOT
+> 把矩形区域内的字符单元格拷回客户端；RESTORE 把之前保存的单元格重绘到原位置
+> （非 0x20–0x7E 的字节按空格处理）。这是**非破坏性对话框覆盖**的基础：弹框前
+> 保存区域，关闭后恢复，底层 shell 文本不受影响。
 
 ### 4.3 错误码
 
@@ -252,6 +291,18 @@ typedef struct {
 #define ERR_NOCAP       -3    /* 能力不足 */
 #define ERR_FAULT       -7    /* 内存错误 */
 ```
+
+### 4.4 交互组件（v1.1/v1.2，客户端键盘驱动）
+
+`tui_input_line` / `tui_confirm` 直接对 `keyboard` 服务发 `KBD_OP_READ_BLOCK`
+（阻塞读）。两者都遵循**非破坏性覆盖**协议：
+
+1. `tui_region_save` 保存将被覆盖的区域（输入行 / 对话框矩形）＋ 当前光标；
+2. 渲染组件并循环读键；
+3. 结束后 `tui_region_restore` 恢复区域与光标，屏幕回到弹框前状态。
+
+因此调用方（如 shell 的 `stop` 命令）在弹框结束后可以继续正常输出，屏幕上
+不会残留对话框边框或输入行。
 
 ---
 

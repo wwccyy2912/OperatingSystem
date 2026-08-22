@@ -327,7 +327,6 @@ typedef enum {
 **场景：App `com.editor`（前台，Persona=alice.work）请求打开
 `/Users/alice/Work/report.md`（可写），应用在安装时已声明需要
 `data.user.documents.write`（Timed 30min, Path=/Users/alice/Work/）**
-
 ```
 1. 安装期：pkg.install 流程中 perm-engine 审查声明 →
    生成策略记录 {subject=app.com.editor.uuid, atom=DATA_DOCS_WRITE,
@@ -364,8 +363,53 @@ typedef enum {
 
 ---
 
-## 十、补充八：分阶段实施路线图
+## 九·五、用户账户服务与 ROLE_SET 管理面（2026-08 落地）
 
+### 9.5.1 user 账户服务（user/services/user/main.c）
+
+- **职责**：自然人账户生命周期（LOGIN/LOGOUT/PASSWD/USERADD/USERDEL/USERS/
+  WHOAMI/VERIFY/STOP）。端口名 `user`。
+- **身份绑定**：登录时把内核签发的 `caller_subject`（ipc_recv_from，不可伪造）
+  绑定到账户表项；`whoami` 按调用方 subject 反查。
+- **角色同步**：登录成功后把账户角色写入 perm-engine 的 `s_roles`（ROLE_SET），
+  使「自然人角色」实时成为「进程角色」，VFS/能力门控按此裁决。
+- **启动自举**：账户表为空时创建 `admin/admin`（OWNER），并提示改密
+  （`passwd`）。
+- **密码散列**：FNV-1a-64 + 每账户随机盐（完整性保护，非加密存储；文档明确
+  为演示级）。
+
+### 9.5.2 ROLE_SET 的管理面门控（perm-manager.c do_role_set）
+
+ROLE_SET（热切换角色）是管理面操作。门控条件（二选一）：
+
+1. **角色管理面**：调用方自身角色为 OWNER/ADMIN（`role_is_management`）——
+   经典管理面，init 启动时被 seed 为 OWNER，P1 回归测试依赖此路径；
+2. **user 账户服务**：调用方能力表持有 `ATOM_SERVICE_MANAGE` **且**内核
+   `SYS_PROC_INFO_BY_SUBJECT` 返回的进程名为 `user`（`caller_is_user_service`）。
+   user 服务通过 blob-identity 种子获得该原子（process_desc.c），因此它能
+   以 STANDARD 角色身份替登录用户同步角色。
+
+注意：仅凭 `ATOM_SERVICE_MANAGE` 原子**不足以**放行——init 也持有该原子
+（它 spawn 全部服务），若 P1 测试把 init 降级为 GUEST 后它仍能
+ROLE_SET 自我提权，则违反「管理面不可自升」约束（P1 test 8）。因此原子
+必须与内核签发的进程名绑定，把授权限定在真正的 user 服务上。
+
+其余调用方一律 `ERR_DENIED`。授权依据是内核在 `ipc_recv_from` 交付的
+不可伪造调用方 subject + `proc_info_by_subject` 的不可伪造进程名。
+
+### 9.5.3 系统程序退出保护（stop 命令）
+
+- shell `stop <svc>`：TUI 确认框 → 当前账户 whoami → 掩码密码输入 →
+  `USER_OP_VERIFY`（只验密码不绑定）→ `USER_OP_STOP`。
+- user 服务在 STOP 处理中**二次校验**调用方为 OWNER/ADMIN，并拒绝关闭
+  系统关键服务（serial/term/keyboard/vfs/fs_mem_driver/fs_virtio_blk_driver/
+  perm/manager/user）；kill 由持有 ATOM_SERVICE_MANAGE 的 user 服务执行
+  （shell 不是管理面，无杀进程能力）。
+- 验证：`scripts/verify_users.py`（登录/建号/列号/登出/越权拒杀/管理员杀）。
+
+---
+
+## 十、补充八：分阶段实施路线图
 | Phase | 内容 | 关键交付 | 验收标准 |
 |-------|------|---------|---------|
 | **P0 地基** ✅ | 内核 SubjectID + 消息头身份 + 能力生命周期 | `process_t.subject_id`、`SYS_IPC_RECV_FROM` sender 出参、`cap_entry_t` 扩展（atom/expiry/quota/scope）、`SYS_CAP_CREATE_ATOM`/`SYS_CAP_CONSUME`/`SYS_CAP_REVOKE_BY_ATOM`、`atom.h` 枚举 | 两个进程互冒充身份被拒；能力超时自动失效；批量撤权生效；31/31 测试通过（27 现有 + 4 新增 P0 测试）|

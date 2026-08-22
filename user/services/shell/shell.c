@@ -33,6 +33,8 @@
 #include "../lib/libpkg/pkg.h"  /* libpkg pkg-manager client (pkg_*) */
 #include "../lib/libos/syscalls.h"
 #include "../perm/perm.h" /* Powerbox protocol (perm_answer/perm_revoke) */
+#include "../user/user.h" /* user account protocol */
+#include "../lib/libtui/tui.h" /* interactive TUI components */
 #include <malloc.h>       /* malloc, free */
 #include <stdarg.h>
 #include <stdint.h>
@@ -101,6 +103,14 @@ static int cmd_perm_query(int argc, char *argv[]);
 static int cmd_perm_revoke(int argc, char *argv[]);
 static int cmd_mv(int argc, char *argv[]);
 static int cmd_pkg(int argc, char *argv[]);
+static int cmd_login(int argc, char *argv[]);
+static int cmd_logout(int argc, char *argv[]);
+static int cmd_whoami(int argc, char *argv[]);
+static int cmd_passwd(int argc, char *argv[]);
+static int cmd_useradd(int argc, char *argv[]);
+static int cmd_userdel(int argc, char *argv[]);
+static int cmd_users(int argc, char *argv[]);
+static int cmd_stop(int argc, char *argv[]);
 
 /* ====================================================================
  * Runtime command registry
@@ -526,7 +536,7 @@ static int cmd_pid(int argc, char *argv[]) {
  */
 static int cmd_exec(int argc, char *argv[]) {
     const char *name = (argc > 1) ? argv[1] : "hello";
-    static char blob_buf[131072]; /* must hold the largest demo ELF */
+    static char blob_buf[262144]; /* must hold the largest demo ELF */
     int         size = blob_get(name, blob_buf, sizeof(blob_buf));
     if (size < 0) {
         shell_printf("exec: blob_get(%s) FAILED (%d)\n", name, size);
@@ -1180,7 +1190,7 @@ static int cmd_bm_create(int argc, char *argv[]) {
     if (r < 0) {
         shell_printf("bm_create: FAILED (%d)", r);
         if (r == VFS_ERR_ACCESS)
-            shell_write(" (denied — see term, then perm_answer <id> y, "
+            shell_write(" (denied - see term, then perm_answer <id> y, "
                         "and retry)\n");
         else
             shell_write("\n");
@@ -1499,6 +1509,16 @@ static void shell_main(void *arg) {
     shell_register_command("mv", "Move/rename: mv <src> <dst-dir> [new-name]", cmd_mv);
     shell_register_command("pkg", "pkg-manager: pkg <install|list|run|remove>", cmd_pkg);
 
+    /* User accounts + exit guard */
+    shell_register_command("login", "Log in: login [name] [password]", cmd_login);
+    shell_register_command("logout", "Log out the current account", cmd_logout);
+    shell_register_command("whoami", "Show the logged-in account", cmd_whoami);
+    shell_register_command("passwd", "Change password: passwd [name]", cmd_passwd);
+    shell_register_command("useradd", "Create account (admin): useradd <name> <role> [pw]", cmd_useradd);
+    shell_register_command("userdel", "Delete account (admin): userdel <name>", cmd_userdel);
+    shell_register_command("users", "List accounts (admin)", cmd_users);
+    shell_register_command("stop", "Stop a system program (admin, confirmed): stop <svc>", cmd_stop);
+
     shell_loop();
 }
 
@@ -1513,4 +1533,316 @@ static void shell_main(void *arg) {
 int main(void) {
     shell_main(NULL);
     return 0; /* unreachable */
+}
+
+/* ====================================================================
+ * User account commands (user service, user.h)
+ * ==================================================================== */
+
+static int user_port(void) {
+    static int s_port = -2;
+    if (s_port >= -1)
+        return s_port;
+    s_port = port_get(USER_PORT_NAME);
+    return s_port;
+}
+
+/* user_call: simple request/reply over the "user" port. */
+static int user_call(const void *req, int req_len, void *resp, int resp_len) {
+    int port = user_port();
+    if (port < 0)
+        return port;
+    int rlen = resp_len;
+    int r    = ipc_call(port, req, req_len, resp, &rlen);
+    if (r < 0)
+        return r;
+    return 0;
+}
+
+static const char *role_name(uint32_t role) {
+    switch (role) {
+    case PERM_ROLE_OWNER: return "OWNER";
+    case PERM_ROLE_ADMIN: return "ADMIN";
+    case PERM_ROLE_STANDARD: return "STANDARD";
+    case PERM_ROLE_CHILD: return "CHILD";
+    case PERM_ROLE_GUEST: return "GUEST";
+    case PERM_ROLE_AUDITOR: return "AUDITOR";
+    default: return "?";
+    }
+}
+
+/* login [name] — bind this shell to an account (password via masked
+ * TUI input unless given as the second argument). */
+static int cmd_login(int argc, char *argv[]) {
+    char name[USER_NAME_MAX];
+    char pw[USER_PW_MAX];
+
+    if (argc >= 2) {
+        strncpy(name, argv[1], sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+    } else {
+        if (tui_input_line(5, 30, "User: ", name, sizeof(name), 0) < 0)
+            return -1;
+    }
+    if (argc >= 3) {
+        strncpy(pw, argv[2], sizeof(pw) - 1);
+        pw[sizeof(pw) - 1] = '\0';
+    } else {
+        if (tui_input_line(5, 31, "Password: ", pw, sizeof(pw), 1) < 0)
+            return -1;
+    }
+
+    user_req_login_t req;
+    memset(&req, 0, sizeof(req));
+    req.op = USER_OP_LOGIN;
+    strncpy(req.name, name, sizeof(req.name) - 1);
+    strncpy(req.password, pw, sizeof(req.password) - 1);
+    user_resp_login_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int r = user_call(&req, (int)sizeof(req), &resp, (int)sizeof(resp));
+    if (r < 0) {
+        shell_printf("login: ipc FAILED (%d)\n", r);
+        return -1;
+    }
+    if (resp.ret < 0) {
+        shell_printf("login: FAILED (%d) - bad name or password\n", resp.ret);
+        return -1;
+    }
+    shell_printf("login: ok - '%s' (%s)\n", resp.name, role_name(resp.role));
+    return 0;
+}
+
+static int cmd_logout(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    user_req_login_t req;
+    memset(&req, 0, sizeof(req));
+    req.op = USER_OP_LOGOUT;
+    user_resp_login_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int r = user_call(&req, (int)sizeof(req), &resp, (int)sizeof(resp));
+    if (r < 0 || resp.ret < 0) {
+        shell_printf("logout: FAILED (%d)\n", r < 0 ? r : resp.ret);
+        return -1;
+    }
+    shell_printf("logout: ok\n");
+    return 0;
+}
+
+static int cmd_whoami(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    user_req_login_t req;
+    memset(&req, 0, sizeof(req));
+    req.op = USER_OP_WHOAMI;
+    user_resp_login_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int r = user_call(&req, (int)sizeof(req), &resp, (int)sizeof(resp));
+    if (r < 0) {
+        shell_printf("whoami: ipc FAILED (%d)\n", r);
+        return -1;
+    }
+    if (resp.ret < 0) {
+        shell_printf("whoami: not logged in (%d)\n", resp.ret);
+        return -1;
+    }
+    shell_printf("%s (%s)\n", resp.name, role_name(resp.role));
+    return 0;
+}
+
+/* passwd [name] — change own password (TUI masked input), or another
+ * user's when given a name (requires admin re-auth). */
+static int cmd_passwd(int argc, char *argv[]) {
+    char oldpw[USER_PW_MAX];
+    char newpw[USER_PW_MAX];
+
+    if (tui_input_line(5, 30, "Current password: ", oldpw, sizeof(oldpw), 1) < 0)
+        return -1;
+    if (tui_input_line(5, 31, "New password: ", newpw, sizeof(newpw), 1) < 0)
+        return -1;
+
+    user_req_passwd_t req;
+    memset(&req, 0, sizeof(req));
+    req.op = USER_OP_PASSWD;
+    strncpy(req.old_password, oldpw, sizeof(req.old_password) - 1);
+    strncpy(req.new_password, newpw, sizeof(req.new_password) - 1);
+    if (argc >= 2)
+        strncpy(req.name, argv[1], sizeof(req.name) - 1);
+
+    user_resp_passwd_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int r = user_call(&req, (int)sizeof(req), &resp, (int)sizeof(resp));
+    if (r < 0 || resp.ret < 0) {
+        shell_printf("passwd: FAILED (%d)\n", r < 0 ? r : resp.ret);
+        return -1;
+    }
+    shell_printf("passwd: ok\n");
+    return 0;
+}
+
+/* useradd <name> <role> [password] — create an account (admin only).
+ * Role: owner|admin|standard|child|guest|auditor (or numeric). */
+static int cmd_useradd(int argc, char *argv[]) {
+    if (argc < 3) {
+        shell_write("Usage: useradd <name> <role> [password]\n");
+        return -1;
+    }
+    uint32_t role;
+    if (strcmp(argv[2], "owner") == 0) role = PERM_ROLE_OWNER;
+    else if (strcmp(argv[2], "admin") == 0) role = PERM_ROLE_ADMIN;
+    else if (strcmp(argv[2], "standard") == 0) role = PERM_ROLE_STANDARD;
+    else if (strcmp(argv[2], "child") == 0) role = PERM_ROLE_CHILD;
+    else if (strcmp(argv[2], "guest") == 0) role = PERM_ROLE_GUEST;
+    else if (strcmp(argv[2], "auditor") == 0) role = PERM_ROLE_AUDITOR;
+    else role = (uint32_t)atoi(argv[2]);
+
+    char pw[USER_PW_MAX];
+    if (argc >= 4) {
+        strncpy(pw, argv[3], sizeof(pw) - 1);
+        pw[sizeof(pw) - 1] = '\0';
+    } else {
+        if (tui_input_line(5, 30, "Password for new user: ", pw, sizeof(pw), 1) < 0)
+            return -1;
+    }
+
+    user_req_login_t req;
+    memset(&req, 0, sizeof(req));
+    req.op = USER_OP_USERADD;
+    strncpy(req.name, argv[1], sizeof(req.name) - 1);
+    strncpy(req.password, pw, sizeof(req.password) - 1);
+    req.role = role;
+    user_resp_login_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int r = user_call(&req, (int)sizeof(req), &resp, (int)sizeof(resp));
+    if (r < 0 || resp.ret < 0) {
+        shell_printf("useradd: FAILED (%d)\n", r < 0 ? r : resp.ret);
+        return -1;
+    }
+    shell_printf("useradd: ok - '%s' (%s)\n", argv[1], role_name(role));
+    return 0;
+}
+
+static int cmd_userdel(int argc, char *argv[]) {
+    if (argc < 2) {
+        shell_write("Usage: userdel <name>\n");
+        return -1;
+    }
+    user_req_login_t req;
+    memset(&req, 0, sizeof(req));
+    req.op = USER_OP_USERDEL;
+    strncpy(req.name, argv[1], sizeof(req.name) - 1);
+    user_resp_login_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int r = user_call(&req, (int)sizeof(req), &resp, (int)sizeof(resp));
+    if (r < 0 || resp.ret < 0) {
+        shell_printf("userdel: FAILED (%d)\n", r < 0 ? r : resp.ret);
+        return -1;
+    }
+    shell_printf("userdel: ok\n");
+    return 0;
+}
+
+static int cmd_users(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    user_req_login_t req;
+    memset(&req, 0, sizeof(req));
+    req.op = USER_OP_USERS;
+    user_resp_login_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int r = user_call(&req, (int)sizeof(req), &resp, (int)sizeof(resp));
+    if (r < 0 || resp.ret < 0) {
+        shell_printf("users: FAILED (%d)\n", r < 0 ? r : resp.ret);
+        return -1;
+    }
+    /* reason holds "name role;name role;..." lines. */
+    char *p = resp.reason;
+    shell_printf("Accounts (%d):\n", (int)resp.count);
+    while (*p) {
+        char *semi = strchr(p, ';');
+        if (!semi)
+            break;
+        *semi = '\0';
+        shell_printf("  %s\n", p);
+        p = semi + 1;
+    }
+    return 0;
+}
+
+/* ====================================================================
+ * Exit guard: stop <svc>
+ * 1. TUI confirm dialog 2. admin password (masked) 3. USER_OP_STOP.
+ * The user service re-checks OWNER/ADMIN and refuses system-critical
+ * services; the kill is executed there (shell is not management-plane).
+ * ==================================================================== */
+
+static int cmd_stop(int argc, char *argv[]) {
+    if (argc < 2) {
+        shell_write("Usage: stop <svc-name>\n");
+        return -1;
+    }
+
+    /* 1. Confirm dialog. */
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Stop system program '%s'?", argv[1]);
+    int yes = tui_confirm(20, 14, 60, "Confirm Stop", msg,
+                          "Type y to confirm, n to cancel");
+    if (yes < 0) {
+        shell_printf("stop: dialog error (%d)\n", yes);
+        return -1;
+    }
+    if (!yes) {
+        shell_printf("stop: cancelled\n");
+        return 0;
+    }
+
+    /* 2. Admin password (masked TUI input), verified against the
+     * CURRENTLY LOGGED-IN account. */
+    user_resp_login_t who;
+    memset(&who, 0, sizeof(who));
+    {
+        user_req_login_t wq;
+        memset(&wq, 0, sizeof(wq));
+        wq.op = USER_OP_WHOAMI;
+        int r = user_call(&wq, (int)sizeof(wq), &who, (int)sizeof(who));
+        if (r < 0 || who.ret < 0) {
+            shell_printf("stop: not logged in - run 'login' first (%d)\n", r < 0 ? r : who.ret);
+            return -1;
+        }
+    }
+
+    char pw[USER_PW_MAX];
+    if (tui_input_line(5, 31, "Admin password: ", pw, sizeof(pw), 1) < 0)
+        return -1;
+
+    user_req_login_t vq;
+    memset(&vq, 0, sizeof(vq));
+    vq.op = USER_OP_VERIFY;
+    strncpy(vq.name, who.name, sizeof(vq.name) - 1);
+    strncpy(vq.password, pw, sizeof(vq.password) - 1);
+    user_resp_login_t vr;
+    memset(&vr, 0, sizeof(vr));
+    int r = user_call(&vq, (int)sizeof(vq), &vr, (int)sizeof(vr));
+    if (r < 0 || vr.ret < 0) {
+        shell_printf("stop: wrong password or verification failed (%d)\n", r < 0 ? r : vr.ret);
+        return -1;
+    }
+
+    /* 3. Execute the stop (service re-checks OWNER/ADMIN + critical). */
+    user_req_stop_t sq;
+    memset(&sq, 0, sizeof(sq));
+    sq.op = USER_OP_STOP;
+    strncpy(sq.svc, argv[1], sizeof(sq.svc) - 1);
+    user_resp_stop_t sr;
+    memset(&sr, 0, sizeof(sr));
+    r = user_call(&sq, (int)sizeof(sq), &sr, (int)sizeof(sr));
+    if (r < 0 || sr.ret < 0) {
+        shell_printf("stop: FAILED (%d)%s%s\n",
+                     r < 0 ? r : sr.ret,
+                     sr.detail[0] ? " — " : "",
+                     sr.detail);
+        return -1;
+    }
+    shell_printf("stop: %s\n", sr.detail);
+    return 0;
 }

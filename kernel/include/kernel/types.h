@@ -88,16 +88,25 @@ typedef u32 rights_t;
  * user thread stack region (ASLR_STACK_BLOCK = MAX_THREADS * PAGE_SIZE).
  *
  * Raised from 256 to 1024 so a single process can run 1000+ concurrent
- * threads (stress test).  Static memory cost at 1024:
- *   - s_cap_tables:       1024 x 8 B = 8 KB (BSS, pointer array only)
- *   - s_thread_table:     ~0.3 MB
- *   - s_process_table:    ~0.7 MB
- *   - ASLR stack region:  1024 pages = 4 MB virtual (fits in the
+ * threads (stress test), then to 2048 so the P4 exhaustion test can
+ * fill the table even with ~24 live service threads (the old assert
+ * needed 1000 of 1023 usable slots — the user service's single thread
+ * tipped it to 999).  Static memory cost at 2048:
+ *   - s_cap_tables:       2048 x 8 B = 16 KB (BSS, pointer array only)
+ *   - s_thread_table:     ~0.6 MB
+ *   - s_process_table:    ~1.4 MB
+ *   - ASLR stack region:  2048 x 4 pages = 32 MB virtual (fits in the
  *     [0x90000000, 0x100000000) block; physical only when touched)
  *   - Cap tables themselves are dynamically allocated (~73 KB each via
  *     pmm_alloc_pages) — ~1 MB total for 14 live processes.
  */
-#define MAX_THREADS  1024
+#define MAX_THREADS  2048
+
+/* User stack size per thread (4 pages = 16 KiB).  Service processes
+ * (vfs/term/shell…) run deep call chains on this stack; a single page
+ * overflows once the code grows (observed: vfs SIGSEGV at the stack
+ * bottom).  Also sizes ASLR_STACK_BLOCK (rng.h). */
+#define USER_STACK_PAGES 4
 #define MAX_PORTS    256
 #define MAX_CAPS     1024
 #define MAX_MSG_SIZE 4096

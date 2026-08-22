@@ -99,6 +99,7 @@ static service_t s_services[] = {
     {"device_mgr", -1, 0, 1},           /* PCI device manager       */
     {"pkg", -1, 0, 1},                  /* .ops app container manager */
     {"shell", -1, 0, 1},
+    {"user", -1, 0, 1}, /* user account service (login/passwd/stop guard) */
 };
 
 /* Restartable services (production hardening): crash → auto-restart up
@@ -119,6 +120,7 @@ static service_t s_services[] = {
 #define SVC_DEVICE_MGR    8
 #define SVC_PKG           9
 #define SVC_SHELL         10
+#define SVC_USER          11
 
 /* ====================================================================
  * Serial service output (mirrors shell.c)
@@ -348,11 +350,11 @@ static void serial_test_run(void) {
  * immediately after.
  */
 static int spawn_service(service_t *svc, int quiet) {
-    char *blob_buf = malloc(131072); /* must hold the largest service ELF */
+    char *blob_buf = malloc(262144); /* must hold the largest service ELF */
     if (!blob_buf)
         return ERR_NOMEM;
 
-    int size = blob_get(svc->name, blob_buf, 131072);
+    int size = blob_get(svc->name, blob_buf, 262144);
     if (size < 0) {
         free(blob_buf);
         if (!quiet)
@@ -417,7 +419,7 @@ static void service_monitor(void *arg) {
  * during the boot sequence, so it is not restarted here.)
  */
 static void start_service_monitors(void) {
-    static const int s_restartable[] = {SVC_PERM, SVC_PKG, SVC_DEVICE_MGR, SVC_SHELL};
+    static const int s_restartable[] = {SVC_PERM, SVC_PKG, SVC_DEVICE_MGR, SVC_SHELL, SVC_USER};
     for (u32 i = 0; i < sizeof(s_restartable) / sizeof(s_restartable[0]); i++) {
         int tid = thread_create(service_monitor, (void *)&s_services[s_restartable[i]], 10);
         if (tid < 0)
@@ -576,6 +578,11 @@ int main(void) {
      * spawn is deliberately silent (no "shell started (PID=..)" log):
      * printing it after process_create() would let the fresh shell run
      * mid-print and interleave the boot log. */
+    manager_write("manager: starting user service\n");
+    if (spawn_service(&s_services[SVC_USER], 0) < 0)
+        for (;;)
+            thread_yield();
+
     manager_write("manager: starting shell\n");
     (void)spawn_service(&s_services[SVC_SHELL], 1);
 

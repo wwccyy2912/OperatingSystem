@@ -31,8 +31,13 @@
 #define TUI_OP_RENDER_LINE 5 /* render line at (x,y) */
 #define TUI_OP_SET_CURSOR  6 /* set cursor position */
 #define TUI_OP_GET_CURSOR  7 /* query cursor position */
+#define TUI_OP_SNAPSHOT    8 /* save a cell region: {x,y,w,h} -> cells[] */
+#define TUI_OP_RESTORE     9 /* redraw a saved cell region: {x,y,w,h,cells} */
 
 #define TUI_MAX_TEXT 256 /* max payload per operation */
+
+/* Snapshot/restore region cap (must match term.c TERM_MAX_REGION_CELLS). */
+#define TUI_MAX_REGION_CELLS 2048
 
 /* ====================================================================
  * Basic output
@@ -126,4 +131,43 @@ int tui_port_get(void);
  */
 int tui_printf(const char *fmt, ...);
 
+/* ====================================================================
+ * Region snapshot/restore (v1.2): save a rectangular block of screen
+ * cells and redraw it later.  The basis for non-destructive dialog
+ * overlays: save the area under a dialog, render the dialog, then
+ * restore the area when it closes.  Cells are plain ASCII.
+ * ==================================================================== */
+
+/**
+ * Save the w*h cells of the region at (x,y) into cells[] (which must
+ * hold at least w*h bytes; w*h must not exceed TUI_MAX_REGION_CELLS).
+ * Returns 0 on success, negative error on failure.
+ */
+int tui_region_save(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t *cells);
+
+/**
+ * Redraw the w*h cells previously saved by tui_region_save at (x,y).
+ * Returns 0 on success, negative error on failure.
+ */
+int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *cells);
+
 #endif /* LIBTUI_TUI_H */
+
+/* ====================================================================
+ * Interactive components (v1.1): input line, password line, confirm box.
+ * These read the keyboard service directly (READ_BLOCK).  They are
+ * intended for use while the caller has NO parked keyboard read (e.g.
+ * a shell between commands); with focus free, READ_BLOCK delivers keys.
+ * ==================================================================== */
+
+/* Render a labelled input line at (x,y) and read a line from the
+ * keyboard.  When mask != 0 every typed character is echoed as '*'
+ * (password entry).  Returns the number of characters read (>=0), or
+ * a negative error.  buf receives the NUL-terminated line. */
+int tui_input_line(int x, int y, const char *prompt, char *buf, int maxlen, int mask);
+
+/* Render a titled confirmation dialog centered around (x,y) with a
+ * message and a hint line, then read y/n.  Returns 1 (yes), 0 (no),
+ * or a negative error. */
+int tui_confirm(int x, int y, int w, const char *title, const char *msg,
+                const char *hint);

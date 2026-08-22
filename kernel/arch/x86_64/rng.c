@@ -110,8 +110,9 @@ u64 rng_range(u64 limit) {
 /* ------------------------------------------------------------------ */
 
 u64 aslr_stack_base(void) {
-    /* One ASLR_STACK_BLOCK (MAX_THREADS pages, 4 MB at 1024) per
-     * possible thread; pick a random block. */
+    /* One ASLR_STACK_BLOCK (MAX_THREADS * USER_STACK_PAGES pages,
+     * 32 MB at MAX_THREADS=2048) per possible thread; pick a random
+     * block. */
     u64 region = ASLR_STACK_END - ASLR_STACK_BASE;
     u64 blocks = region / ASLR_STACK_BLOCK;
     return ASLR_STACK_BASE + rng_range(blocks) * ASLR_STACK_BLOCK;

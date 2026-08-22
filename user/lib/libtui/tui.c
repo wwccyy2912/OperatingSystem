@@ -268,3 +268,209 @@ int tui_printf(const char *fmt, ...) {
     buf[len] = '\0';
     return tui_write(buf, (u32)len);
 }
+
+/* ====================================================================
+ * Region snapshot/restore (v1.2)
+ * ==================================================================== */
+
+int tui_region_save(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t *cells) {
+    if (!cells || w == 0 || h == 0 || (uint64_t)w * h > TUI_MAX_REGION_CELLS)
+        return -2; /* ERR_INVAL */
+
+    int port = tui_port_get();
+    if (port < 0)
+        return port;
+
+    u32 *req = (u32 *)s_req;
+    req[0]   = TUI_OP_SNAPSHOT;
+    req[1]   = 16; /* payload: x,y,w,h */
+    req[2]   = x;
+    req[3]   = y;
+    req[4]   = w;
+    req[5]   = h;
+
+    int resp_len = (int)sizeof(s_resp);
+    int ret      = ipc_call(port, s_req, 8 + 16, s_resp, &resp_len);
+    if (ret < 0)
+        return ret;
+    if (resp_len < 4)
+        return -1;
+    i32 r = *(i32 *)s_resp;
+    if (r < 0)
+        return r;
+    memcpy(cells, s_resp + 4, (size_t)(w * h));
+    return 0;
+}
+
+int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *cells) {
+    if (!cells || w == 0 || h == 0 || (uint64_t)w * h > TUI_MAX_REGION_CELLS)
+        return -2; /* ERR_INVAL */
+
+    int port = tui_port_get();
+    if (port < 0)
+        return port;
+
+    u32 *req = (u32 *)s_req;
+    req[0]   = TUI_OP_RESTORE;
+    req[1]   = 16 + (u32)(w * h);
+    req[2]   = x;
+    req[3]   = y;
+    req[4]   = w;
+    req[5]   = h;
+    memcpy(s_req + 8 + 16, cells, (size_t)(w * h));
+
+    int resp_len = (int)sizeof(s_resp);
+    int ret      = ipc_call(port, s_req, 8 + 16 + (int)(w * h), s_resp, &resp_len);
+    if (ret < 0)
+        return ret;
+    if (resp_len < 4)
+        return -1;
+    return *(i32 *)s_resp;
+}
+
+/* ====================================================================
+ * Interactive components (v1.1)
+ * ==================================================================== */
+
+static int s_tui_kbd_port = -2; /* -2 unresolved, -1 failed, >=0 port */
+
+static int tui_kbd_get(void) {
+    if (s_tui_kbd_port >= -1)
+        return s_tui_kbd_port;
+    s_tui_kbd_port = port_get("keyboard");
+    return s_tui_kbd_port;
+}
+
+/* Read one key (READ_BLOCK, ASCII char in data[0]). */
+static int tui_kbd_read_key(u8 *key) {
+    int port = tui_kbd_get();
+    if (port < 0)
+        return -1;
+    u32 *req = (u32 *)s_req;
+    req[0]   = 2; /* KBD_OP_READ_BLOCK */
+    req[1]   = 1; /* max data bytes */
+    int  resp_len = (int)sizeof(s_resp);
+    if (ipc_call(port, s_req, 8, s_resp, &resp_len) < 0 || resp_len < 4)
+        return -1;
+    if (key)
+        *key = s_resp[4];
+    return *(i32 *)s_resp;
+}
+
+int tui_input_line(int x, int y, const char *prompt, char *buf, int maxlen, int mask) {
+    if (!buf || maxlen <= 1)
+        return -1;
+
+    /* Non-destructive overlay: save the cells the prompt line will
+     * cover plus the cursor, and restore both before returning. */
+    int  plen = prompt ? (int)strlen(prompt) : 0;
+    u32  rw   = (u32)(plen + maxlen + 1);
+    u8   saved[TUI_MAX_REGION_CELLS];
+    int  has_saved = 0;
+    u32  cx = 0, cy = 0;
+    int  have_cursor = 0;
+    if (rw <= TUI_MAX_REGION_CELLS && tui_region_save((u32)x, (u32)y, rw, 1, saved) == 0) {
+        has_saved = 1;
+        if (tui_get_cursor(&cx, &cy) == 0)
+            have_cursor = 1;
+    }
+
+    int pos = 0;
+    buf[0]  = '\0';
+    for (;;) {
+        /* Render prompt + masked content + cursor marker. */
+        char disp[256];
+        int  d = 0;
+        if (prompt) {
+            while (prompt[d] && d < (int)sizeof(disp) - 2) {
+                disp[d] = prompt[d];
+                d++;
+            }
+        }
+        for (int i = 0; i < pos && d < (int)sizeof(disp) - 2; i++)
+            disp[d++] = mask ? '*' : buf[i];
+        disp[d++] = '_'; /* cursor */
+        disp[d]   = '\0';
+        tui_render_line_at(x, y, disp, (u32)d);
+        tui_set_cursor((u32)(x + d), (u32)y);
+
+        u8 key = 0;
+        if (tui_kbd_read_key(&key) < 0) {
+            if (has_saved) {
+                (void)tui_region_restore((u32)x, (u32)y, rw, 1, saved);
+                if (have_cursor)
+                    (void)tui_set_cursor(cx, cy);
+            }
+            return -1;
+        }
+        if (key == '\r' || key == '\n') {
+            break;
+        } else if (key == '\b' || key == 0x7F) {
+            if (pos > 0)
+                pos--;
+        } else if (key >= ' ' && key < 0x7F) {
+            if (pos < maxlen - 1)
+                buf[pos++] = (char)key;
+        }
+        buf[pos] = '\0';
+    }
+    buf[pos] = '\0';
+
+    /* Restore the covered region and the previous cursor position. */
+    if (has_saved) {
+        (void)tui_region_restore((u32)x, (u32)y, rw, 1, saved);
+        if (have_cursor)
+            (void)tui_set_cursor(cx, cy);
+    }
+    return pos;
+}
+
+int tui_confirm(int x, int y, int w, const char *title, const char *msg, const char *hint) {
+    if (w < 16)
+        w = 16;
+    if (w > 100)
+        w = 100;
+
+    /* Non-destructive overlay: snapshot the dialog rectangle. */
+    u8  saved[TUI_MAX_REGION_CELLS];
+    int has_saved = 0;
+    u32 cx = 0, cy = 0;
+    int have_cursor = 0;
+    if ((u64)w * 5 <= TUI_MAX_REGION_CELLS &&
+        tui_region_save((u32)x, (u32)y, (u32)w, 5, saved) == 0) {
+        has_saved = 1;
+        if (tui_get_cursor(&cx, &cy) == 0)
+            have_cursor = 1;
+    }
+
+    tui_render_box(x, y, (u32)w, 5, title);
+    if (msg)
+        tui_render_line_at(x + 2, (u32)(y + 2), msg, (u32)strlen(msg));
+    if (hint)
+        tui_render_line_at(x + 2, (u32)(y + 3), hint, (u32)strlen(hint));
+
+    int result = -1;
+    for (;;) {
+        u8 key = 0;
+        if (tui_kbd_read_key(&key) < 0) {
+            result = -1;
+            break;
+        }
+        if (key == 'y' || key == 'Y') {
+            result = 1;
+            break;
+        }
+        if (key == 'n' || key == 'N') {
+            result = 0;
+            break;
+        }
+    }
+
+    /* Restore the covered region and the previous cursor position. */
+    if (has_saved) {
+        (void)tui_region_restore((u32)x, (u32)y, (u32)w, 5, saved);
+        if (have_cursor)
+            (void)tui_set_cursor(cx, cy);
+    }
+    return result;
+}

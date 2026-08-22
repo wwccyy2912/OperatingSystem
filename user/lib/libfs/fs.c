@@ -477,3 +477,31 @@ int fs_move_item(const char      *src,
         *out_item = resp->item;
     return 0;
 }
+
+/* Phase 3 zero-copy read: map the file's backing pool pages READ-ONLY
+ * into the caller at `map_virt` (a vspace_alloc()'d range).  Returns
+ * the mapped size in bytes (>= 0), or a negative error — ERR_NOENT
+ * means the file is not pool-backed and the caller should fall back to
+ * chunked fs_read(). */
+int fs_read_map(vfs_handle_t handle, void *map_virt, u32 *mapped_size) {
+    int port = fs_port();
+    if (port < 0)
+        return port;
+
+    vfs_req_read_map_t *req = (vfs_req_read_map_t *)s_req;
+    memset(req, 0, sizeof(*req));
+    req->op       = VFS_OP_READ_MAP;
+    req->handle   = handle;
+    req->map_virt = map_virt;
+
+    vfs_resp_read_map_t *resp     = (vfs_resp_read_map_t *)s_resp;
+    int                  resp_len = (int)sizeof(*resp);
+    int                  r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    if (r < 0)
+        return r;
+    if (resp->ret < 0)
+        return resp->ret;
+    if (mapped_size)
+        *mapped_size = (u32)resp->ret;
+    return 0;
+}

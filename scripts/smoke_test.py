@@ -321,7 +321,7 @@ VGA_SCENARIOS = [
 
 # Serial scenarios: no input, wait for service output in serial log.
 SERIAL_ANCHORS = [
-    ("regression classic", r"=== Results: 31/31 passed ==="),
+    ("regression classic", r"=== Results: 33/33 passed ==="),  # +FPU/SSE, +IPC peer-death
     ("regression P1",      r"=== P1 Permissions: 10/10 passed ==="),
     # P2 gate/P2V: summaries are now reliable - the sys_debug_log token
     # bucket (kernel/syscall/syscall.c DEBUG_LOG_TICK_BUDGET 512 + bucket
@@ -329,7 +329,7 @@ SERIAL_ANCHORS = [
     # The first-test-line alternates stay as belt-and-suspenders against a
     # future budget regression.
     ("regression P2 gate",
-     r"(=== P2 Gate: 3/3 passed ===|P2: set_time unauthorized -> ERR_NOCAP \.\.\. PASS)"),
+     r"(=== P2 Gate: 5/5 passed ===|P2: set_time unauthorized -> ERR_NOCAP \.\.\. PASS)"),
     ("regression P2V",
      r"(=== P2 VFS: 4/4 passed ===|P2V: OPEN: unauthorized WRITE denied)"),
     # R2.1 keyboard focus ownership (init KBD_OP direct IPC round-trip;
@@ -370,8 +370,8 @@ def run_powerbox_flow():
          r"bm_create: ok, \d+-byte bookmark cached"),
         ("bm_resolve", "bm_resolve",
          r"bm_resolve: handle -?\d+, item 'a\.txt' \(id \d+\), access \d+"),
-        ("mv", "move /Users/a.txt /Users b.txt",
-         r"move: 'b\.txt' -> item \d+ \(size \d+\)"),
+        ("mv", "mv /Users/a.txt /Users b.txt",
+         r"mv: 'b\.txt' -> item \d+ \(size \d+\)"),
         ("bm_resolve after move", "bm_resolve",
          r"bm_resolve: handle -?\d+, item 'b\.txt'"),
         ("perm_revoke", "perm_revoke", r"perm_revoke: \d+ grant\(s\) dropped"),
@@ -537,11 +537,12 @@ def run_round3_flow():
         print("  %s R3.2 alive after fill" % ("OK" if passed else "FAIL"))
         ok = ok and passed
 
-    # R3.3: spawn uses the kernel blob (not the pkg store), so it works
+    # R3.3: exec uses the kernel blob (not the pkg store), so it works
     # even after R2.4 removed hello from the store.
     base = len(re.findall(r"hello: signal self-test PASSED", read_log()))
     for i in range(3):
-        passed = run_vga_cmd("exec", r"spawn: created PID \d+", 20,
+        # cmd_exec prints "exec: created PID <n>" (shell rename 6918a97).
+        passed = run_vga_cmd("exec", r"exec: created PID \d+", 20,
                              "R3.3 spawn #%d" % (i + 1))
         print("  %s R3.3 spawn #%d" % ("OK" if passed else "FAIL", i + 1))
         ok = ok and passed
@@ -596,7 +597,7 @@ def run_disk_persist_flow():
     offset = len(read_log())
     print("    system_reset...", flush=True)
     mon_cmd("system_reset")
-    if not wait_serial_since(offset, r"proc: CREATE pid=16 name=shell",
+    if not wait_serial_since(offset, r"proc: CREATE pid=\d+ name=shell",
                              BOOT_TIMEOUT, "reboot shell"):
         print("  FAIL reboot (no shell CREATE)")
         return False
@@ -634,7 +635,7 @@ def main():
 
     # --- boot: serial shell CREATE, then VGA prompt -------------------------
     print("[boot] waiting for shell process + VGA prompt...", flush=True)
-    if not wait_serial(r"proc: CREATE pid=16 name=shell", BOOT_TIMEOUT,
+    if not wait_serial(r"proc: CREATE pid=\d+ name=shell", BOOT_TIMEOUT,
                        "shell CREATE"):
         print("BOOT FAILED (no shell process)")
         dump_tail()

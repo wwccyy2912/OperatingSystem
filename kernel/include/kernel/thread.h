@@ -94,16 +94,20 @@ typedef struct thread {
     /* CFS scheduler: virtual runtime and RB tree node */
     u64       vruntime; /* Accumulated weighted runtime */
     rb_node_t rb;       /* RB tree node (key = vruntime) */
-
-    /* FPU state index — points into s_fpu_state[] in sched.c.
-     * Stored as tid so we don't need a pointer chase. */
-    bool fpu_used; /* true once thread has executed FP code */
 } thread_t;
 
 /**
  * Initialize the thread subsystem.
  */
 void thread_init(void);
+
+/**
+ * Seed a thread's FPU/SSE state slot to the x86 hardware defaults
+ * (all exceptions masked).  Called at thread creation AND slot reuse;
+ * keeps fpu_switch's fxrstor always valid.
+ * @param tid Thread whose slot to seed.
+ */
+void fpu_state_init(tid_t tid);
 
 /**
  * Create a new kernel thread.

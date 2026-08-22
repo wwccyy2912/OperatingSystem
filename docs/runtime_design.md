@@ -449,32 +449,35 @@ void *malloc(size_t size)
 
 ### 6.1 概述
 
-OpenSys 实现了 POSIX 风格的进程级信号，支持：
+OpSys 实现了 POSIX 风格的进程级信号（Ring 3 语义，kernel_roadmap.md D4/P2）：
 
 - 64 个信号（SIGKILL 9、SIGUSR1 10、SIGSEGV 11 等）
-- Per-process handler table（`proc->sig_handlers[]`）
+- **信号语义在 Ring 3**：per-process handler table 存于用户内存
+  （`user/runtime/signal_user.c` 的 `s_handlers[]`），内核 TCB 无感知
 - Process-wide pending bitmask（`proc->sig_pending`）
 - Lazy delivery via checkpoints（syscall return、interrupt return）
 
-> 注：用户态仅薄封装，内核 process/signal.c 仍为投递引擎；完整用户态信号库迁移 ⏸（见 kernel_roadmap §4.2 P2）
+> 迁移状态：✅ 已完成（2026-08-21）。内核 `process/signal.c` 仅保留投递
+> 机制（checkpoint 时快照中断上下文到 sigframe、改写 RIP/RDI/RSP 进入
+> Ring 3 dispatcher）；`signal()` 注册为纯用户态表槽交换（无 syscall）；
+> `sigrestore.S` 已删除。见 `user/runtime/signal_user.c`。
 
 ### 6.2 信号处理函数注册
 
-**文件**：`user/lib/libos/syscalls.h`
+**文件**：`user/runtime/signal_user.c`（API 声明在 `user/lib/libos/syscalls.h`）
 
 ```c
 typedef void (*sighandler_t)(int);
 
 sighandler_t signal(int signum, sighandler_t handler)
 {
-    /* 注册处理函数或获取当前处理函数 */
+    /* 纯用户态：交换 s_handlers[] 表槽，无 syscall */
     /* 成功返回前一个处理函数，失败返回 SIG_ERR */
 }
 
 int kill(int pid, int signum)
 {
-    /* 向进程发送信号 */
-    /* 返回 0 或错误码 */
+    /* syscall：内核仅置位 sig_pending；语义由 dispatcher 决定 */
 }
 ```
 
@@ -493,67 +496,71 @@ signal(SIGTERM, SIG_IGN);   /* 忽略 SIGTERM */
 signal(SIGSEGV, SIG_DFL);   /* 默认处理（通常终止） */
 ```
 
-### 6.3 内核信号传递（kernel/process/signal.c）
+### 6.3 内核投递机制（kernel/process/signal.c）
 
 **传递流程**：
 
-1. kill(pid, sig) → proc->sig_pending |= (1LL << sig)
+1. kill(pid, sig) → 内核 `proc->sig_pending |= (1LL << sig)`（仅置位）
 2. Checkpoint 检测（syscall return、interrupt return）
-3. signal_check_common() 查找待处理的信号
-4. 若 SIG_DFL：执行默认动作（ignore 或 terminate）
-5. 若 SIG_IGN：忽略
-6. 若处理函数：构建 sigframe，跳转到处理函数
+3. `signal_check_common()` 取最低位待处理信号；无 dispatcher 则保持
+   pending 重试
+4. 构建 sigframe 于用户栈，改写 RIP = `sig_dispatcher`、RDI = sigframe
+   base、RSP = base - 8，返回用户态进入 Ring 3 dispatcher
+5. `__sig_dispatcher`（signal_user.c）查表决定：
+   - SIG_IGN → `SYS_SIGRETURN` 恢复上下文
+   - SIG_DFL → 默认动作（SIGSEGV/SIGPIPE/SIGALRM/SIGTERM 以
+     `exit(128+signum)` 终止；其余忽略）
+   - 用户 handler → 调用 handler，然后 `SYS_SIGRETURN` 恢复上下文
+
+SIGKILL 不可捕获/忽略：内核在 kill() 路径直接 `signal_kill_process()`
+强制退出（进程生命周期，不属于信号语义）。
 
 ### 6.4 sigframe 布局
 
-**文件**：`kernel/include/kernel/signal.h`
+**文件**：`kernel/include/kernel/signal.h`（ABI：内核投递 ⇄ Ring 3 dispatcher）
 
 ```
-User stack during signal handling:
+User stack during signal delivery:
 
   high addr   [original user stack...]
-              [interruped context]
+              [interrupted context]
 
               ┌─────────────────────────────────┐
               │ sigframe_t (152 bytes):         │
               │  - 15 GPRs (rax-r15)            │
-              │  - rip (handler return addr)    │
+              │  - rip (被中断的指令指针)        │
               │  - rflags                       │
               │  - rsp (original stack ptr)     │
               │  - signum (signal number)       │
               └─────────────────────────────────┤
-              │ [8-byte restorer addr]          │  ← RSP at handler entry
-              │ (__restore_rt)                  │
+              │ [8-byte ZEROED slot]            │  ← dispatcher entry RSP
+              │ (必须经 SYS_SIGRETURN 返回，    │
+              │  绝不可 ret —— 会跳到零槽)      │
   low addr    (aligned to 16-byte boundary)
 ```
 
-### 6.5 用户态信号返回跳板（sigrestore.S）
+### 6.5 Ring 3 dispatcher（signal_user.c）
 
-**文件**：`user/runtime/sigrestore.S`
+**文件**：`user/runtime/signal_user.c`
 
-```asm
-__restore_rt:
-    ; RSP = sigframe base
-    ; 处理函数的 ret 弹出 [RSP-8] = __restore_rt
-    ; 控制流到达这里
-
-    mov rdi, rsp         ; sigframe 基址 → RDI
-    mov eax, 50          ; SYS_SIGRETURN
-    int 0x80
-
-    ; 不应该返回
-.halt:
-    hlt
-    jmp .halt
+```c
+void __sig_dispatcher(unsigned long frame_base) {
+    /* RDI = sigframe base（内核改写） */
+    /* 查 s_handlers[signum]：SIG_IGN → SYS_SIGRETURN 恢复；
+     * SIG_DFL → 默认动作（终止或忽略）；
+     * handler → 调用后 SYS_SIGRETURN 恢复。 */
+}
 ```
+
+**注册**：C runtime 的 `.init_array` constructor 在进程启动时调用一次
+`SYS_SIGNAL(dispatcher)` 注册 dispatcher 地址；此后任何 kill() 都可投递。
 
 **生命周期**：
 
-1. 内核设置 RIP = handler，RSP = base - 8，RDI = signum
-2. 处理函数执行（可以调用 malloc、printf 等）
-3. 处理函数 ret → \_\_restore_rt
-4. \_\_restore_rt 调用 SYS_SIGRETURN
-5. 内核从 sigframe 恢复原始上下文，继续执行被中断的代码
+1. 内核 checkpoint 构建 sigframe，进入 `__sig_dispatcher`（RDI = base）
+2. dispatcher 查表决定忽略/默认/调用 handler
+3. 无论哪条路径，最终 `sys_call(SYS_SIGRETURN, base)`
+4. 内核从 sigframe 恢复原始上下文，继续执行被中断的代码
 
 ---
 

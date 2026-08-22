@@ -56,6 +56,14 @@ port_t ipc_port_create(void);
 void ipc_port_destroy(port_t port);
 
 /**
+ * Tear down every IPC resource owned by a dying process: destroy its
+ * ports (waking all blocked peers with ERR_NOENT) and drop its
+ * registry names.  Called from process_reap().
+ * @param pid  PID of the dying process.
+ */
+void ipc_cleanup_process(pid_t pid);
+
+/**
  * Send a message to a port (blocking if port has no receiver).
  * @param port  Destination port.
  * @param msg   Message data.

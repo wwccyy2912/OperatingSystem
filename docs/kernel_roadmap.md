@@ -121,9 +121,9 @@
 | 阶段 | 工作 | 说明 | 验证 |
 |---|---|---|---|
 | **P0** | Mutex Fast-Path：用户态 spinlock 封装 | `libos` 提供 `user_spinlock`（原子 CAS，无竞争 0 syscall），竞争时 `thread_yield()` | ✅ 完成：`user/lib/libos/spinlock.h`（CAS+yield），`malloc` 无竞争 0 syscall |
-| **P3** | Futex 化内核 Mutex | 无竞争纯原子 + 竞争排队；**SMP 阶段实施** | 多核竞争基准 |
-| **P3** | IPC 多活动调用 | 当前 `s_active_call` 每端口单活动调用，多客户端排队 | vfs 并发基准 |
-| **P3** | 零拷贝读路径 | `CAP_TYPE_MEM` 映射文件页，绕开 4096 上限（vfs_design §8.4） | cat 大文件基准 |
+| **P3** | Futex 化内核 Mutex | 无竞争纯原子 + 竞争排队；**SMP 阶段实施** | ⏸ 推迟到 SMP（单核收益有限） |
+| **P3** | IPC 多活动调用 | 当前 `s_active_call` 每端口单活动调用，多客户端排队 | ✅ 已完成（v0.2/v0.3：`s_reply_wait` 每端口链表 + 代际令牌 + `ipc_abort_wait`；manager monitor 线程与 shell 并发调 serial 验证通过） |
+| **P3** | 零拷贝读路径 | `CAP_TYPE_MEM` 映射文件页，绕开 4096 上限（vfs_design §8.4） | ✅ 已完成（2026-08-22）：内核 `SYS_SHM_CREATE`/`SYS_SHM_MAP`（管理原子门控 + 池表校验 + 只读映射）；fs_mem_driver 共享页池存储（bump 分配，增长迁移堆回退）；vfs `VFS_OP_READ_MAP`（授权重查 + 导出）；libfs `fs_read_map`；P5 回归（映射内容 == chunked 读） |
 | **P1 配套** | SYS_MAP_MEMORY 支持设备 MMIO | virtio-blk/net DMA 环前提 | virtio 驱动 |
 
 ### 4.2 实用性方向（可运行、可验证优先）
@@ -135,7 +135,7 @@
 | **P1** | 新增 `SYS_VSPACE_ALLOC` | 无 | ✅ 完成：`kernel/mm/vspace.c`（383 行），分配 + 映射 + 错误路径（`ERR_INVAL`），`init` 测试验证通过 |
 | **P1** | ELF 加载器移 Ring 3 | SYS_VSPACE_ALLOC | ✅ 完成：`kernel/mm/elf.c` → `elf_boot.c`（仅保留 init 加载器）；解析移入 `user/lib/libos/elf_parse.c`，`sys_process_create` 改描述符式（`proc_image_desc_t`） |
 | **P2** | 新增 `SYS_THREAD_SET_CTX` | 无 | ✅ 完成：`kernel/sched/thread_ctx.c` + `thread_ctx.h`（101 行），seL4 `TCB_WriteRegisters` 等价物；`_Static_assert` 锁定 thread_ctx_t 与 context_switch.S 帧布局 |
-| **P2** | Signal 移 Ring 3 | SYS_THREAD_SET_CTX | ⏸ 原语已就绪，用户态信号库未实施（内核 `signal.c` 暂留） |
+| **P2** | Signal 移 Ring 3 | SYS_THREAD_SET_CTX | ✅ 完成：`user/runtime/signal_user.c`（dispatcher + 用户态 handler 表）；内核 `signal.c` 仅留投递机制；`sigrestore.S` 删除；`SYS_SIGNAL` 改注册 dispatcher；hello 信号自测 + 49 项回归通过 |
 | **P2** | 常规串口日志走用户态 serial 服务 | 无 | ✅ 完成：内核保留 `serial_puts` 仅 panic/early-boot |
 
 ### 4.3 安全方向（TCB 削减 + 原语最小化）
@@ -144,7 +144,7 @@
 |---|---|---|---|
 | **P0** | 删内核 Framebuffer 绘制 | 减攻面（像素/字体渲染逻辑出内核） | ✅ 完成：内核 -373 行（framebuffer.c 字库+绘制函数、kernel_main.c 启动画面） |
 | **P1** | ELF 解析出内核 | 恶意 ELF 的解析攻击面移出 TCB | ✅ 完成：`elf.c` → `elf_boot.c`（init-only 加载器，181 行）；全部解析逻辑移入用户态 `elf_parse.c` |
-| **P2** | Signal 语义出内核 | 信号处理逻辑用户态化 | ⏸ 原语已备（SYS_THREAD_SET_CTX），用户态信号库未实施 |
+| **P2** | Signal 语义出内核 | 信号处理逻辑用户态化 | ✅ 完成：语义在 `user/runtime/signal_user.c`（handler 表/SIG_IGN/SIG_DFL 策略/默认动作），内核仅保留 checkpoint 投递 + SIGKILL 强制退出 |
 | **P1 配套** | MMIO 能力化 | 设备内存映射走 `CAP_TYPE_MEM`/`CAP_TYPE_PCI_DEV` 门控，不开放裸映射 | ✅ 完成：新增 PCI 枚举 syscall（`SYS_PCI_GET_COUNT`/`SYS_PCI_GET_DEVICE`），`device_mgr` 服务（Ring 3）经 IPC 提供 PCI 目录 |
 | **长期** | 崩溃恢复策略 | vfs -ESTALE 重开（vfs_design §十之一）、服务重启语义 | 服务级容错 |
 
@@ -194,10 +194,31 @@
 
 1. **多核模型**：单核 → SMP 的调度/锁/缓存一致性设计（Futex、irq 绑定表
    `s_irq_bindings` 均需重审）。
-2. **IPC 并发模型**：`s_active_call` 单活动调用 → 多活动调用池（Phase 3）。
-3. **崩溃恢复**：vfs_server 崩溃 → 句柄全失效 → -ESTALE 重开策略（Phase 1 磁盘卷
-   引入前定案）。
+2. **IPC 并发模型**：`s_active_call` 单活动调用 → 多活动调用池 ✅ 已完成（v0.2/v0.3，`s_reply_wait` 链表 + 代际令牌；`ipc_abort_wait` 处理强杀）。残留：无。
+3. **崩溃恢复**：内核侧已落地（2026-08-21：`process_reap` → `ipc_cleanup_process`
+   销毁死亡进程端口、唤醒阻塞对端为 ERR_NOENT、释放注册名；`irq_cleanup_process`
+   立即释放 IRQ 线；回归新增 crashpeer 对端死亡测试）。**服务侧** -ESTALE 重开与
+   manager 全服务重启策略待续（vfs 句柄失效语义）。
 4. **用户态 loader 的归属进程**：manager 内嵌 vs 独立 loader 服务（Phase 1 编码前定）。
+
+## 七之二、生产加固记录（2026-08-21，投产前硬化）
+
+| 项 | 内容 | 验证 |
+|---|---|---|
+| FPU/SSE 状态保存恢复 | `fpu_switch` 从空操作恢复为急切 fxsave/fxrstor；每线程槽位初始化 x86 默认值；`fpu_used` 死字段移除 | 新增 FPU 双线程交错 SSE2 回归测试（32/32 起） |
+| SYS_PANIC 门控 | 任意 Ring 3 进程可一键崩溃内核（DoS）→ 门控 `ATOM_SYS_DEBUG`（init 种子） | P2 门控套件 3→5 项 |
+| 管理原子种子提权链 | 应用 blob_get("perm")+process_create 逐字节副本可获 `ATOM_SERVICE_MANAGE`（完全管理接管）→ 种子加调用者门控（仅持管理原子的 spawner 可种），manager 加入种子表 | 回归全绿 |
+| sys_kill 门控 | 任意进程可 SIGKILL 关键服务 → 自杀恒允许、杀他人须 `ATOM_SERVICE_MANAGE` | R2.6 kill 错误路径保持 |
+| sys_notify 门控 | 可向外部线程注入虚假通知 → 目标限本进程线程 | P2 notify 测试 |
+| sys_debug_getchar 门控 | 任意进程可窃取/消耗控制台输入 → 仅 COM1 IO 能力持有者可读 | P2 debug_getchar 测试 |
+| sys_fb_get_info/map 门控 | 任意进程可涂改屏幕 → 门控 `ATOM_SERVICE_MANAGE`（term 持有） | term 渲染正常 |
+| IPC 对端死亡 | 服务崩溃时阻塞的 ipc_call 调用方永久挂死、端口注册名泄漏、IRQ 线不释放 → `process_reap` 统一清理（`ipc_cleanup_process`/`irq_cleanup_process`） | 新增 crashpeer 对端死亡回归测试（33/33 起） |
+| 服务自动重启 | manager 重启策略从 flaky-only 扩展为 perm/pkg/device_mgr/shell（每服务一 monitor 线程，MAX_RESTARTS=3）；配合端口/IRQ 清理可干净重启 | 新增 P3 Crash Recovery 回归（kill pkg → 自动重启 → 端口恢复） |
+| force_exit 槽位残留 | `alloc_thread` 漏清 `force_exit`：SIGKILL 线程槽位回收后，新线程在首个检查点被静默杀死（code 0）→ 补清零 | P3 测试一次重启成功（原为两次） |
+| blob 注册 fail-fast | BLOB_MAX_ENTRIES 静默溢出致服务缺失（sbox_demo_noperm 注册失败被吞）→ 上限 22 + 注册失败 panic | 全量 smoke 恢复 |
+| v0.4 图形最小闭环 | `window_demo` 服务：经 term（显示所有者）渲染 3 窗口 + 标题栏焦点标记 + 状态栏，键盘 1/2/3 切换焦点、q 退出（输入走 keyboard 焦点路由）——窗口概念在现有安全架构内的闭环；真实合成器/窗口注册表待续 | `scripts/verify_window_demo.py`（VGA 解码验证窗口渲染 + 焦点切换） |
+| 资源耗尽优雅降级 | 新增 P4 套件：IPC 超长消息 → ERR_INVAL（边界）；线程表耗尽（1024）→ ERR_NOMEM 且 join 全部释放后可恢复（优雅降级，不崩溃） | init 回归 54→56 项 |
+| 零拷贝读路径（P3 完成） | 内核 `SYS_SHM_CREATE`/`SYS_SHM_MAP`（67/68，管理原子门控 + 池表防任意物理映射 + 只读非执行映射）；fs_mem_driver 共享池存储（System blob 池化 + Users 增长迁移堆回退）；vfs `READ_MAP` 授权重查；`fs_read_map` | P5 回归 1/1（映射 == chunked 读）；smoke 62/62 |
 
 ---
 
@@ -217,10 +238,11 @@ P1（✅ 已完成 2026-08-09，QEMU 回归通过：24/24 测试全过）
   ├─ PCI 枚举 syscall + device_mgr 服务（Ring 3）：SYS_PCI_GET_COUNT/GET_DEVICE
   └─ 常规串口日志用户态化
 
-P2（原语已落地，Signal 用户态化待续）
+P2（✅ 已完成 2026-08-21，QEMU 回归通过：49/49 全过 + hello 信号自测）
   ├─ SYS_THREAD_SET_CTX（thread_ctx.c，seL4 TCB_WriteRegisters 等价物）✅
   ├─ MAX_THREADS 256→1024 + 1000 线程 / 100k IPC 压力测试 ✅
-  └─ Signal 用户态化（内核 signal.c 暂留，原语已备）⏸
+  └─ Signal 用户态化（signal_user.c：dispatcher + 用户态 handler 表；
+       内核 signal.c 仅留投递机制；sigrestore.S 删除）✅
 
 P3（SMP/远期）
   ├─ Futex 化 Mutex、IPC 多活动调用、零拷贝读

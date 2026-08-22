@@ -243,15 +243,30 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     if (!proc)
         return (i64)ERR_NOMEM;
 
-    /* ---- Blob identity seeding (docs/ops_format.md §6): the perm
-     * and pkg services are the only subjects allowed to sign atom
-     * caps (sys_cap_grant_to_subject / perm decision_encode / pkg
-     * manifest issue).  Identity is established by CONTENT: the
-     * caller's blob must be byte-identical (blob_size + memcmp) to
-     * the kernel-embedded service ELF — a name like "perm" alone is
-     * NOT trusted (an app can name itself anything). ---- */
-    if (proc->cap_table) {
-        static const char *const s_svc_blobs[] = {"perm", "pkg"};
+    /* ---- Blob identity seeding (docs/ops_format.md §6): the manager,
+     * perm, pkg, term, vfs and fs_mem_driver services are the only
+     * subjects allowed to sign / answer atom caps
+     * (sys_cap_grant_to_subject / perm decision_encode / pkg manifest
+     * issue / Powerbox ANSWER — the term UI agent answers user
+     * verdicts — and SYS_SHM_CREATE/MAP, which vfs_server uses to
+     * export zero-copy file pages from the driver's pool).  Identity
+     * is established by CONTENT: the caller's blob must be
+     * byte-identical (blob_size + memcmp) to the kernel-embedded
+     * service ELF — a name like "perm" alone is NOT trusted (an app
+     * can name itself anything).
+     *
+     * CALLER GATE (production hardening): the spawner itself must
+     * hold ATOM_SERVICE_MANAGE.  Otherwise an untrusted app could
+     * blob_get("perm") + process_create() a byte-identical copy and
+     * receive the management atom (privilege escalation).  The legit
+     * chain is init -> manager -> services; init and manager both
+     * hold the atom, so real service spawns keep working. ---- */
+    process_t *cur = process_current();
+    if (proc->cap_table && cur && cur->cap_table &&
+        cap_lookup_by_atom(cur->cap_table, cur->subject_id, ATOM_SERVICE_MANAGE, 0) !=
+            CAP_NULL) {
+        static const char *const s_svc_blobs[] = {
+            "manager", "perm", "pkg", "term", "vfs", "fs_mem_driver"};
         for (u64 bi = 0; bi < sizeof(s_svc_blobs) / sizeof(s_svc_blobs[0]); bi++) {
             const void *blob_data = NULL;
             u64         blob_sz   = 0;

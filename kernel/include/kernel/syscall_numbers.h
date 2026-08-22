@@ -158,4 +158,12 @@
  * may inspect others' atom holdings. */
 #define SYS_CAP_HAS_ATOM 66 /* (subject, atom) -> 1/0 */
 
+/* ---- Phase 3: zero-copy read path (shared physical-page pools) ----
+ * SYS_SHM_CREATE: allocate a contiguous physical-page pool and map it
+ *   into the caller (gated on ATOM_SERVICE_MANAGE).
+ * SYS_SHM_MAP: map an existing pool READ-ONLY into a client's address
+ *   space (gated on ATOM_SERVICE_MANAGE + pool-table verification). */
+#define SYS_SHM_CREATE 67 /* (count, virt) -> phys_base */
+#define SYS_SHM_MAP    68 /* (phys_base, count, subject, virt) -> OK */
+
 #endif /* KERNEL_SYSCALL_NUMBERS_H */

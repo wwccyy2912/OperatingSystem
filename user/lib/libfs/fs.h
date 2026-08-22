@@ -100,4 +100,10 @@ int fs_move_item(const char      *src,
                  const char      *new_name,
                  vfs_item_info_t *out_item);
 
+/* Phase 3 zero-copy read: map the file's backing pool pages READ-ONLY
+ * into the caller at `map_virt` (a vspace_alloc()'d range).  Returns
+ * the mapped size via *mapped_size and 0 on success; ERR_NOENT means
+ * the file is not pool-backed (fall back to fs_read()). */
+int fs_read_map(vfs_handle_t handle, void *map_virt, u32 *mapped_size);
+
 #endif /* LIBFS_FS_H */

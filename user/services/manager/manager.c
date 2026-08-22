@@ -35,12 +35,12 @@
  *               from then on; the manager never writes to the serial
  *               port again
  *
- * Single-writer rule: the kernel IPC layer keeps ONE active call per
- * port (s_active_call), so at most one process may be inside
- * ipc_call() on a given port at a time.  The manager serialises port
- * access by construction: serial writes happen only before the shell
- * starts; term/keyboard are only touched by the shell after it is
- * spawned.
+ *  * IPC note: the kernel's per-port reply-wait LIST (ipc.c, v0.2+)
+ *  supports many concurrent callers on one port (reply tokens carry
+ *  generations), so the manager's monitor threads may safely call the
+ *  serial service while the shell is reading — the old "single active
+ *  call per port" limitation no longer exists.  The boot sequence
+ *  still writes serially only to keep the startup log readable.
  *
  * Monitoring design: exit detection = blocking process_wait() on the
  * service's PID.  Hang/timeout detection would need a kernel
@@ -60,6 +60,7 @@
 #include <stdarg.h>
 #include <stddef.h> /* NULL */
 #include <stdint.h>
+#include <malloc.h>
 
 /* Fixed-width types (kernel/types.h is not includable from user space:
  * its error_t enum collides with the OK/ERR_* macros in syscalls.h). */
@@ -94,11 +95,18 @@ static service_t s_services[] = {
     {"vfs", -1, 0, 0},                  /* VFS namespace server     */
     {"fs_mem_driver", -1, 0, 0},        /* in-memory storage driver */
     {"fs_virtio_blk_driver", -1, 0, 0}, /* block-device storage driver */
-    {"perm", -1, 0, 0},                 /* Powerbox auth manager    */
-    {"device_mgr", -1, 0, 0},           /* PCI device manager       */
-    {"pkg", -1, 0, 0},                  /* .ops app container manager */
-    {"shell", -1, 0, 0},
+    {"perm", -1, 0, 1},                 /* Powerbox auth manager    */
+    {"device_mgr", -1, 0, 1},           /* PCI device manager       */
+    {"pkg", -1, 0, 1},                  /* .ops app container manager */
+    {"shell", -1, 0, 1},
 };
+
+/* Restartable services (production hardening): crash → auto-restart up
+ * to MAX_RESTARTS.  Self-contained, stateless-ish services only —
+ * vfs/fs drivers own the namespace/mount state (restart needs the
+ * -ESTALE reopen semantics, roadmap §七.3) and serial/term/keyboard
+ * own hardware/IRQ/fb (restart is feasible since process_reap cleans
+ * ports+IRQs, but is disruptive — deferred). */
 
 #define SVC_SERIAL        0
 #define SVC_TERM          1
@@ -328,22 +336,31 @@ static void serial_test_run(void) {
 /*
  * Start a service: fetch its embedded ELF image from the kernel blob
  * table (SYS_BLOB_GET) and spawn it as an independent process
- * (SYS_PROCESS_CREATE).  The ELF buffer is static BSS (the hello
- * spawn path proves a 64 KB user blob buffer works).  Records the
- * child PID in the service table.  Returns 0 on success, else the
- * first negative error; logs unless quiet.
+ * (SYS_PROCESS_CREATE).  Records the child PID in the service table.
+ * Returns 0 on success, else the first negative error; logs unless
+ * quiet.
+ *
+ * The ELF buffer is allocated per call (NOT static): multiple monitor
+ * threads (perm/pkg/device_mgr/shell) can spawn concurrently when
+ * several services crash at once — a shared static buffer would race
+ * and hand process_create a corrupted/overwritten image.  The kernel
+ * copies the image during the syscall, so the buffer is freed
+ * immediately after.
  */
 static int spawn_service(service_t *svc, int quiet) {
-    static char blob_buf[131072]; /* must hold the largest service ELF
-                                     (shell.elf ~108 KB after libc migration) */
+    char *blob_buf = malloc(131072); /* must hold the largest service ELF */
+    if (!blob_buf)
+        return ERR_NOMEM;
 
-    int size = blob_get(svc->name, blob_buf, sizeof(blob_buf));
+    int size = blob_get(svc->name, blob_buf, 131072);
     if (size < 0) {
+        free(blob_buf);
         if (!quiet)
             manager_printf("manager: %s blob_get failed (%d)\n", svc->name, size);
         return size;
     }
     int pid = process_create(svc->name, blob_buf, size);
+    free(blob_buf);
     if (pid < 0) {
         if (!quiet)
             manager_printf("manager: %s process_create failed (%d)\n", svc->name, pid);
@@ -360,24 +377,24 @@ static int spawn_service(service_t *svc, int quiet) {
  * ==================================================================== */
 
 /*
- * The flaky demo service is its own process (user/services/flaky/
- * main.c: sleep(5) then return 7).  The manager blocks in
- * process_wait() until the flaky process's last thread exits, then
- * applies the restart policy: up to MAX_RESTARTS restarts, then
- * FAILED.  Logs every event through the serial service.  This loop
- * runs on the manager's single thread, so during the whole cycle the
- * manager is the only process issuing ipc_call() on the serial port
- * (the shell has not been spawned yet — single-writer rule).
+ * Generic service monitor (restart policy): blocks in process_wait()
+ * until the service's last thread exits, then applies the restart
+ * policy: up to MAX_RESTARTS restarts, then FAILED.  Logs every event
+ * through the serial service.  One monitor thread per restartable
+ * service (perm/pkg/device_mgr/shell); each touches only its own
+ * service_t entry, so concurrent monitors are safe.
  */
-static void flaky_monitor(void) {
-    service_t *svc = &s_services[SVC_FLAKY];
+static void service_monitor(void *arg) {
+    service_t *svc = (service_t *)arg;
 
     for (;;) {
         int exit_code = 0;
         int ret       = process_wait(svc->pid, &exit_code);
         if (ret < 0) {
-            manager_printf("manager: %s wait failed (%d)\n", svc->name, ret);
-            break;
+            /* Race: the process was already reaped as an orphan before
+             * this monitor registered its wait.  Treat it like an exit
+             * and apply the restart policy. */
+            manager_printf("manager: %s wait failed (%d), restarting\n", svc->name, ret);
         }
         if (svc->restart_count >= MAX_RESTARTS) {
             manager_printf("manager: %s marked FAILED\n", svc->name);
@@ -392,6 +409,26 @@ static void flaky_monitor(void) {
         if (spawn_service(svc, 0) < 0)
             break;
     }
+}
+
+/*
+ * After the boot sequence (shell spawned): start one monitor thread
+ * per restartable service.  (flaky's monitor already ran to FAILED
+ * during the boot sequence, so it is not restarted here.)
+ */
+static void start_service_monitors(void) {
+    static const int s_restartable[] = {SVC_PERM, SVC_PKG, SVC_DEVICE_MGR, SVC_SHELL};
+    for (u32 i = 0; i < sizeof(s_restartable) / sizeof(s_restartable[0]); i++) {
+        int tid = thread_create(service_monitor, (void *)&s_services[s_restartable[i]], 10);
+        if (tid < 0)
+            manager_printf("manager: monitor(%s) thread_create failed (%d)\n",
+                           s_services[s_restartable[i]].name,
+                           tid);
+    }
+
+    /* Idle — the monitors + shell keep running as their own threads. */
+    for (;;)
+        thread_yield();
 }
 
 /* ====================================================================
@@ -450,21 +487,13 @@ int main(void) {
             thread_yield();
 
     /* ---- 5. Supervisor loop ----
-     * The manager's single thread blocks in process_wait() until the
-     * flaky process exits, then applies the restart policy.  During
-     * the whole flaky cycle this thread is the ONLY ipc_call() user on
-     * the serial port — the shell has not been created yet
-     * (single-writer rule: the kernel IPC layer keeps a single
-     * active-call slot per port (s_active_call), so a second caller
-     * whose request arrives while the service is between recv and
-     * reply would clobber the first caller's reply slot and deadlock
-     * it.  Kernel/serial.c/shell.c are off-limits, so the manager
-     * serialises port access by construction instead.) */
-    flaky_monitor();
+     * The manager's main thread runs flaky's monitor to FAILED before
+     * the shell exists, so the boot-time serial log stays clean. */
+    service_monitor(&s_services[SVC_FLAKY]);
 
     manager_write("manager: MANAGER_OK\n");
 
-    /* ---- 5b. VFS services (before the shell — single-writer rule) ----
+    /* ---- 5b. VFS services ----
      * vfs_server owns the namespace; fs_mem_driver is spawned as its
      * own process (decision A1) and performs the driver-initiated
      * MOUNT handshake against "vfs".  The manager waits for both ports
@@ -543,17 +572,17 @@ int main(void) {
             thread_yield();
 
     /* ---- 6. Shell LAST (keeps the single-writer rule) ----
-     * The shell is spawned only after the manager's output phase is
-     * over, and the manager never writes to the serial port again:
-     * from here on the shell is the sole ipc_call() user (banner,
-     * prompt, READ-poll, command echo).  The spawn is deliberately
-     * silent (no "shell started (PID=..)" log): printing it after
-     * process_create() would let the fresh shell run mid-print and
-     * collide on the port. */
+     * The shell is spawned after the manager's output phase.  The
+     * spawn is deliberately silent (no "shell started (PID=..)" log):
+     * printing it after process_create() would let the fresh shell run
+     * mid-print and interleave the boot log. */
     manager_write("manager: starting shell\n");
     (void)spawn_service(&s_services[SVC_SHELL], 1);
 
-    /* Idle — the shell keeps running as its own process. */
-    for (;;)
-        thread_yield();
+    /* ---- 7. Service monitors (crash recovery) ----
+     * One monitor thread per restartable service; the main thread
+     * takes flaky's monitor.  A crashed perm/pkg/device_mgr/shell is
+     * auto-restarted (up to MAX_RESTARTS) — process_reap now cleans
+     * the dead process's ports/IRQs/names, so the restart is clean. */
+    start_service_monitors();
 }

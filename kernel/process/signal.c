@@ -13,18 +13,20 @@
  * stack, with no spinlocks held by the caller.  They may re-enter the
  * scheduler (thread_exit / sched_enqueue) but never block.
  *
- * Semantics:
+ * Semantics (Ring 3 migration, kernel_roadmap.md D4/P2):
  *   - kill(SIGKILL)            -> signal_kill_process(): force_exit on
  *                                 every thread + wake blocked ones;
  *                                 each thread dies at its next checkpoint.
- *   - kill(sig, SIG_DFL)       -> terminate (SIGKILL/SIGSEGV/SIGPIPE/
- *                                 SIGALRM/SIGTERM) or ignore (the rest)
- *   - kill(sig, SIG_IGN)       -> bit never set
- *   - kill(sig, handler)       -> set the pending bit; at the next
+ *   - kill(other)              -> set the pending bit; at the next
  *                                 checkpoint on some thread of the
- *                                 process, build a sigframe on the user
- *                                 stack and rewrite RIP/RDI/RSP to enter
- *                                 the handler (see signal.h ABI).
+ *                                 process, snapshot the interrupted
+ *                                 context into a sigframe on the user
+ *                                 stack and divert RIP/RDI/RSP into
+ *                                 the Ring 3 dispatcher registered by
+ *                                 the C runtime (see signal.h ABI).
+ *                                 Handler lookup, ignore/default
+ *                                 policy and default actions live in
+ *                                 user/runtime/signal_user.c.
  *   - SYS_SIGRETURN            -> signal_restore(): copy the sigframe
  *                                 back into the current syscall frame.
  */
@@ -59,26 +61,12 @@
 
 /* ------------------------------------------------------------------ */
 
-bool signal_default_terminates(int signum) {
-    switch (signum) {
-    case SIGKILL:
-    case SIGSEGV:
-    case SIGPIPE:
-    case SIGALRM:
-    case SIGTERM:
-        return true;
-    default:
-        return false;
-    }
-}
-
 /*
  * Shared delivery core.  Called by both checkpoints with the ORIGINAL
  * interrupted context (gprs/rip/rsp/rflags of the user-mode frame).
  *
- * Returns true when the frame was rewritten to enter a user handler;
- * false when nothing was delivered.  A default-action termination (or
- * SIGKILL) never returns.
+ * Returns true when the frame was rewritten to enter the Ring 3
+ * dispatcher; false when nothing was delivered.
  */
 static bool signal_check_common(process_t *proc, u64 *gprs, u64 *rip, u64 *rsp, u64 *rflags) {
     if (!proc || proc->sig_pending == 0)
@@ -93,31 +81,27 @@ static bool signal_check_common(process_t *proc, u64 *gprs, u64 *rip, u64 *rsp, 
         /* Single delivery, no queuing: consume the bit now */
         proc->sig_pending &= ~(1ULL << signum);
 
-        u64 handler = proc->sig_handlers[signum];
-
-        if (handler == SIG_IGN)
-            continue;
-
-        if (handler == SIG_DFL) {
-            if (signal_default_terminates(signum)) {
-                signal_kill_process(proc, 128 + signum);
-                thread_exit(128 + signum); /* never returns */
-            }
-            continue; /* default = ignore */
+        /* Ring 3 migration: the kernel knows nothing about handlers.
+         * Without a registered dispatcher the signal cannot be
+         * delivered yet -- keep it pending and retry at the next
+         * checkpoint. */
+        if (proc->sig_dispatcher == 0) {
+            proc->sig_pending |= (1ULL << signum);
+            return false;
         }
 
-        /* ---- Real handler: build the sigframe on the user stack ----
+        /* ---- Build the sigframe on the user stack ----
          *
-         * Layout (signal.h): sigframe_t at [base, base+152), 8-byte
-         * restorer slot just below at [base-8, base); handler enters
-         * with RSP = base-8 (≡ 8 mod 16, SysV ABI entry alignment),
-         * RDI = signum, RIP = handler. */
+         * Layout (signal.h): sigframe_t at [base, base+152), zeroed
+         * 8-byte slot just below at [base-8, base); the dispatcher
+         * enters with RSP = base-8 (≡ 8 mod 16, SysV ABI entry
+         * alignment), RDI = sigframe base, RIP = dispatcher. */
         u64 base = (*rsp - SIGFRAME_TOTAL) & ~0xFULL;
 
-        if (base < 0x1000 || proc->sig_restorer == 0 ||
+        if (base < 0x1000 ||
             !vmm_validate_user_range(proc->addr_space, base - 8, SIGFRAME_TOTAL, true)) {
-            /* Stack exhausted / missing restorer: cannot deliver now.
-             * Keep the signal pending and retry at the next checkpoint. */
+            /* Stack exhausted: cannot deliver now.  Keep the signal
+             * pending and retry at the next checkpoint. */
             proc->sig_pending |= (1ULL << signum);
             return false;
         }
@@ -132,12 +116,11 @@ static bool signal_check_common(process_t *proc, u64 *gprs, u64 *rip, u64 *rsp, 
         sf->rsp    = *rsp;
         sf->signum = (u64)signum;
 
-        /* Restorer slot just below the sigframe base */
-        *(u64 *)(uintptr_t)(base - 8) = proc->sig_restorer;
+        *(u64 *)(uintptr_t)(base - 8) = 0;
 
-        /* Divert the return path into the handler */
-        gprs[9] = (u64)signum; /* RDI = signum */
-        *rip    = handler;
+        /* Divert the return path into the Ring 3 dispatcher */
+        gprs[9] = base; /* RDI = sigframe base */
+        *rip    = proc->sig_dispatcher;
         *rsp    = base - 8;
 
         return true;

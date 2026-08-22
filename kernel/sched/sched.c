@@ -25,19 +25,45 @@
 
 /* Per-thread FPU/SSE state buffers.  Each buffer is 512 bytes and
  * 16-byte aligned (required by fxsave/fxrstor).  Indexed by TID.
- * Using a separate array avoids struct-layout alignment issues. */
+ * Using a separate array avoids struct-layout alignment issues.
+ * fxstate layout (Intel SDM): [0..1] x87 CW, [24..27] MXCSR,
+ * [32..159] x87 regs, [160..511] XMM0-15. */
 static u8 s_fpu_state[MAX_THREADS][512] __attribute__((aligned(16)));
+
+/* x86 hardware default control words: all exceptions MASKED.  A fresh
+ * slot with CW/MXCSR = 0 would leave every exception unmasked (and
+ * fxrstor of an unmasked-pending state can raise #GP), so every slot
+ * is seeded to the hardware defaults at creation and reuse. */
+#define FPU_X87_CW_DEFAULT  0x037Fu
+#define FPU_MXCSR_DEFAULT   0x1F80u
+
+/* Seed tid's FPU slot to the x86 hardware defaults (see thread.c
+ * alloc_thread — fresh AND recycled slots).  Safe before any fxsave. */
+void fpu_state_init(tid_t tid) {
+    if (tid < 0 || tid >= MAX_THREADS)
+        return;
+    u8 *slot = s_fpu_state[tid];
+    for (u32 i = 0; i < 512; i++)
+        slot[i] = 0;
+    *(u16 *)(slot + 0)  = FPU_X87_CW_DEFAULT;
+    *(u32 *)(slot + 24) = FPU_MXCSR_DEFAULT;
+}
 
 /* Save/restore FPU state around context_switch so user-space programs
  * can use SSE/SSE2 floating-point.  Called with interrupts disabled,
  * immediately before context_switch().  Saves prev's live FPU state and
  * loads next's saved state — context_switch's IRETQ transfer preserves
- * the FPU registers as-is, so the load takes effect for next. */
+ * the FPU registers as-is, so the load takes effect for next.
+ *
+ * Eager strategy: fxsave/fxrstor on EVERY switch.  The kernel itself
+ * is built with -mno-sse/-mno-sse2/-mno-mmx, so kernel code never
+ * touches FPU/SSE state; CR4.OSFXSR is set in boot.asm (bits 9-10).
+ * Every thread slot is pre-seeded to x86 defaults by fpu_state_init(),
+ * so fxrstor is always valid — including the very first switch into a
+ * fresh thread and switches involving idle (tid 0). */
 static inline void fpu_switch(thread_t *prev, thread_t *next) {
-    /* TEMPORARILY DISABLED - causes #GP */
-    (void)prev;
-    (void)next;
-    return;
+    __asm__ volatile("fxsave %0" : "=m"(s_fpu_state[prev->tid]) : : "memory");
+    __asm__ volatile("fxrstor %0" :: "m"(s_fpu_state[next->tid]) : "memory");
 }
 
 /* CFS weights indexed by priority (0 = lowest, 31 = highest) */

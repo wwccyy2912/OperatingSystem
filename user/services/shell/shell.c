@@ -83,7 +83,6 @@ static int cmd_exec(int argc, char *argv[]);
 static int cmd_uptime(int argc, char *argv[]);
 static int cmd_exit(int argc, char *argv[]);
 static int cmd_reboot(int argc, char *argv[]);
-static int cmd_panic(int argc, char *argv[]); /* TEMP test hook */
 static int cmd_kill(int argc, char *argv[]);
 static int cmd_ps(int argc, char *argv[]);
 static int cmd_ls(int argc, char *argv[]);
@@ -763,19 +762,6 @@ static int cmd_reboot(int argc, char *argv[]) {
     return 0;
 }
 
-/*
- * TEMP test hook: exercise the unified kernel panic path from the shell.
- * The kernel halts — this never returns on success.
- */
-static int cmd_panic(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
-    shell_write("Triggering kernel panic...\n");
-    (void)sys_panic();
-    /* Only reached if the panic syscall failed. */
-    shell_write("panic: syscall failed, system still running\n");
-    return 0;
-}
 
 /*
  * Column helpers for cmd_ps.  The file-local shell_printf() has no
@@ -1491,7 +1477,6 @@ static void shell_main(void *arg) {
     shell_register_command("uptime", "Show system tick count", cmd_uptime);
     shell_register_command("exit", "Exit the shell", cmd_exit);
     shell_register_command("reboot", "Halt the system", cmd_reboot);
-    shell_register_command("panic", "Trigger a kernel panic (TEMP test)", cmd_panic);
     shell_register_command("kill", "Send a signal: kill <pid> [signum]", cmd_kill);
     shell_register_command("ps", "List running processes", cmd_ps);
     shell_register_command(

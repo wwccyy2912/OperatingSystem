@@ -76,6 +76,76 @@ typedef struct {
 static mem_vol_t s_sys;           /* System volume (read-only blobs) */
 static mem_vol_t s_usr;           /* Users volume (read-write RAM)   */
 
+/* ====================================================================
+ * Shared page pool (Phase 3 zero-copy read path, kernel/mm/shm.c)
+ * File data is preferentially allocated from this kernel-backed pool;
+ * vfs_server maps pool pages READ-ONLY into authorized clients via
+ * SYS_SHM_MAP, bypassing the 4096-byte IPC copy path.  A file whose
+ * data is NOT pool-resident (pool exhausted, or it grew after
+ * allocation — growth migrates to the heap) simply falls back to the
+ * chunked read path.
+ * ==================================================================== */
+
+#define SHM_POOL_PAGES 256u /* 1 MiB pool */
+
+static u8  *s_pool_virt; /* pool mapping in this process */
+static u64  s_pool_phys; /* kernel-issued physical base (SYS_SHM_CREATE) */
+static u32  s_pool_used; /* bump offset (page-aligned) */
+static int  s_pool_ready;
+
+/* Create the pool: vspace_alloc a range, then SYS_SHM_CREATE maps the
+ * physical pages into it.  Returns 0, or -1 (pool stays disabled and
+ * all files use heap storage — safe fallback). */
+static int pool_init(void) {
+    void *virt = vspace_alloc(SHM_POOL_PAGES * PAGE_SIZE, 0);
+    if (!virt)
+        return -1;
+    u64 phys = shm_create(SHM_POOL_PAGES, virt);
+    if ((long long)phys <= 0)
+        return -1;
+    s_pool_virt  = (u8 *)virt;
+    s_pool_phys  = phys;
+    s_pool_used  = 0;
+    s_pool_ready = 1;
+    printf("fs_mem_driver: shm pool ready (phys=0x%lx, %u pages)\n",
+           (unsigned long)phys,
+           (unsigned)SHM_POOL_PAGES);
+    return 0;
+}
+
+/* Page-aligned bump allocation; NULL when exhausted (heap fallback). */
+static u8 *pool_alloc(u32 size) {
+    if (!s_pool_ready)
+        return NULL;
+    u32 need = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (s_pool_used + need > SHM_POOL_PAGES * PAGE_SIZE)
+        return NULL;
+    u8 *p = s_pool_virt + s_pool_used;
+    s_pool_used += need;
+    return p;
+}
+
+static int pool_contains(const u8 *p) {
+    return s_pool_ready && p >= s_pool_virt &&
+           p < s_pool_virt + SHM_POOL_PAGES * PAGE_SIZE;
+}
+
+/* Backing physical range of a pool-resident buffer. */
+static int pool_phys_range(const u8 *p, u64 *phys_out) {
+    if (!pool_contains(p))
+        return 0;
+    *phys_out = s_pool_phys + (u64)(p - s_pool_virt);
+    return 1;
+}
+
+/* Free a data buffer: heap buffers are free()d, pool buffers are NOT
+ * (the bump allocator never returns blocks; the 1 MiB pool is a
+ * bounded, driver-lifetime cache). */
+static void item_free_data(u8 *p) {
+    if (p && !pool_contains(p))
+        free(p);
+}
+
 /* Request/response buffers (drv_req_t/drv_resp_t both < 4096) */
 static u8 s_req[DRV_REQ_MAX];
 static u8 s_resp[DRV_RESP_MAX];
@@ -179,7 +249,7 @@ static i32 mem_delete(mem_vol_t *vol, vfs_item_id_t id, u32 recursive)
         }
 
         if (it->data) {
-                free(it->data);
+                item_free_data(it->data);
                 vol->used -= it->size;
         }
         memset(it, 0, sizeof(*it));             /* in_use = 0, id never reused */
@@ -317,7 +387,11 @@ static int mem_sys_load(void)
                 }
 
                 mem_item_t *it = mem_find(&s_sys, fid);
-                it->data = malloc((size_t)n);
+                /* Prefer the zero-copy pool (read-only blobs, never
+                 * freed); fall back to heap when the pool is full. */
+                it->data = pool_alloc((u32)n);
+                if (!it->data)
+                        it->data = malloc((size_t)n);
                 if (!it->data) {
                         printf("fs_mem_driver: OOM loading '%s' (%d bytes)\n", fname, n);
                         it->in_use = 0;
@@ -426,7 +500,7 @@ static i32 mem_write(mem_vol_t *vol, vfs_item_id_t id, u64 offset,
         /* Truncate (OPEN+TRUNCATE): len==0 && offset==0 clears the file. */
         if (len == 0) {
                 if (offset == 0 && it->size > 0) {
-                        free(it->data);
+                        item_free_data(it->data);
                         it->data = NULL;
                         vol->used -= it->size;
                         it->size = 0;
@@ -442,11 +516,32 @@ static i32 mem_write(mem_vol_t *vol, vfs_item_id_t id, u64 offset,
                 return VFS_ERR_NOSPC;           /* growth would exceed 32 MiB */
 
         if (need > it->size) {
-                u8 *nd = realloc(it->data, (size_t)need);
+                u8 *nd;
+                if (!it->data) {
+                        /* First allocation: prefer the zero-copy pool. */
+                        nd = pool_alloc((u32)need);
+                        if (nd && offset > 0)   /* hole: zero-fill 0..offset */
+                                memset(nd, 0, (size_t)offset);
+                } else if (pool_contains(it->data)) {
+                        /* Pool-backed file growing: migrate to the heap.
+                         * (The pool bump allocator cannot grow blocks in
+                         * place; after migration the file is served by
+                         * the chunked read path.) */
+                        nd = malloc((size_t)need);
+                        if (nd) {
+                                memcpy(nd, it->data, (size_t)it->size);
+                                if (offset > it->size)
+                                        memset(nd + it->size, 0,
+                                               (size_t)(offset - it->size));
+                        }
+                } else {
+                        nd = realloc(it->data, (size_t)need);
+                        if (nd && offset > it->size)
+                                memset(nd + it->size, 0,
+                                       (size_t)(offset - it->size));
+                }
                 if (!nd)
                         return ERR_NOMEM;
-                if (offset > it->size)          /* hole: zero-fill size..offset */
-                        memset(nd + it->size, 0, (size_t)(offset - it->size));
                 it->data = nd;
                 vol->used += need - it->size;
                 it->size = need;
@@ -531,6 +626,23 @@ static void drv_handle(int token, drv_req_t *req)
                 resp->u.stat.read_only = vol->read_only;
                 resp->ret = 0;
                 break;
+        case DRV_OP_PHYS_RANGE: {
+                /* Zero-copy backing range of a pool-resident file. */
+                mem_item_t *it = mem_find(vol, req->item_id);
+                if (!it || it->type != VFS_ITEM_FILE || !it->data) {
+                        resp->ret = ERR_NOENT;
+                        break;
+                }
+                u64 phys = 0;
+                if (!pool_phys_range(it->data, &phys)) {
+                        resp->ret = ERR_NOENT; /* heap-backed: fall back */
+                        break;
+                }
+                resp->u.pr.phys_base = phys;
+                resp->u.pr.size = (u32)it->size;
+                resp->ret = 0;
+                break;
+        }
         default:
                 resp->ret = ERR_INVAL;
                 break;
@@ -549,6 +661,12 @@ out:
 int main(void)
 {
         printf("fs_mem_driver: starting in-memory filesystem driver\n");
+
+        /* ---- 1. Zero-copy shared pool FIRST (best-effort: a failure
+         * only disables the fast path; every file falls back to heap).
+         * Created before the System volume loads so its blobs land in
+         * the pool. ---- */
+        (void)pool_init();
 
         /* ---- 1. Volumes ---- */
         if (mem_sys_load() < 0) {

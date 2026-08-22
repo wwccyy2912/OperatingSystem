@@ -206,7 +206,8 @@ void kernel_main(u64 mboot_info_phys, u64 kernel_phys_start) {
      * device owner, so its cap_create_atom/cap_grant_to_subject/
      * cap_revoke_by_atom self-tests (P0/P1/P2V regression) and perm's
      * decision_encode path (which signs atom caps via cap_grant_to_subject)
-     * keep working under the new syscall gates. */
+     * keep working under the new syscall gates.  ATOM_SYS_DEBUG is the
+     * developer-mode atom gating SYS_PANIC (and future debug hooks). */
     if (init_proc->cap_table) {
         cap_t h = CAP_NULL;
         cap_create_atom(init_proc->cap_table,
@@ -220,6 +221,14 @@ void kernel_main(u64 mboot_info_phys, u64 kernel_phys_start) {
         cap_create_atom(init_proc->cap_table,
                         init_proc->subject_id,
                         ATOM_SERVICE_MANAGE,
+                        RIGHT_ALL,
+                        0,
+                        0,
+                        0,
+                        &h);
+        cap_create_atom(init_proc->cap_table,
+                        init_proc->subject_id,
+                        ATOM_SYS_DEBUG,
                         RIGHT_ALL,
                         0,
                         0,

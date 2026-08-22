@@ -16,7 +16,7 @@
 
 #define BLOB_NAME_MAX 32 /* Max blob name length incl. NUL */
 #define BLOB_MAX_ENTRIES \
-    18 /* Max registered blobs (services + sbox_demo_noperm alias + headroom) */
+    22 /* Max registered blobs (20 services + alias + headroom) */
 
 typedef struct {
     char        name[BLOB_NAME_MAX];

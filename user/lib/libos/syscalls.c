@@ -280,18 +280,12 @@ int mutex_destroy(int handle) {
 /* ---- Signals ---- */
 
 /*
- * Register a signal handler.  The kernel needs the __restore_rt
- * trampoline address (user/runtime/sigrestore.S) so it can re-enter
- * the kernel after the handler returns; supplying it is the wrapper's
- * job — the kernel stores it per-process at registration time.
+ * signal() lives in the C runtime (user/runtime/signal_user.c): with
+ * semantics moved to Ring 3 (kernel_roadmap.md D4/P2), registering a
+ * handler is a plain user-memory table swap -- no syscall involved.
+ * kill() remains a syscall: the kernel latches the pending bit and
+ * the Ring 3 dispatcher decides ignore/default/handler at delivery.
  */
-sighandler_t signal(int signum, sighandler_t handler) {
-    extern void __restore_rt(void);
-    long ret = sys_call(
-        SYS_SIGNAL, signum, (long)handler, (long)(uintptr_t)__restore_rt, 0, 0);
-    return (ret < 0) ? SIG_ERR : (sighandler_t)ret;
-}
-
 int kill(int pid, int signum) {
     return (int)sys_call(SYS_KILL, pid, signum, 0, 0, 0);
 }
@@ -347,4 +341,23 @@ int cap_has_atom(uint64_t subject, atom_id_t atom) {
 int ipc_recv_from(int port, void *buf, int *len, int *tok, uint64_t *sender_subject) {
     return (int)sys_call(
         SYS_IPC_RECV_FROM, port, (long)buf, (long)len, (long)tok, (long)sender_subject);
+}
+
+/* ---- Phase 3: zero-copy read path (shared physical-page pools) ---- */
+
+/* SYS_SHM_CREATE: allocate `count` contiguous physical pages and map
+ * them at `virt` (a vspace_alloc()'d range) in the caller's address
+ * space.  Gated on ATOM_SERVICE_MANAGE.  Returns the pool's physical
+ * base (the handle for shm_map), or a negative error. */
+uint64_t shm_create(uint64_t count, void *virt) {
+    return (uint64_t)sys_call(SYS_SHM_CREATE, (long)count, (long)virt, 0, 0, 0);
+}
+
+/* SYS_SHM_MAP: map `count` pages of the pool at `phys_base` READ-ONLY
+ * into the process holding `subject` at `virt` (vspace_alloc'ed by the
+ * client).  Gated on ATOM_SERVICE_MANAGE + pool-table verification.
+ * Returns 0, or a negative error. */
+int shm_map(uint64_t phys_base, uint64_t count, uint64_t subject, void *virt) {
+    return (int)sys_call(
+        SYS_SHM_MAP, (long)phys_base, (long)count, (long)subject, (long)virt, 0);
 }

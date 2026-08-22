@@ -127,28 +127,44 @@ shell: pkg run <app_id>
 | `sys_cap_revoke_by_atom` | 调用者持 `ATOM_SERVICE_MANAGE` | 同上 |
 | `sys_cap_has_atom` | 调用者持 `ATOM_SERVICE_MANAGE` | 只读查询：`subject` 是否持 `atom` → 1/0 |
 | perm `do_grant` | 调用者持 `ATOM_SERVICE_MANAGE` | 能力制（见下） |
+| perm `do_answer` | 调用者持 `ATOM_SERVICE_MANAGE` | 能力制：term（UI 代理）应答用户裁决；init/perm/pkg 管理面；沙盒应用无法自答（防提权） |
+| perm `do_revoke` | 自撤销恒允许；撤销**他人**授权须持 `ATOM_SERVICE_MANAGE` | 防任意 Ring 3 进程撤销他人授权（DoS） |
+| `sys_panic` | 调用者持 `ATOM_SYS_DEBUG` | 开发者模式原子；防任意 Ring 3 进程一键崩溃内核（DoS） |
+| `sys_kill` | 自杀恒允许；杀**他人**须持 `ATOM_SERVICE_MANAGE` | 防 SIGKILL 掉 manager/serial 等关键服务（DoS） |
+| `sys_notify` | 目标必须为本进程线程 | 防向外部线程注入虚假通知位 |
+| `sys_debug_getchar` | 调用者持 COM1（0x3F8-0x3FF）IO 端口读能力 | 控制台输入归 serial 驱动；防窃取/消耗控制台输入 |
+| `sys_fb_get_info` / `sys_fb_map` | 调用者持 `ATOM_SERVICE_MANAGE` | 显示帧缓冲为共享系统资源，归 term 服务（UI 代理） |
 
 门控用 `cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM, 0)` 判存在（同
 syscall.c:818 SYS_SET_TIME 模式）。
 
-**perm `do_grant` 门控为能力制而非角色制**：授予以「调用者持有 `ATOM_SERVICE_MANAGE`
-原子」为准，而非 `role_is_management`。原因：grant 必须能压倒角色默认（§四 grants
-beat role defaults）——P1 回归把 init 热切换为 GUEST 后仍要求 `PERM_OP_GRANT` 成功，
-而 init 即使 GUEST 也持 `ATOM_SERVICE_MANAGE`（种子）；应用永不可持该原子（原子表
-封闭集合，见 §4），故应用无法授。perm 通过 `cap_has_atom(caller_subject,
-ATOM_SERVICE_MANAGE)` 查询（`SYS_CAP_HAS_ATOM`，新增 syscall 66）。`do_role_set`
-仍为角色制（管理平面热切换）。
+**perm `do_grant`/`do_answer`/`do_revoke` 门控为能力制而非角色制**：授予以「调用者
+持有 `ATOM_SERVICE_MANAGE` 原子」为准，而非 `role_is_management`。原因：grant 必须
+能压倒角色默认（§四 grants beat role defaults）——P1 回归把 init 热切换为 GUEST 后
+仍要求 `PERM_OP_GRANT` 成功，而 init 即使 GUEST 也持 `ATOM_SERVICE_MANAGE`（种子）；
+应用永不可持该原子（原子表封闭集合，见 §4），故应用无法授/无法答/无法撤销**他人**
+授权（自撤销恒允许，无危害）。perm 通过
+`cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE)` 查询（`SYS_CAP_HAS_ATOM`，新增
+syscall 66）。`do_role_set` 仍为角色制（管理平面热切换）。
 
 **种子（不破 P0/P1/P2 回归）**：
-- `kernel_main.c` init 能力表追加 `ATOM_CAP_GRANT_SELF` + `ATOM_SERVICE_MANAGE`
-  （RIGHT_ALL）→ init 的 cap_create_atom/cap_grant_to_subject/cap_revoke_by_atom
-  测试与 P1 GRANT 测试保持绿。
-- `process_desc.c`（sc_sys_process_create 尾部，进程能力表分配后）**按 blob 身份**
-  种子：用户传入 blob 与 `blob_get("perm")`/`blob_get("pkg")` memcmp 相等 →
-  新进程能力表种 `ATOM_SERVICE_MANAGE`。非名字匹配（防伪造 ELF 冒充）；perm 的
-  decision_encode/grant_revoke 与 pkg-manager 的 manifest 签发均依赖此种子。
+- `kernel_main.c` init 能力表追加 `ATOM_CAP_GRANT_SELF` + `ATOM_SERVICE_MANAGE` +
+  `ATOM_SYS_DEBUG`（RIGHT_ALL）→ init 的 cap_create_atom/cap_grant_to_subject/
+  cap_revoke_by_atom 测试、P1 GRANT/ANSWER/REVOKE 测试与 SYS_PANIC 门控保持可用。
+- `process_desc.c`（sc_sys_process_create 尾部，进程能力表分配后）**按 blob 身份 +
+  调用者门控**种子：调用者须持 `ATOM_SERVICE_MANAGE`，且用户传入 blob 与
+  `blob_get("manager")`/`blob_get("perm")`/`blob_get("pkg")`/`blob_get("term")`
+  memcmp 相等 → 新进程能力表种 `ATOM_SERVICE_MANAGE`。**调用者门控是生产加固**：
+  否则应用可 blob_get("perm") + process_create 逐字节副本 → 内容一致种子 → 获得
+  管理原子（提权）。合法链路：init → manager → {perm,pkg,term}，init/manager 均持
+  原子，真实服务 spawn 不受影响。perm 的 decision_encode/grant_revoke、
+  pkg-manager 的 manifest 签发与 term 的 Powerbox 应答（UI 代理）均依赖此种子。
 - syscall 编号追加（`SYS_CAP_HAS_ATOM = 66`，不重排），`SYS_COUNT` 同步为
   `SYS_CAP_HAS_ATOM + 1`。
+- 零拷贝（Phase 3）：`SYS_SHM_CREATE = 67`（受信服务分配物理页池，门控
+  `ATOM_SERVICE_MANAGE`）、`SYS_SHM_MAP = 68`（池页只读映射到客户端，门控
+  `ATOM_SERVICE_MANAGE` + 池表校验，防任意物理内存映射）；`SYS_COUNT` 同步为
+  `SYS_SHM_MAP + 1`。种子表扩展：`vfs`（导出文件页）、`fs_mem_driver`（创建池）。
 
 ## 7. pkg 端口协议摘要（详见 user/services/pkg/pkg.h）
 

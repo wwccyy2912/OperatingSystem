@@ -23,3 +23,6 @@ compile_commands.json
 
 # Disk images
 disk.img
+
+list.sh
+output.txt

@@ -32,4 +32,8 @@ i64 sc_sys_blk_read(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
 i64 sc_sys_blk_write(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
 i64 sc_sys_blk_info(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
 
+/* kernel/mm/shm.c — SYS_SHM_CREATE/MAP (zero-copy read path pools) */
+i64 sc_sys_shm_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
+i64 sc_sys_shm_map(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
+
 #endif /* KERNEL_SYSCALL_HANDLERS_H */

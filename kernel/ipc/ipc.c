@@ -339,8 +339,40 @@ void ipc_port_destroy(port_t port) {
     spin_unlock(&s_ipc_lock);
 }
 
-error_t ipc_send(port_t port, const void *msg, u32 len) {
+/*
+ * Tear down every IPC resource owned by a dying process:
+ *   1. Destroy all its ports — ipc_port_destroy wakes every blocked
+ *      receiver / pending sender / awaiting-reply caller with
+ *      ERR_NOENT, so no client can hang on a dead peer.
+ *   2. Drop registry names whose port belonged to the dying process,
+ *      so a restarted service can re-register its well-known name
+ *      (without this the name leaks and restart fails with ERR_BUSY).
+ * Called from process_reap() (process.c) with the process already
+ * marked ZOMBIE; its threads are all dead.
+ */
+void ipc_cleanup_process(pid_t pid) {
+    for (u32 i = 0; i < MAX_PORTS; i++) {
+        if (s_port_table[i].in_use && s_port_table[i].owner_pid == pid)
+            ipc_port_destroy((port_t)(i + 1));
+    }
+
     spin_lock(&s_ipc_lock);
+    for (u32 i = 0; i < s_port_registry_count;) {
+        port_entry_t *p = port_lookup(s_port_registry[i].port);
+        if (!p || p->owner_pid == pid) {
+            /* Name is dangling (port destroyed) or owned by the dead
+             * process: shift the tail down and retry this slot. */
+            for (u32 j = i; j + 1 < s_port_registry_count; j++)
+                s_port_registry[j] = s_port_registry[j + 1];
+            s_port_registry_count--;
+        } else {
+            i++;
+        }
+    }
+    spin_unlock(&s_ipc_lock);
+}
+
+error_t ipc_send(port_t port, const void *msg, u32 len) {    spin_lock(&s_ipc_lock);
     port_entry_t *p = port_lookup(port);
     if (!p) {
         spin_unlock(&s_ipc_lock);

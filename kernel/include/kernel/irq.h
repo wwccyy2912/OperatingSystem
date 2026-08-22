@@ -31,6 +31,13 @@ error_t irq_bind(u8 irq, u32 mask);
 error_t irq_unbind(u8 irq);
 
 /**
+ * Release every IRQ line bound by threads of a dying process.
+ * Called from process_reap().
+ * @param pid  PID of the dying process.
+ */
+void irq_cleanup_process(pid_t pid);
+
+/**
  * Forward an IRQ to its bound thread (called from the ISR).
  * @param irq  IRQ number (0-15).
  * @return true if a binding was active (forwarded or self-cleaned),

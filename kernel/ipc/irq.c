@@ -66,6 +66,22 @@ error_t irq_unbind(u8 irq) {
 }
 
 /*
+ * Release every IRQ line bound by threads of a dying process.
+ * Complement to irq_handle's lazy self-heal: the line is freed and
+ * disabled immediately on process death instead of waiting for the
+ * next IRQ to discover the dead owner.  Called from process_reap().
+ */
+void irq_cleanup_process(pid_t pid) {
+    for (u32 i = 0; i < IRQ_BINDING_MAX; i++) {
+        if (!s_irq_bindings[i].active)
+            continue;
+        thread_t *t = thread_get(s_irq_bindings[i].tid);
+        if (!t || t->pid == pid)
+            irq_unbind((u8)i);
+    }
+}
+
+/*
  * ISR-side forwarding.  Returns true if a binding was active, so the
  * caller knows the IRQ was consumed (forwarded, or self-cleaned after
  * the owner thread died).

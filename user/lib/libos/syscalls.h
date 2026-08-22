@@ -225,13 +225,15 @@ int mutex_destroy(int handle);
 
 /* --- Signals ---
  * Constants mirror kernel/include/kernel/signal.h (POSIX subset).
- * signal() registers a handler; kill() sends a signal to a process;
- * the kernel's SYS_SIGRETURN is invoked by the __restore_rt trampoline
- * in user/runtime/sigrestore.S (never call it directly).
+ * Signal SEMANTICS live in Ring 3 (kernel_roadmap.md D4/P2):
+ * signal() swaps a slot in the runtime's user-memory handler table
+ * (user/runtime/signal_user.c) -- no syscall involved.  Delivery
+ * enters the runtime's __sig_dispatcher, which decides ignore/
+ * default/handler and restores the interrupted context via the
+ * kernel's SYS_SIGRETURN (never call it directly).
  *
- * SIG_DFL/SIG_IGN are encoded as the integer values 0/1 (the kernel
- * compares handler values numerically) but typed as sighandler_t so
- * they can be passed to/returned from signal() directly. */
+ * SIG_DFL/SIG_IGN are encoded as the integer values 0/1 but typed as
+ * sighandler_t so they can be passed to/returned from signal(). */
 typedef void (*sighandler_t)(int signum);
 
 #define SIGKILL 9 /* uncatchable, unignorable terminate */
@@ -382,3 +384,17 @@ int cap_has_atom(uint64_t subject, atom_id_t atom);
 int ipc_recv_from(int port, void *buf, int *len, int *tok, uint64_t *sender_subject);
 
 #endif /* LIBOS_SYSCALLS_H */
+
+/* ---- Phase 3: zero-copy read path (shared physical-page pools) ---- */
+
+/* SYS_SHM_CREATE — allocate a contiguous physical-page pool mapped at
+ * `virt` in the caller (management-plane gated).  Returns the pool's
+ * physical base (handle for shm_map), or a negative error. */
+uint64_t shm_create(uint64_t count, void *virt);
+
+/* SYS_SHM_MAP — map `count` pool pages at `phys_base` READ-ONLY into
+ * the process holding `subject` at `virt` (vspace_alloc'ed by the
+ * client).  Returns 0, or a negative error. */
+int shm_map(uint64_t phys_base, uint64_t count, uint64_t subject, void *virt);
+
+

@@ -1754,6 +1754,77 @@ out:
  * trusted server (sandboxed clients never talk to the kernel directly);
  * the subject comes from THIS server's ipc_recv_from, never from the
  * request bytes. */
+/* VFS_OP_READ_MAP — Phase 3 zero-copy read.  The caller's read
+ * authorization is re-checked exactly like do_read (handle owner +
+ * live perm_check); the file's pool-backed physical range is then
+ * mapped READ-ONLY into the caller's address space via SYS_SHM_MAP.
+ * Returns the mapped size, or ERR_NOENT when the file is not
+ * pool-backed (client falls back to chunked reads). */
+static void do_read_map(int token, int msg_len, u64 caller_subject) {
+    vfs_resp_read_map_t *resp = (vfs_resp_read_map_t *)s_resp;
+    if (msg_len < (int)sizeof(vfs_req_read_map_t)) {
+        resp->ret = ERR_INVAL;
+        goto out;
+    }
+    vfs_req_read_map_t *req = (vfs_req_read_map_t *)s_req;
+    if (req->map_virt == 0) {
+        resp->ret = ERR_INVAL;
+        goto out;
+    }
+
+    vfs_handle_ent_t *h = handle_find(req->handle);
+    if (!h) {
+        resp->ret = VFS_ERR_STALE;
+        goto out;
+    }
+    if (!(h->access & VFS_ACCESS_READ)) {
+        resp->ret = VFS_ERR_PERM;
+        goto out;
+    }
+    /* Same authz re-check as do_read: revocation takes effect
+     * immediately, and a leaked handle token is rejected. */
+    if (caller_subject != h->subject_id) {
+        resp->ret = VFS_ERR_ACCESS;
+        goto out;
+    }
+    int r = perm_check(&h->resource, VFS_ACCESS_READ, "", h->subject_id, NULL);
+    if (r < 0) {
+        resp->ret = r;
+        goto out;
+    }
+
+    /* Ask the driver for the file's pool-backed physical range. */
+    memset(&s_drv_req, 0, sizeof(s_drv_req));
+    s_drv_req.op      = DRV_OP_PHYS_RANGE;
+    s_drv_req.volume  = s_vols[h->vol_index].drv_vol;
+    s_drv_req.item_id = h->item_id;
+    r                 = vfs_drv_call(h->vol_index, &s_drv_req, &s_drv_resp);
+    if (r < 0) {
+        resp->ret = r;
+        goto out;
+    }
+    if (s_drv_resp.ret < 0) {
+        resp->ret = s_drv_resp.ret; /* ERR_NOENT → fall back to chunked */
+        goto out;
+    }
+
+    /* Map the pool pages READ-ONLY into the caller. */
+    u32 pages = (s_drv_resp.u.pr.size + PAGE_SIZE - 1) / PAGE_SIZE;
+    r         = shm_map(s_drv_resp.u.pr.phys_base, pages, caller_subject, req->map_virt);
+    if (r < 0) {
+        resp->ret = r;
+        goto out;
+    }
+    resp->ret = (i32)s_drv_resp.u.pr.size;
+
+out:
+    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+}
+
+/* VFS_OP_WHOAMI — report the CALLER's kernel-issued subject_id.  Proxies
+ * SYS_GET_SUBJECT through the trusted server (sandboxed clients never
+ * talk to the kernel directly); the subject comes from THIS server's
+ * ipc_recv_from, never from the request bytes. */
 static void do_whoami(int token, int msg_len, u64 subject_id) {
     vfs_resp_whoami_t *resp = (vfs_resp_whoami_t *)s_resp;
     (void)msg_len;
@@ -1778,6 +1849,9 @@ static void vfs_handle_request(int token, u32 op, int msg_len, u64 caller_subjec
         break;
     case VFS_OP_READ:
         do_read(token, msg_len, caller_subject);
+        break;
+    case VFS_OP_READ_MAP:
+        do_read_map(token, msg_len, caller_subject);
         break;
     case VFS_OP_WRITE:
         do_write(token, msg_len, caller_subject);

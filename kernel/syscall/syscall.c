@@ -26,6 +26,9 @@
 #include <kernel/string.h>
 #include <kernel/signal.h>
 #include <kernel/proc_info.h>
+
+/* Forward declarations (defined below in this file). */
+static bool proc_has_io_port_cap(rights_t need, u16 port);
 #include <kernel/panic.h>
 #include <kernel/pci.h>
 
@@ -586,6 +589,17 @@ static i64 sys_unmap_memory(u64 virt, u64 size) {
  * Returns 0 on success, or a negative error.
  */
 static i64 sys_fb_get_info(u64 buf_ptr) {
+    /* GATED (production hardening): the framebuffer is a shared system
+     * display resource owned by the term service (which holds
+     * ATOM_SERVICE_MANAGE via blob identity).  An untrusted app could
+     * otherwise scribble over the whole screen at will. */
+    process_t *proc = process_current();
+    if (!proc || !proc->cap_table)
+        return (i64)ERR_FAULT;
+    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, 0) ==
+        CAP_NULL)
+        return (i64)ERR_NOCAP;
+
     fb_user_info_t info;
     if (fb_get_user_info(&info) < 0)
         return (i64)ERR_NOENT;
@@ -605,6 +619,15 @@ static i64 sys_fb_get_info(u64 buf_ptr) {
  * Returns the virtual address on success, or a negative error.
  */
 static i64 sys_fb_map(u64 virt, u64 size) {
+    /* GATED: same as sys_fb_get_info — only the term service (management
+     * atom holder) may map the display framebuffer. */
+    process_t *gproc = process_current();
+    if (!gproc || !gproc->cap_table)
+        return (i64)ERR_FAULT;
+    if (cap_lookup_by_atom(gproc->cap_table, gproc->subject_id, ATOM_SERVICE_MANAGE, 0) ==
+        CAP_NULL)
+        return (i64)ERR_NOCAP;
+
     fb_user_info_t info;
     if (fb_get_user_info(&info) < 0)
         return (i64)ERR_NOENT;
@@ -1069,14 +1092,30 @@ static i64 sys_blob_get(u64 name_ptr, u64 buf_ptr, u64 buf_size) {
 /* ---- Serial I/O ---- */
 
 static i64 sys_debug_getchar(void) {
+    /* GATED (production hardening): console input belongs to the COM1
+     * driver — the serial service holds the 0x3F8..0x3FF IO-port cap
+     * (serial.c cap_create_obj).  Without this any Ring-3 process
+     * could consume/steal the console input stream. */
+    if (!proc_has_io_port_cap(RIGHT_READ, 0x3F8)) /* SERIAL_COM1_BASE */
+        return (i64)ERR_NOCAP;
     char c = serial_getchar();
     return (i64)(unsigned char)c;
 }
 
 /*
  * Notification: OR a bitmask into a target thread's pending signals.
+ * GATED (production hardening): the target must be a thread of the
+ * CALLING process — no other process may inject spurious wakeups /
+ * fake notification bits into a foreign thread.  (The kernel's own
+ * irq.c forwards IRQs via notify() internally and is unaffected.)
  */
 static i64 sys_notify(u64 target_tid, u64 mask) {
+    process_t *proc = process_current();
+    if (!proc)
+        return (i64)ERR_FAULT;
+    thread_t *t = thread_get((tid_t)target_tid);
+    if (!t || t->pid != proc->pid)
+        return (i64)ERR_NOENT; /* foreign/unknown TID: no existence leak */
     return (i64)notify((tid_t)target_tid, (u32)mask);
 }
 
@@ -1252,9 +1291,12 @@ static i64 sys_reboot(void) {
 }
 
 /*
- * Temporary test hook (SYS_PANIC): panic the kernel on demand from user
- * space.  Lets the shell 'panic' command exercise the unified panic
- * path (kernel/panic.c) end-to-end.  noreturn: the kernel halts here.
+ * Panic hook (SYS_PANIC): panic the kernel on demand.
+ * Lets the shell 'panic' command exercise the unified panic path
+ * (kernel/panic.c) end-to-end.
+ * GATED (permission_model.md §四): the CALLER must hold ATOM_SYS_DEBUG
+ * (developer mode).  Without the gate any Ring-3 process could halt the
+ * whole system at will (trivial DoS).  noreturn on success.
  */
 static i64 sc_sys_panic(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     (void)a1;
@@ -1262,41 +1304,38 @@ static i64 sc_sys_panic(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     (void)a3;
     (void)a4;
     (void)a5;
+
+    process_t *proc = process_current();
+    if (!proc || !proc->cap_table)
+        return (i64)ERR_FAULT;
+    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_SYS_DEBUG, 0) == CAP_NULL)
+        return (i64)ERR_NOCAP;
+
     panic("User-triggered panic (SYS_PANIC from shell)");
     __builtin_unreachable();
 }
 
 /*
- * POSIX-style signal registration (SYS_SIGNAL).
- * a1 = signum (1..NSIG-1; SIGKILL/SIGSTOP are uncatchable/unignorable),
- * a2 = handler: SIG_DFL (0), SIG_IGN (1), or a user handler address,
- * a3 = restorer: __restore_rt trampoline address (required when a2 is
- *      a real handler; the kernel jumps to it after the handler rets).
- * @return Previous handler for signum (SIG_DFL if never set), or a
- *         negative error code.
+ * Register the Ring 3 signal dispatcher (SYS_SIGNAL).
+ * a1 = dispatcher address (user/runtime/signal_user.c
+ *      __sig_dispatcher), installed once by a C-runtime constructor
+ *      at process startup.
+ * Delivery snapshots the interrupted context into a sigframe on the
+ * user stack and enters the dispatcher with RDI = sigframe base; the
+ * handler table and default-action policy live entirely in Ring 3
+ * (kernel_roadmap.md D4/P2).
+ * @return OK, or a negative error code.
  */
-static i64 sys_signal(u64 signum, u64 handler, u64 restorer) {
-    if (signum == 0 || signum >= NSIG)
+static i64 sys_signal(u64 dispatcher) {
+    if (dispatcher < 0x1000 || dispatcher >= USER_PTR_MAX)
         return (i64)ERR_INVAL;
-    if (signum == SIGKILL || signum == SIGSTOP)
-        return (i64)ERR_INVAL;
-
-    if (handler != SIG_DFL && handler != SIG_IGN) {
-        if (handler < 0x1000 || handler >= USER_PTR_MAX)
-            return (i64)ERR_INVAL;
-        if (restorer < 0x1000 || restorer >= USER_PTR_MAX)
-            return (i64)ERR_INVAL;
-    }
 
     process_t *proc = process_current();
     if (!proc)
         return (i64)ERR_NOMEM;
 
-    u64 old                    = proc->sig_handlers[signum];
-    proc->sig_handlers[signum] = handler;
-    if (handler != SIG_DFL && handler != SIG_IGN)
-        proc->sig_restorer = restorer;
-    return (i64)old;
+    proc->sig_dispatcher = dispatcher;
+    return OK;
 }
 
 /*
@@ -1314,6 +1353,18 @@ static i64 sys_kill(u64 pid, u64 signum) {
     if (proc->state == PROC_STATE_ZOMBIE || proc->state == PROC_STATE_FINISHED)
         return (i64)ERR_NOENT;
 
+    /* GATED (production hardening, permission_model.md §四): a process
+     * may signal only ITSELF (own process); signalling another process
+     * requires ATOM_SERVICE_MANAGE.  Without this any Ring-3 process
+     * could SIGKILL the manager/serial/term services (system DoS). */
+    process_t *caller = process_current();
+    if (!caller || !caller->cap_table)
+        return (i64)ERR_FAULT;
+    if (proc->pid != caller->pid &&
+        cap_lookup_by_atom(caller->cap_table, caller->subject_id, ATOM_SERVICE_MANAGE, 0) ==
+            CAP_NULL)
+        return (i64)ERR_NOCAP;
+
     if (signum == SIGKILL) {
         /* Force-kill: every thread gets force_exit and blocked ones
          * are woken; each dies at its next checkpoint. */
@@ -1328,25 +1379,17 @@ static i64 sys_kill(u64 pid, u64 signum) {
         return OK;
     }
 
-    u64 handler = proc->sig_handlers[signum];
-    if (handler == SIG_IGN)
-        return OK;
-
-    if (handler == SIG_DFL) {
-        if (signal_default_terminates((int)signum))
-            signal_kill_process(proc, 128 + (int)signum);
-        return OK; /* otherwise default action is ignore */
-    }
-
-    /* Registered handler: latch the pending bit; the delivery core
-     * pops it lazily at the next checkpoint on some thread. */
+    /* Semantics live in Ring 3 (kernel_roadmap.md D4/P2): just latch
+     * the pending bit; the user dispatcher decides ignore/default/
+     * handler at delivery time. */
     proc->sig_pending |= (1ULL << signum);
     return OK;
 }
 
 /*
  * Return from a signal handler (SYS_SIGRETURN).
- * a1 = sigframe base address, passed in RDI by __restore_rt.
+ * a1 = sigframe base address, passed in RDI by the Ring 3 signal
+ *      dispatcher (user/runtime/signal_user.c).
  * @return The restored user RAX (or a negative error code).
  */
 static i64 sys_sigreturn(u64 frame_ptr) {
@@ -1486,7 +1529,7 @@ SYSCALL0(sys_reboot)
 SYSCALL1(sys_set_time)
 SYSCALL1(sys_fb_get_info)
 SYSCALL2(sys_fb_map)
-SYSCALL3(sys_signal)
+SYSCALL1(sys_signal)
 SYSCALL2(sys_kill)
 SYSCALL1(sys_sigreturn)
 
@@ -1553,6 +1596,8 @@ static const syscall_fn_t s_syscall_table[SYS_COUNT] = {
     [SYS_BLK_READ]             = sc_sys_blk_read,
     [SYS_BLK_WRITE]            = sc_sys_blk_write,
     [SYS_BLK_INFO]             = sc_sys_blk_info,
+    [SYS_SHM_CREATE]           = sc_sys_shm_create,
+    [SYS_SHM_MAP]              = sc_sys_shm_map,
 };
 
 /**

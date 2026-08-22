@@ -16,6 +16,7 @@
 
 #include <kernel/blob.h>
 #include <kernel/string.h>
+#include <kernel/panic.h>
 
 /* Embedded blobs (defined by build/<name>_blob.o, one per service) */
 extern char init_elf_start[], init_elf_end[], init_elf_size[];
@@ -26,6 +27,7 @@ extern char keyboard_elf_start[], keyboard_elf_end[], keyboard_elf_size[];
 extern char term_elf_start[], term_elf_end[], term_elf_size[];
 extern char shell_elf_start[], shell_elf_end[], shell_elf_size[];
 extern char flaky_elf_start[], flaky_elf_end[], flaky_elf_size[];
+extern char crashpeer_elf_start[], crashpeer_elf_end[], crashpeer_elf_size[];
 extern char vfs_elf_start[], vfs_elf_end[], vfs_elf_size[];
 extern char fs_mem_driver_elf_start[], fs_mem_driver_elf_end[], fs_mem_driver_elf_size[];
 extern char fs_virtio_blk_driver_elf_start[], fs_virtio_blk_driver_elf_end[],
@@ -35,32 +37,48 @@ extern char device_mgr_elf_start[], device_mgr_elf_end[], device_mgr_elf_size[];
 extern char pkg_elf_start[], pkg_elf_end[], pkg_elf_size[];
 extern char sbox_demo_elf_start[], sbox_demo_elf_end[], sbox_demo_elf_size[];
 extern char runtime_demo_elf_start[], runtime_demo_elf_end[], runtime_demo_elf_size[];
+extern char tui_demo_elf_start[], tui_demo_elf_end[], tui_demo_elf_size[];
+extern char window_demo_elf_start[], window_demo_elf_end[], window_demo_elf_size[];
 
 static blob_entry_t s_blobs[BLOB_MAX_ENTRIES];
 static int          s_blob_count = 0;
 
 void blob_init(void) {
-    (void)blob_register("init", init_elf_start, (u64)init_elf_size);
-    (void)blob_register("manager", manager_elf_start, (u64)manager_elf_size);
-    (void)blob_register("serial", serial_elf_start, (u64)serial_elf_size);
-    (void)blob_register("keyboard", keyboard_elf_start, (u64)keyboard_elf_size);
-    (void)blob_register("term", term_elf_start, (u64)term_elf_size);
-    (void)blob_register("shell", shell_elf_start, (u64)shell_elf_size);
-    (void)blob_register("flaky", flaky_elf_start, (u64)flaky_elf_size);
-    (void)blob_register("hello", hello_elf_start, (u64)hello_elf_size);
-    (void)blob_register("vfs", vfs_elf_start, (u64)vfs_elf_size);
-    (void)blob_register("fs_mem_driver", fs_mem_driver_elf_start, (u64)fs_mem_driver_elf_size);
-    (void)blob_register(
+    /* Every registration MUST succeed: a missing blob means a service
+     * can never be spawned (it would fail subtly at runtime).  Fail
+     * the boot loudly instead of limping on. */
+#define BLOB_REG(name, data, sz)                              \
+    do {                                                      \
+        if (blob_register(name, data, sz) != OK)              \
+            panic("blob_init: register '%s' failed", name);   \
+    } while (0)
+
+    BLOB_REG("init", init_elf_start, (u64)init_elf_size);
+    BLOB_REG("manager", manager_elf_start, (u64)manager_elf_size);
+    BLOB_REG("serial", serial_elf_start, (u64)serial_elf_size);
+    BLOB_REG("keyboard", keyboard_elf_start, (u64)keyboard_elf_size);
+    BLOB_REG("term", term_elf_start, (u64)term_elf_size);
+    BLOB_REG("shell", shell_elf_start, (u64)shell_elf_size);
+    BLOB_REG("flaky", flaky_elf_start, (u64)flaky_elf_size);
+    BLOB_REG("crashpeer", crashpeer_elf_start, (u64)crashpeer_elf_size);
+    BLOB_REG("hello", hello_elf_start, (u64)hello_elf_size);
+    BLOB_REG("vfs", vfs_elf_start, (u64)vfs_elf_size);
+    BLOB_REG("fs_mem_driver", fs_mem_driver_elf_start, (u64)fs_mem_driver_elf_size);
+    BLOB_REG(
         "fs_virtio_blk_driver", fs_virtio_blk_driver_elf_start, (u64)fs_virtio_blk_driver_elf_size);
-    (void)blob_register("perm", perm_elf_start, (u64)perm_elf_size);
-    (void)blob_register("device_mgr", device_mgr_elf_start, (u64)device_mgr_elf_size);
-    (void)blob_register("pkg", pkg_elf_start, (u64)pkg_elf_size);
-    (void)blob_register("sbox_demo", sbox_demo_elf_start, (u64)sbox_demo_elf_size);
-    (void)blob_register("runtime_demo", runtime_demo_elf_start, (u64)runtime_demo_elf_size);
+    BLOB_REG("perm", perm_elf_start, (u64)perm_elf_size);
+    BLOB_REG("device_mgr", device_mgr_elf_start, (u64)device_mgr_elf_size);
+    BLOB_REG("pkg", pkg_elf_start, (u64)pkg_elf_size);
+    BLOB_REG("sbox_demo", sbox_demo_elf_start, (u64)sbox_demo_elf_size);
+    BLOB_REG("runtime_demo", runtime_demo_elf_start, (u64)runtime_demo_elf_size);
+    BLOB_REG("tui_demo", tui_demo_elf_start, (u64)tui_demo_elf_size);
+    BLOB_REG("window_demo", window_demo_elf_start, (u64)window_demo_elf_size);
     /* Alias: the same sandbox ELF installed WITHOUT permissions
      * (docs/ops_format.md §8.5: pkg install sbox_demo_noperm).  The
      * blob payload is identical — only the manifest atoms differ. */
-    (void)blob_register("sbox_demo_noperm", sbox_demo_elf_start, (u64)sbox_demo_elf_size);
+    BLOB_REG("sbox_demo_noperm", sbox_demo_elf_start, (u64)sbox_demo_elf_size);
+
+#undef BLOB_REG
 }
 
 int blob_register(const char *name, const void *data, u64 size) {

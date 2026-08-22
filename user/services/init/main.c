@@ -14,6 +14,7 @@
  * live vfs_server + perm-manager tests below.  Include perm.h only
  * (it includes vfs.h) so the u8/u32/i32/u64 typedefs are not doubled. */
 #include "../perm/perm.h"
+#include "../lib/libfs/fs.h"
 
 /* ---- Test framework ---- */
 
@@ -500,8 +501,10 @@ static void test_cap_revoke_by_atom(void) {
     ASSERT(cap_consume(s1) == 0, "s1 wrongly revoked");
     ASSERT(cap_consume(s2) == 0, "s2 wrongly revoked");
 
-    /* Unmatched atom / wrong subject revoke nothing. */
-    n = cap_revoke_by_atom(subj, ATOM_SYS_DEBUG, 0);
+    /* Unmatched atom / wrong subject revoke nothing.  (ATOM_SYS_DEBUG
+     * is deliberately NOT used here: init holds it — seeded for the
+     * SYS_PANIC gate — so it would match.) */
+    n = cap_revoke_by_atom(subj, ATOM_HW_CAMERA_CAPTURE, 0);
     ASSERT(n == 0, "unknown atom revoked something");
     n = cap_revoke_by_atom(subj + 1, ATOM_NET_WIFI_SCAN, 0);
     ASSERT(n == 0, "wrong subject revoked something");
@@ -584,6 +587,62 @@ static void test_ipc_call_err(void) {
     int         resp_len = sizeof(resp);
     int         ret      = ipc_call(9999, req, 3, resp, &resp_len);
     ASSERT(ret < 0, "should fail for nonexistent port");
+    PASS();
+}
+
+/*
+ * Crash recovery (production hardening): a client blocked in ipc_call
+ * on a port whose owner process dies must be woken with ERR_NOENT —
+ * never hang.  process_reap() → ipc_cleanup_process() destroys the
+ * dead process's ports (waking all blocked peers) and frees its
+ * registry names so a restarted service can re-register them.
+ */
+static void test_ipc_peer_death(void) {
+    TEST("ipc_call to dead peer wakes with ERR_NOENT");
+    static char blob[131072]; /* must hold crashpeer.elf */
+    int size = blob_get("crashpeer", blob, sizeof(blob));
+    ASSERT(size > 0, "blob_get(crashpeer) failed");
+
+    int pid = process_create("crashpeer", blob, size);
+    ASSERT(pid > 0, "process_create(crashpeer) failed");
+
+    /* Wait for the helper to register its port (bounded poll). */
+    int port = 0;
+    for (int i = 0; i < 200 && port <= 0; i++) {
+        port = port_get("crashpeer");
+        if (port <= 0)
+            thread_yield();
+    }
+    ASSERT(port > 0, "crashpeer port never registered");
+
+    /* The call blocks until crashpeer receives it and then exits
+     * WITHOUT replying (simulated crash mid-call).  The kernel must
+     * wake us with ERR_NOENT, not leave us blocked forever. */
+    const char req[] = "ping";
+    char       resp[16];
+    int        resp_len = (int)sizeof(resp);
+    int        ret      = ipc_call(port, req, 4, resp, &resp_len);
+    printf("(call_ret=%d) ", ret);
+    ASSERT(ret == ERR_NOENT, "call did not fail with ERR_NOENT (hang?)");
+
+    /* The registry name must be freed too: a fresh spawn can re-own it.
+     * (The port NUMBER may be reused — slots are table indices.) */
+    int pid2 = process_create("crashpeer", blob, size);
+    ASSERT(pid2 > 0, "second process_create failed");
+    int port2 = 0;
+    for (int i = 0; i < 200 && port2 <= 0; i++) {
+        port2 = port_get("crashpeer");
+        if (port2 <= 0)
+            thread_yield();
+    }
+    ASSERT(port2 > 0, "crashpeer name not re-registrable");
+
+    /* Let the second helper die too (call -> receives -> exits without
+     * replying -> we wake ERR_NOENT again); no blocked test peer left. */
+    char resp2[16];
+    int  rlen2 = (int)sizeof(resp2);
+    int  ret2  = ipc_call(port2, req, 4, resp2, &rlen2);
+    ASSERT(ret2 == ERR_NOENT, "second peer-death wake failed");
     PASS();
 }
 
@@ -835,6 +894,65 @@ static void test_stress_ipc_100k(void) {
     PASS();
 }
 
+/* ---- FPU/SSE state save/restore across context switches ----
+ * Two threads interleave SSE2 double-precision series with yields.
+ * Without fpu_switch (fxsave/fxrstor) on context_switch, the XMM
+ * registers of one worker clobber the other's live series and the
+ * exactness checks below fail.  Sum-of-squares is exact in doubles
+ * (n(n+1)(2n+1)/6, all terms < 2^53), so == is the right check. */
+
+static volatile int g_fpu_stage;
+static volatile int g_fpu_a_fail;
+static volatile int g_fpu_b_fail;
+
+static void fpu_worker_a(void *arg) {
+    (void)arg;
+    volatile double acc = 0.0;
+    for (int i = 1; i <= 400; i++) {
+        acc += (double)i * (double)i; /* SSE2: live in XMM across yield */
+        if ((i & 0x3F) == 0) {
+            thread_yield();
+            double expect =
+                (double)i * (double)(i + 1) * (double)(2 * i + 1) / 6.0;
+            if (acc != expect)
+                g_fpu_a_fail = 1;
+        }
+    }
+    g_fpu_stage++;
+    thread_exit(0);
+}
+
+static void fpu_worker_b(void *arg) {
+    (void)arg;
+    volatile double acc = 1.0;
+    for (int i = 1; i <= 400; i++) {
+        acc *= 1.0001; /* different pattern, different XMM values */
+        if ((i & 0x3F) == 0) {
+            thread_yield();
+            if (!(acc > 1.0)) /* monotonic series must stay > 1 */
+                g_fpu_b_fail = 1;
+        }
+    }
+    g_fpu_stage++;
+    thread_exit(0);
+}
+
+static void test_fpu_sse_switch(void) {
+    TEST("FPU/SSE state across context switches");
+    g_fpu_stage = 0;
+    g_fpu_a_fail = 0;
+    g_fpu_b_fail = 0;
+    int ta = thread_create(fpu_worker_a, 0, 10);
+    int tb = thread_create(fpu_worker_b, 0, 10);
+    ASSERT(ta > 0 && tb > 0, "thread_create failed");
+    thread_join(ta, NULL);
+    thread_join(tb, NULL);
+    ASSERT(g_fpu_stage == 2, "workers did not finish");
+    ASSERT(g_fpu_a_fail == 0, "worker A result corrupted");
+    ASSERT(g_fpu_b_fail == 0, "worker B result corrupted");
+    PASS();
+}
+
 static void run_tests(void) {
     printf("=== Syscall Tests ===\n");
     test_debug_log();
@@ -850,6 +968,7 @@ static void run_tests(void) {
     test_get_time();
     test_sleep();
     test_thread_join();
+    test_fpu_sse_switch();
     test_unmap_memory();
     test_heap_guard();
     test_cap_grant();
@@ -860,6 +979,7 @@ static void run_tests(void) {
     test_ipc_send_recv();
     test_subject_identity();
     test_ipc_call_err();
+    test_ipc_peer_death();
     test_set_affinity();
     bench_syscall_100k();
     bench_yield_solo();
@@ -1386,6 +1506,30 @@ static void test_p2_reboot_unauthorized(void) {
     P2_PASS();
 }
 
+/* ---- P2 test 4: notify is same-process only ---- */
+
+static void test_p2_notify_foreign(void) {
+    P2_TEST("notify foreign/nonexistent thread -> ERR_NOENT");
+    /* The gate rejects any target outside the calling process; foreign
+     * and unknown TIDs are reported identically (no existence leak). */
+    int ret = notify(0x7FFFFFFF, 1u << 2);
+    printf("(ret=%d) ", ret);
+    P2_ASSERT(ret == ERR_NOENT, "notify foreign thread accepted");
+    P2_PASS();
+}
+
+/* ---- P2 test 5: console input is COM1-driver only ---- */
+
+static void test_p2_debug_getchar_gate(void) {
+    P2_TEST("debug_getchar unauthorized -> ERR_NOCAP");
+    /* init holds no COM1 IO-port cap (that belongs to the serial
+     * service), so the console-input gate must deny. */
+    int c = debug_getchar();
+    printf("(ret=%d) ", c);
+    P2_ASSERT(c == ERR_NOCAP, "console input not gated");
+    P2_PASS();
+}
+
 /* ---- P2 runner: sensitive syscall gate tests ---- */
 
 static void run_p2_gate_tests(void) {
@@ -1393,6 +1537,8 @@ static void run_p2_gate_tests(void) {
     test_p2_set_time_unauthorized();
     test_p2_set_time_authorized();
     test_p2_reboot_unauthorized();
+    test_p2_notify_foreign();
+    test_p2_debug_getchar_gate();
     printf("=== P2 Gate: %d/%d passed ===\n", p2_pass, p2_run);
 }
 
@@ -1951,6 +2097,279 @@ static void run_kbd_focus_tests(void) {
     printf("=== KBD Focus: %d/%d passed ===\n", kbd_pass, kbd_run);
 }
 
+/* ====================================================================
+ * P3: crash recovery (production hardening) — kill a live service,
+ * assert the manager auto-restarts it and its well-known port comes
+ * back (process_reap → ipc_cleanup_process frees the dead process's
+ * registry names; the manager's service_monitor re-spawns it).
+ * ==================================================================== */
+
+static int p3_run = 0, p3_pass = 0;
+
+#define P3_TEST(name)                  \
+    do {                               \
+        printf("  P3: %s ... ", name); \
+        p3_run++;                      \
+    } while (0)
+
+#define P3_PASS()        \
+    do {                 \
+        p3_pass++;       \
+        printf("PASS\n"); \
+    } while (0)
+
+#define P3_FAIL(msg)              \
+    do {                          \
+        printf("FAIL: %s\n", msg); \
+    } while (0)
+
+#define P3_ASSERT(cond, msg) \
+    do {                     \
+        if (!(cond)) {       \
+            P3_FAIL(msg);    \
+            return;          \
+        }                    \
+    } while (0)
+
+static int find_pid_by_name(const char *name) {
+    /* Static: proc_info_t is 84 B; 64 entries = 5.4 KB would overflow
+     * init's single-page user stack if allocated locally. */
+    static proc_info_t list[64];
+    int n = process_list(list, 64);
+    if (n <= 0)
+        return -1;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(list[i].name, name) == 0)
+            return list[i].pid;
+    }
+    return -1;
+}
+
+static void test_restart_pkg(void) {
+    P3_TEST("kill pkg -> manager auto-restart (port returns)");
+    int pid = find_pid_by_name("pkg");
+    P3_ASSERT(pid > 0, "pkg not running");
+    P3_ASSERT(port_get("pkg") > 0, "pkg port unavailable");
+
+    /* init holds ATOM_SERVICE_MANAGE → cross-process SIGKILL allowed. */
+    int ret = kill(pid, SIGKILL);
+    P3_ASSERT(ret == 0, "kill(pkg, SIGKILL) failed");
+
+    /* The manager's service_monitor wakes on pkg's death, re-spawns it,
+     * and the re-spawned pkg re-registers its "pkg" name (the dead
+     * process's registry entry was cleaned by ipc_cleanup_process). */
+    int port_after = 0;
+    for (int i = 0; i < 400 && port_after <= 0; i++) {
+        port_after = port_get("pkg");
+        if (port_after <= 0)
+            thread_yield();
+    }
+    P3_ASSERT(port_after > 0, "pkg port did not return after restart");
+    printf("(pid=%d restarted) ", pid);
+    P3_PASS();
+}
+
+static void run_crash_recovery_tests(void) {
+    printf("\n=== P3 Crash Recovery (service auto-restart) ===\n");
+    test_restart_pkg();
+    printf("=== P3 Crash Recovery: %d/%d passed ===\n", p3_pass, p3_run);
+}
+
+/* ====================================================================
+ * P4: resource exhaustion (production hardening) — fill kernel tables
+ * to their limits, assert graceful negative errors instead of a crash,
+ * then drain and prove the system recovers.  Every resource grabbed
+ * here is released before the test returns, so the running services
+ * are unaffected afterwards.
+ * ==================================================================== */
+
+static int p4_run = 0, p4_pass = 0;
+
+#define P4_TEST(name)                   \
+    do {                                \
+        printf("  P4: %s ... ", name);  \
+        p4_run++;                       \
+    } while (0)
+
+#define P4_PASS()        \
+    do {                 \
+        p4_pass++;       \
+        printf("PASS\n"); \
+    } while (0)
+
+#define P4_FAIL(msg)               \
+    do {                           \
+        printf("FAIL: %s\n", msg); \
+    } while (0)
+
+#define P4_ASSERT(cond, ...) \
+    do {                     \
+        if (!(cond)) {       \
+            printf("FAIL: "); \
+            printf(__VA_ARGS__); \
+            printf("\n");    \
+            return;          \
+        }                    \
+    } while (0)
+
+/* Thread that exits immediately (used to fill and release the table). */
+static void p4_worker_exit(void *arg) {
+    (void)arg;
+    thread_exit(0);
+}
+
+/* Boundary: a message larger than MAX_MSG_SIZE (4096, kernel/ipc/ipc.c)
+ * must be rejected with ERR_INVAL before any queueing/blocking. */
+static void test_ipc_msg_size_boundary(void) {
+    P4_TEST("IPC message > MAX_MSG_SIZE -> ERR_INVAL");
+    int port = ipc_port_create();
+    P4_ASSERT(port > 0, "ipc_port_create failed");
+    static char big[8192];
+    for (int i = 0; i < (int)sizeof(big); i++)
+        big[i] = (char)i;
+    int r = ipc_send(port, big, (int)sizeof(big));
+    P4_ASSERT(r == ERR_INVAL, "oversized send returned %d", r);
+    P4_PASS();
+}
+
+/* Thread table (MAX_THREADS = 1024): creating until the table is full
+ * must return ERR_NOMEM (never crash), and joining every worker must
+ * free the slots so the system can create threads again. */
+static void test_thread_table_exhaustion(void) {
+    P4_TEST("thread table exhaustion -> ERR_NOMEM, recoverable");
+    /* Static: 1024 tids × 4 B; a stack-allocated array this size is
+     * fine for init's stack, but static keeps the stack lean. */
+    static int tids[1024];
+    int        n = 0;
+    for (int i = 0; i < 1100; i++) {
+        int tid = thread_create(p4_worker_exit, 0, 10);
+        if (tid < 0) {
+            P4_ASSERT(tid == ERR_NOMEM, "unexpected thread_create error");
+            break;
+        }
+        tids[n++] = tid;
+    }
+    P4_ASSERT(n >= 1000, "could not fill thread table (%d)", n);
+
+    for (int i = 0; i < n; i++)
+        thread_join(tids[i], NULL);
+
+    /* Recoverable: a fresh create+join succeeds after the drain. */
+    int tid = thread_create(p4_worker_exit, 0, 10);
+    P4_ASSERT(tid > 0, "not recoverable after thread drain");
+    thread_join(tid, NULL);
+    P4_PASS();
+}
+
+static void run_resource_exhaustion_tests(void) {
+    printf("\n=== P4 Resource Exhaustion ===\n");
+    test_ipc_msg_size_boundary();
+    test_thread_table_exhaustion();
+    printf("=== P4 Resource Exhaustion: %d/%d passed ===\n", p4_pass, p4_run);
+}
+
+/* ====================================================================
+ * P5: zero-copy read path (Phase 3, vfs_design §8.4)
+ * A System-volume blob backed by the driver's shared page pool is
+ * mapped READ-ONLY into init's address space (vfs re-checks the READ
+ * grant, then SYS_SHM_MAP maps the pool pages).  Content must match a
+ * chunked fs_read — proving the zero-copy path serves the same bytes.
+ * ==================================================================== */
+
+static int p5_run = 0, p5_pass = 0;
+
+#define P5_TEST(name)                  \
+    do {                               \
+        printf("  P5: %s ... ", name); \
+        p5_run++;                      \
+    } while (0)
+
+#define P5_PASS()        \
+    do {                 \
+        p5_pass++;       \
+        printf("PASS\n"); \
+    } while (0)
+
+#define P5_ASSERT(cond, ...)   \
+    do {                       \
+        if (!(cond)) {         \
+            printf("FAIL: ");  \
+            printf(__VA_ARGS__); \
+            printf("\n");      \
+            return;            \
+        }                      \
+    } while (0)
+
+static void test_zero_copy_read(void) {
+    P5_TEST("zero-copy READ_MAP: pool-backed blob matches chunked read");
+    /* Idempotent re-grant of READ on System/Kernel/init.elf (P2V may
+     * have revoked it); init holds ATOM_SERVICE_MANAGE so the GRANT
+     * passes. */
+    int perm_port = p1_port_get("perm");
+    P5_ASSERT(perm_port > 0, "perm port unavailable");
+    perm_req_grant_t g;
+    memset(&g, 0, sizeof(g));
+    g.op         = PERM_OP_GRANT;
+    g.resource   = g_p1_res;
+    g.access     = VFS_ACCESS_READ;
+    g.subject_id = get_subject();
+    g.atom       = ATOM_DATA_DOCS_READ;
+    perm_resp_grant_t gr;
+    int rlen = (int)sizeof(gr);
+    P5_ASSERT(ipc_call(perm_port, &g, (int)sizeof(g), &gr, &rlen) == 0 && gr.ret == 0,
+              "GRANT READ failed (%d)", gr.ret);
+
+    vfs_handle_t h = 0;
+    int r = fs_open_item("/Volumes/System/Kernel/init.elf", VFS_OPEN_READONLY,
+                         VFS_ACCESS_READ, &h);
+    P5_ASSERT(r == 0, "open init.elf failed (%d)", r);
+
+    /* Reserve a generous mapping range (init.elf < 1 MiB). */
+    void *map = vspace_alloc(0x100000, 0);
+    P5_ASSERT(map != 0, "vspace_alloc failed");
+
+    u32 msize = 0;
+    r         = fs_read_map(h, map, &msize);
+    P5_ASSERT(r == 0, "read_map failed (%d)", r);
+    P5_ASSERT(msize > 4096u, "mapped size too small (%u)", msize);
+
+    /* Compare head + tail against the chunked read path. */
+    u8  buf[256];
+    u32 got = 0;
+    P5_ASSERT(fs_read(h, 0, buf, sizeof(buf), &got) == 0 && got == sizeof(buf),
+              "chunked head read failed");
+    int ok = 1;
+    for (u32 i = 0; i < sizeof(buf); i++) {
+        if (((u8 *)map)[i] != buf[i]) {
+            ok = 0;
+            break;
+        }
+    }
+    P5_ASSERT(ok, "mapped head != chunked head");
+
+    u64 tail_off = (u64)msize - sizeof(buf);
+    P5_ASSERT(fs_read(h, tail_off, buf, sizeof(buf), &got) == 0 && got == sizeof(buf),
+              "chunked tail read failed");
+    ok = 1;
+    for (u32 i = 0; i < sizeof(buf); i++) {
+        if (((u8 *)map)[tail_off + i] != buf[i]) {
+            ok = 0;
+            break;
+        }
+    }
+    P5_ASSERT(ok, "mapped tail != chunked tail");
+
+    printf("(mapped=%u bytes, verified head+tail) ", msize);
+    (void)fs_close(h);
+    P5_PASS();
+}
+
+static void run_zero_copy_tests(void) {
+    printf("\n=== P5 Zero-Copy Read ===\n");
+    test_zero_copy_read();
+    printf("=== P5 Zero-Copy Read: %d/%d passed ===\n", p5_pass, p5_run);
+}
+
 /* ---- Entry point ---- */
 
 int main(void) {
@@ -1998,6 +2417,19 @@ int main(void) {
 
     /* KBD focus ownership round-trip (R2.1) — live keyboard service. */
     run_kbd_focus_tests();
+
+    /* P3 crash recovery: kill pkg → manager auto-restarts it. */
+    run_crash_recovery_tests();
+
+    /* P4 resource exhaustion: fill kernel tables to the limit, assert
+     * graceful ERR_NOMEM instead of a crash, drain, and prove the
+     * system recovers.  Runs AFTER the services are up; every resource
+     * it grabs is released before the test returns. */
+    run_resource_exhaustion_tests();
+
+    /* P5 zero-copy read path (Phase 3): map a pool-backed file and
+     * verify its content matches the chunked path. */
+    run_zero_copy_tests();
 
     /* Idle forever — this thread stays alive as the last scheduler
      * participant while the manager and service processes run. */

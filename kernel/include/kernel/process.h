@@ -61,14 +61,17 @@ typedef struct process {
     u64 app_uuid_hi;
     u64 app_uuid_lo;
 
-    /* POSIX-style signals (kernel/signal.h).  Handler table indexed by
-     * signal number (1..NSIG-1): SIG_DFL (0), SIG_IGN (1), or a user
-     * handler address.  sig_pending is the process-wide pending bitmask
-     * (bit N = signal N pending).  sig_restorer is the per-process
-     * __restore_rt address passed at SYS_SIGNAL registration time. */
-    u64 sig_handlers[NSIG];
+    /* Signals (kernel/signal.h) — Ring 3 migration (kernel_roadmap.md
+     * D4/P2): the kernel keeps only MECHANISM.  sig_pending is the
+     * process-wide pending bitmask (bit N = signal N pending);
+     * sig_dispatcher is the Ring 3 entry point registered once by the
+     * C runtime at startup (SYS_SIGNAL).  Delivery snapshots the
+     * interrupted context into a sigframe on the user stack and diverts
+     * RIP = sig_dispatcher, RDI = sigframe base; all semantics (handler
+     * table, SIG_IGN/SIG_DFL policy, default actions) live in the
+     * user-space runtime (user/runtime/signal_user.c). */
+    u64 sig_dispatcher;
     u64 sig_pending;
-    u64 sig_restorer;
 } process_t;
 
 /**

@@ -93,3 +93,43 @@
 三轮共 **68 项检查（正常 63 + `--drive` 5）全部通过**，49 项 init 回归套件不倒退，
 `make iso` 0 新警告，QEMU 全程 0 崩溃。R1-R3 覆盖矩阵（计划 §五）各模块均已覆盖，
 唯一暂缓项 R2.9（runtime_demo 未接线）已记录待后续执行。
+
+---
+
+## 八、补充：R2.9 专项补测执行（2026-08-21）
+
+R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile 而暂缓；本次
+`runtime_demo`/`tui_demo` 已接入 Makefile（`USER_C`/`SVC_NAMES`/`SVC_LINK_RULE`/
+`blob.c`），补充验证完成（驱动：`scripts/verify_demos.py`，QEMU 双通道：
+
+| # | 检查项 | 结果 |
+|---|---|---|
+| 1 | `exec runtime_demo`：全局构造函数先于 main（resource id=42） | ✅ |
+| 2 | atexit 逆序（3→2→1，counter=3） | ✅ |
+| 3 | `.fini_array` 析构（Resource destructor called） | ✅ |
+| 4 | malloc/calloc/realloc 就地扩展（buf2 保留内容） | ✅ |
+| 5 | signal() 注册（SIGUSR1/SIGTERM/SIGPIPE，prev=SIG_DFL） | ✅ |
+| 6 | `exec tui_demo`：term 端口解析 + 渲染完成 + 干净退出 | ✅ |
+| 7 | `exec hello`：信号自测 7 段（注册→自杀→handler→IGN→DFL→SIGTERM 终止 143） | ✅ |
+| 8 | `exec window_demo`：3 窗口渲染 + 键盘焦点切换（VGA 解码 `*` 标记）+ 干净退出 | ✅ |
+
+> 注：引导后 P2V 套件会遗留一个 init EXEC 待决 Powerbox 面板（已知行为，
+> test_report §五.2），面板持有键盘焦点；脚本先 `sendkey y` 应答再执行命令。
+
+## 九、补充：生产加固回归（2026-08-21，第二轮）
+
+内核侧生产加固（安全门控、崩溃恢复、force_exit 修复）后的回归扩充与验证：
+
+| 项 | 结果 |
+|---|---|
+| 经典套件 31→33（+FPU/SSE 交错、+IPC 对端死亡 crashpeer） | ✅ 33/33 |
+| P2 门控 3→5（+notify 限本进程、+debug_getchar COM1 门控） | ✅ 5/5 |
+| 新增 P3 Crash Recovery（kill pkg → 自动重启 → 端口恢复） | ✅ 1/1 |
+| smoke R1-R3 全量 | ✅ 62/62 |
+| smoke `--drive`（R3.5 跨重启持久化） | ✅ 65/65 |
+| P4 资源耗尽（2026-08-21 第三轮）：IPC 超长消息边界 ERR_INVAL；线程表 1024 耗尽 ERR_NOMEM + join 释放后恢复 | ✅ 2/2 |
+| P5 零拷贝读路径（2026-08-22）：System blob 经共享池 READ_ONLY 映射，内容与 chunked 读一致 | ✅ 1/1 |
+
+关键修复：`alloc_thread` 漏清 `force_exit`（SIGKILL 线程槽位回收后新进程在首个
+检查点被静默杀死，code 0）；`ipc_cleanup_process`/`irq_cleanup_process`（进程死亡
+时销毁端口/唤醒阻塞对端/释放注册名与 IRQ 线）；blob 注册 fail-fast。

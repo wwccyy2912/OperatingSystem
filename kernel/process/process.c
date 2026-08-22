@@ -16,6 +16,9 @@
 #include <kernel/serial.h>
 #include <kernel/string.h>
 #include <kernel/proc_info.h>
+#include <kernel/ipc.h>
+#include <kernel/irq.h>
+#include <kernel/shm.h>
 
 /* ------------------------------------------------------------------ */
 /*  Internal data                                                      */
@@ -71,9 +74,8 @@ void process_init(void) {
         s_process_table[i].exit_code    = 0;
         s_process_table[i].waiting_tid  = -1;
         s_process_table[i].heap_base    = HEAP_USER_BASE;
-        memset(s_process_table[i].sig_handlers, 0, sizeof(s_process_table[i].sig_handlers));
-        s_process_table[i].sig_pending  = 0;
-        s_process_table[i].sig_restorer = 0;
+        s_process_table[i].sig_dispatcher = 0;
+        s_process_table[i].sig_pending    = 0;
         s_process_table[i].name[0]      = '\0';
         s_process_table[i].next         = NULL;
     }
@@ -164,10 +166,9 @@ process_t *process_create(const char *name, u64 entry, addr_space_t *as) {
      * at app instantiation.  Unforgeable: never user-supplied. */
     proc->app_uuid_hi = rng_u64();
     proc->app_uuid_lo = rng_u64();
-    /* Signals: fresh process starts with no handlers, no pending. */
-    memset(proc->sig_handlers, 0, sizeof(proc->sig_handlers));
-    proc->sig_pending  = 0;
-    proc->sig_restorer = 0;
+    /* Signals: fresh process starts with no dispatcher, nothing pending. */
+    proc->sig_dispatcher = 0;
+    proc->sig_pending    = 0;
     /* ASLR: randomize the child's heap base; mix in creation timing +
      * PID so sibling processes get decorrelated layouts. */
     rng_mix(sched_get_ticks() ^ ((u64)s_next_pid << 32));
@@ -297,6 +298,17 @@ void process_reap(process_t *proc) {
 
     serial_printf(
         "proc: REAP pid=%d detached=%d count->%d\n", proc->pid, detached, s_process_count);
+
+    /* Tear down the process's IPC + IRQ resources FIRST: every client
+     * blocked on its ports (recv / pending send / awaiting reply) is
+     * woken with ERR_NOENT — never left hanging on a dead peer — and
+     * the port-registry names are freed so a restarted service can
+     * re-register them.  IRQ lines it bound are released immediately
+     * (irq_handle's lazy self-heal only fires on the next IRQ).  Any
+     * shared-page pools it owned are returned to the PMM. */
+    ipc_cleanup_process(proc->pid);
+    irq_cleanup_process(proc->pid);
+    shm_cleanup_process(proc->subject_id);
 
     /* Free the process's resources. */
     if (proc->cap_table)

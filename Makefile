@@ -67,6 +67,7 @@ KERNEL_C := \
     kernel/mm/elf_boot.c \
     kernel/mm/rbtree.c \
     kernel/mm/vspace.c \
+    kernel/mm/shm.c \
     kernel/sched/sched.c \
     kernel/sched/thread.c \
     kernel/sched/thread_ctx.c \
@@ -90,6 +91,7 @@ USER_C := \
     user/runtime/exit.c \
     user/runtime/errno.c \
     user/runtime/malloc.c \
+    user/runtime/signal_user.c \
     user/lib/libc/stdio.c \
     user/lib/libc/stdlib.c \
     user/lib/libc/string.c \
@@ -110,6 +112,7 @@ USER_C := \
     user/services/keyboard/keyboard.c \
     user/services/term/term.c \
     user/services/flaky/main.c \
+    user/services/crashpeer/main.c \
     user/services/hello/main.c \
     user/services/vfs/vfs_server.c \
     user/services/vfs/fs_mem_driver.c \
@@ -119,6 +122,9 @@ USER_C := \
     user/services/pkg/pkg_manager.c \
     user/services/sbox_demo/main.c \
     user/services/runtime_demo/main.c \
+    user/services/tui_demo/main.c \
+    user/services/window_demo/main.c \
+    user/lib/libtui/tui.c \
     user/lib/libfs/fs.c \
     user/lib/libpkg/pkg.c
 
@@ -131,7 +137,6 @@ KERNEL_OBJ    := $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ)
 
 USER_ASM := \
     user/runtime/crt0.S \
-    user/runtime/sigrestore.S \
     user/lib/libc/setjmp.S
 USER_C_OBJ   := $(patsubst %.c, build/%.c.o, $(USER_C))
 USER_ASM_OBJ := $(patsubst %.S, build/%.S.o, $(USER_ASM))
@@ -152,6 +157,7 @@ USER_SVC_ENTRY_OBJ := \
     build/user/services/term/term.c.o \
     build/user/services/shell/shell.c.o \
     build/user/services/flaky/main.c.o \
+    build/user/services/crashpeer/main.c.o \
     build/user/services/hello/main.c.o \
     build/user/services/vfs/vfs_server.c.o \
     build/user/services/vfs/fs_mem_driver.c.o \
@@ -160,10 +166,12 @@ USER_SVC_ENTRY_OBJ := \
     build/user/services/device_mgr/device_mgr.c.o \
     build/user/services/pkg/pkg_manager.c.o \
     build/user/services/sbox_demo/main.c.o \
-    build/user/services/runtime_demo/main.c.o
+    build/user/services/runtime_demo/main.c.o \
+    build/user/services/tui_demo/main.c.o \
+    build/user/services/window_demo/main.c.o
 USER_SHARED_OBJ := $(filter-out $(USER_SVC_ENTRY_OBJ), $(USER_OBJ))
 
-SVC_NAMES := init manager serial keyboard term shell flaky hello vfs fs_mem_driver fs_virtio_blk_driver perm device_mgr pkg sbox_demo runtime_demo
+SVC_NAMES := init manager serial keyboard term shell flaky crashpeer hello vfs fs_mem_driver fs_virtio_blk_driver perm device_mgr pkg sbox_demo runtime_demo tui_demo window_demo
 SVC_BLOBS := $(addprefix build/, $(addsuffix _blob.o, $(SVC_NAMES)))
 
 # ==============================================================================
@@ -227,6 +235,7 @@ $(eval $(call SVC_LINK_RULE,keyboard,keyboard/keyboard.c.o))
 $(eval $(call SVC_LINK_RULE,term,term/term.c.o))
 $(eval $(call SVC_LINK_RULE,shell,shell/shell.c.o))
 $(eval $(call SVC_LINK_RULE,flaky,flaky/main.c.o))
+$(eval $(call SVC_LINK_RULE,crashpeer,crashpeer/main.c.o))
 $(eval $(call SVC_LINK_RULE,hello,hello/main.c.o))
 $(eval $(call SVC_LINK_RULE,vfs,vfs/vfs_server.c.o))
 $(eval $(call SVC_LINK_RULE,fs_mem_driver,vfs/fs_mem_driver.c.o))
@@ -236,6 +245,8 @@ $(eval $(call SVC_LINK_RULE,device_mgr,device_mgr/device_mgr.c.o))
 $(eval $(call SVC_LINK_RULE,pkg,pkg/pkg_manager.c.o))
 $(eval $(call SVC_LINK_RULE,sbox_demo,sbox_demo/main.c.o))
 $(eval $(call SVC_LINK_RULE,runtime_demo,runtime_demo/main.c.o))
+$(eval $(call SVC_LINK_RULE,tui_demo,tui_demo/main.c.o))
+$(eval $(call SVC_LINK_RULE,window_demo,window_demo/main.c.o))
 
 # Embed each service ELF as a kernel blob object (symbols renamed to <svc>_elf_*).
 define SVC_BLOB_RULE
@@ -273,8 +284,7 @@ run: iso
 	qemu-system-x86_64 \
 		-cdrom build/opsos.iso \
 		-m 256M \
-		-nographic \
-		-serial mon:stdio \
+		-serial stdio \
 		-d int,cpu_reset,guest_errors \
 		-drive file=disk.img,if=none,id=vd,cache=writethrough \
 		-device virtio-blk-pci,drive=vd,disable-modern=on

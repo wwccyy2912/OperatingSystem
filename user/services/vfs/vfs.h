@@ -162,8 +162,10 @@ enum {
     VFS_OP_MOVE             = 16, /* Phase 2: move/rename item */
     VFS_OP_WHOAMI           = 17, /* P1 地基: caller → kernel subject_id */
     VFS_OP_LIST_VOLUMES     = 18, /* enumerate mounted volumes (root "/" view) */
+    VFS_OP_READ_MAP         = 19, /* Phase 3: zero-copy file read (map) */
 };
 
+#define PAGE_SIZE 4096u /* user-space view (kernel/types.h) */
 #define VFS_PATH_MAX 1024 /* URL string field size */
 #define VFS_MAX_VOLS 4    /* mount slots (matches vfs_server MAX_VOLS) */
 
@@ -226,6 +228,22 @@ typedef struct {
     i32 ret; /* bytes read, 0 = EOF, negative = error */
     u8  data[VFS_MAX_READ];
 } vfs_resp_read_t;
+
+/* VFS_OP_READ_MAP — Phase 3 zero-copy read: map the file's backing
+ * pool pages READ-ONLY into the caller's address space at `map_virt`
+ * (a vspace_alloc()'d range).  The server validates the caller's read
+ * authorization, then maps the pages.  Returns the mapped size, or a
+ * negative error (ERR_NOENT = file not pool-backed → fall back to
+ * chunked VFS_OP_READ). */
+typedef struct {
+    u32          op;
+    vfs_handle_t handle;
+    void        *map_virt; /* client-reserved target range */
+} vfs_req_read_map_t;
+
+typedef struct {
+    i32 ret; /* mapped size in bytes, negative = error */
+} vfs_resp_read_map_t;
 
 /* VFS_OP_WRITE */
 typedef struct {
@@ -465,6 +483,8 @@ enum {
     DRV_OP_ENUM       = 8,  /* parent_id + from → batch (≤ VFS_ENUM_BATCH) */
     DRV_OP_STAT       = 9,  /* volume → capacity/used/read-only */
     DRV_OP_MOVE       = 10, /* Phase 2: move/rename, itemID stays stable */
+    DRV_OP_PHYS_RANGE = 11, /* Phase 3: file → backing pool (phys, size);
+                             *   ERR_NOENT = not pool-backed */
 };
 
 typedef struct {
@@ -496,6 +516,10 @@ typedef struct {
             u64 used_bytes;
             u32 read_only;
         } stat;                   /* STAT */
+        struct {
+            u64 phys_base; /* PHYS_RANGE: backing pool physical base */
+            u32 size;      /* PHYS_RANGE: file size in bytes */
+        } pr;                     /* PHYS_RANGE */
         u8 data[DRV_MAX_PAYLOAD]; /* READ payload */
     } u;
 } drv_resp_t;

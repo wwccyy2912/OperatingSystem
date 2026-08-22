@@ -55,7 +55,7 @@ OpSys 是一个从零开始的 64 位微内核操作系统项目，采用「机�
 - 零系统调用 malloc 快路径（无竞争自旋锁，无 syscall）。
 - ASLR 堆随机化 + 守卫页保护。
 - `.init_array` 全局构造 + `.fini_array` 析构 + `atexit` 处理。
-- POSIX 风格信号处理（`signal` / `kill` / `sigreturn`）。
+- POSIX 风格信号处理（`signal` / `kill` / `sigreturn`，语义在 Ring 3：`user/runtime/signal_user.c`）。
 - 就地 `realloc` 扩展（吸收后续空闲块，避免 O(n²) 拷贝）。
 
 ---
@@ -114,7 +114,7 @@ OpSys/
 │   │   ├── malloc.c          # 堆分配器（ASLR + 就地扩展）
 │   │   ├── init.c / exit.c   # 全局构造/析构、atexit
 │   │   ├── errno.c           # 错误码
-│   │   └── sigrestore.S      # 信号返回跳板
+│   │   └── signal_user.c     # Ring 3 信号语义（dispatcher + handler 表）
 │   └── services/             # 用户态服务 — 核心 GPLv3 / 扩展 LGPLv3
 │       ├── init/             # 第一个用户程序（含回归测试套件）
 │       ├── manager/          # 服务管理器（拉起全部服务）

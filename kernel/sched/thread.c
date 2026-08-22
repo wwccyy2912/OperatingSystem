@@ -173,6 +173,10 @@ static thread_t *alloc_thread(void) {
     t->affinity         = 0;
     t->exit_code        = 0;
     t->joiner_tid       = -1;
+    t->force_exit       = false; /* MUST clear: a recycled slot from a
+                                  * force-killed thread (SIGKILL) would
+                                  * otherwise kill the new thread at its
+                                  * first checkpoint (exit code 0) */
     t->wake_tick        = 0;
     t->sleep_next       = NULL;
     t->user_rsp         = 0;
@@ -182,6 +186,10 @@ static thread_t *alloc_thread(void) {
 
     /* TID = index in the static table */
     t->tid = (tid_t)(t - s_thread_table);
+
+    /* Seed the FPU/SSE slot to x86 defaults (fresh AND recycled
+     * slots): fpu_switch's fxrstor must always see valid state. */
+    fpu_state_init(t->tid);
 
     return t;
 }
@@ -339,6 +347,7 @@ void thread_init(void) {
     idle->time_slice = 1;  /* will be rescheduled after 1 tick */
     idle->affinity   = -1; /* any CPU */
     idle->addr_space = vmm_get_kernel_addr_space();
+    fpu_state_init(0);     /* idle's FPU slot: valid for fxrstor */
 
     if (setup_thread_stack(idle, idle_thread_func, NULL) != OK) {
         panic("thread: cannot allocate idle stack");

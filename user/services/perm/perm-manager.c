@@ -644,6 +644,7 @@ static void fmt_uint(char *dst, int dst_len, int *pos, unsigned v, int base) {
 
 static void access_label(char *out, int out_len, u32 access) {
     int n = 0;
+    (void)out_len; /* max 3 chars + NUL; callers pass >= 4-byte buffers */
     if (access & VFS_ACCESS_READ)
         out[n++] = 'R';
     if (access & VFS_ACCESS_WRITE)
@@ -741,12 +742,20 @@ static u32 granted_for_atom(u32 atom, u32 access) {
  * P2 抹位: the grant beat now fires on PARTIAL intersection
  * ((g->access & req->access) != 0) and resp->granted carries ONLY the
  * covered bits — a READ grant never yields a WRITE-carrying handle. */
-static void do_check(int token, int msg_len) {
+static void do_check(int token, int msg_len, u64 caller_subject) {
     perm_resp_check_t *resp = (perm_resp_check_t *)s_resp;
     resp->granted           = 0;
     resp->query_id          = 0;
     if (msg_len < (int)sizeof(perm_req_check_t)) {
         resp->ret = ERR_INVAL;
+        goto out;
+    }
+    /* GATED (docs/ops_format.md §6): CHECK answers for the subject in
+     * the REQUEST, which only the trusted vfs_server proxy may fill.
+     * An ungated CHECK would let any Ring-3 process probe arbitrary
+     * subjects' grants/roles (authorization oracle). */
+    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+        resp->ret = ERR_DENIED;
         goto out;
     }
     perm_req_check_t *req     = (perm_req_check_t *)s_req;
@@ -802,14 +811,26 @@ out:
 
 /* ANSWER: user verdict → grant upsert + decision encode (allow) or
  * deny.  The Powerbox verdict lands as a kernel-enforceable atom cap
- * issued into the requesting subject's table (§四). */
-static void do_answer(int token, int msg_len) {
+ * issued into the requesting subject's table (§四).
+ * GATED (docs/ops_format.md §6, capability-based like do_grant): the
+ * CALLER must hold ATOM_SERVICE_MANAGE.  The legitimate answerers are
+ * kernel-endorsed services — term (UI agent, user y/n through the
+ * panel) and init/perm/pkg (management plane; init keeps the atom
+ * even after ROLE_SET hot-reloads it to GUEST).  Sandbox apps never
+ * hold the atom, so they cannot auto-approve their own pending
+ * Powerbox queries (privilege escalation). */
+static void do_answer(int token, int msg_len, u64 caller_subject) {
     perm_resp_answer_t *resp = (perm_resp_answer_t *)s_resp;
     if (msg_len < (int)sizeof(perm_req_answer_t)) {
         resp->ret = ERR_INVAL;
         goto out;
     }
     perm_req_answer_t *req = (perm_req_answer_t *)s_req;
+
+    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+        resp->ret = ERR_DENIED; /* apps cannot answer queries */
+        goto out;
+    }
 
     perm_query_t *q = query_find(req->query_id);
     if (!q) {
@@ -841,11 +862,18 @@ out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
-/* QUERY: UI agent fetches a pending query (decision 2). */
-static void do_query(int token, int msg_len) {
+/* QUERY: UI agent fetches a pending query (decision 2).
+ * GATED: the response carries the query's subject/name/url — only the
+ * trusted UI agent (term) and the management plane may enumerate
+ * pending authorizations. */
+static void do_query(int token, int msg_len, u64 caller_subject) {
     perm_resp_query_t *resp = (perm_resp_query_t *)s_resp;
     if (msg_len < (int)sizeof(perm_req_query_t)) {
         resp->ret = ERR_INVAL;
+        goto out;
+    }
+    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+        resp->ret = ERR_DENIED; /* apps cannot enumerate queries */
         goto out;
     }
     perm_req_query_t *req = (perm_req_query_t *)s_req;
@@ -886,14 +914,25 @@ out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
-/* REVOKE: drop grants (default deny). */
-static void do_revoke(int token, int msg_len) {
+/* REVOKE: drop grants (default deny).
+ * GATED (docs/ops_format.md §6): self-revoke is always allowed (a
+ * process dropping its OWN grants is harmless); revoking ANOTHER
+ * subject's grants requires ATOM_SERVICE_MANAGE.  Without the
+ * cross-subject gate any Ring-3 process could revoke other subjects'
+ * grants (DoS / privilege-removal). */
+static void do_revoke(int token, int msg_len, u64 caller_subject) {
     perm_resp_revoke_t *resp = (perm_resp_revoke_t *)s_resp;
     if (msg_len < (int)sizeof(perm_req_revoke_t)) {
         resp->ret = ERR_INVAL;
         goto out;
     }
     perm_req_revoke_t *req = (perm_req_revoke_t *)s_req;
+
+    if (req->subject_id != caller_subject &&
+        cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+        resp->ret = ERR_DENIED;
+        goto out;
+    }
 
     resp->revoked = grant_revoke(req->subject_id, &req->resource);
     resp->ret     = 0;
@@ -962,10 +1001,17 @@ out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
-/* DUMP: export policy state (roles + rules) for tests/management. */
-static void do_dump(int token, int msg_len) {
+/* DUMP: export policy state (roles + rules + grants) for tests and
+ * management.  GATED (docs/ops_format.md §6, capability-based): the
+ * snapshot reveals the whole policy — management plane only. */
+static void do_dump(int token, int msg_len, u64 caller_subject) {
+    (void)msg_len; /* fixed-size response; length already validated by caller */
     perm_resp_dump_t *resp = (perm_resp_dump_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
+    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+        resp->ret = ERR_DENIED; /* apps cannot export policy */
+        goto out;
+    }
 
     int n            = 0;
     resp->role_count = 0;
@@ -1015,36 +1061,48 @@ static void do_dump(int token, int msg_len) {
     }
     resp->ret = 0;
 
+out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
 /* ====================================================================
  * P2: P3/P4 预留 handlers
  *
- * 这些接口当前只维护状态、不做强制（测试以 GUEST 角色运行，若做
- * 管理面 gate 将全部被拒）。P4 起应对 ROLE_SET 一样要求调用者为
- * OWNER/ADMIN（role_is_management），并纳入策略快照。
+ * 这些接口当前只维护状态、不做强制。管理面 gate 用**能力制**
+ * （ATOM_SERVICE_MANAGE，docs/ops_format.md §6）而非角色制：init 即使
+ * 被热切换为 GUEST 仍持管理原子，因此回归（P2V test 3 以 GUEST 调用
+ * context/freq/policy/audit）保持绿；沙盒应用永不可持该原子。
  * ==================================================================== */
 
 /* CONTEXT (P3 预留): 前台/后台切换通知。 */
-static void do_context(int token, int msg_len) {
+static void do_context(int token, int msg_len, u64 caller_subject) {
     perm_resp_context_t *resp = (perm_resp_context_t *)s_resp;
     resp->ret                 = ERR_INVAL;
     if (msg_len < (int)sizeof(perm_req_context_t))
         goto out;
+    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+        resp->ret = ERR_DENIED; /* apps cannot manipulate context */
+        goto out;
+    }
     perm_req_context_t *req = (perm_req_context_t *)s_req;
     resp->ret               = ctx_upsert(req->subject_id, req->foreground);
 out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
-/* FREQ (P3 预留): 查询/清零授权命中频率计数器。 */
-static void do_freq(int token, int msg_len) {
+/* FREQ (P3 预留): 查询/清零授权命中频率计数器。
+ * GATED: frequency counters are per-subject telemetry — management
+ * plane only. */
+static void do_freq(int token, int msg_len, u64 caller_subject) {
     perm_resp_freq_t *resp = (perm_resp_freq_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
     if (msg_len < (int)sizeof(perm_req_freq_t))
         goto out;
+    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+        resp->ret = ERR_DENIED; /* apps cannot read frequency telemetry */
+        goto out;
+    }
     perm_req_freq_t *req = (perm_req_freq_t *)s_req;
 
     u32 total = 0, slots = 0;
@@ -1069,13 +1127,19 @@ out:
 }
 
 /* POLICY_SAVE (P4 预留): 导出策略二进制快照。
- * 只要求 op 字段即可（size/data 是 LOAD 方向用的）。 */
-static void do_policy_save(int token, int msg_len) {
+ * 只要求 op 字段即可（size/data 是 LOAD 方向用的）。
+ * GATED (docs/ops_format.md §6): the snapshot reveals the whole policy
+ * (roles, rules, grants) — management plane only. */
+static void do_policy_save(int token, int msg_len, u64 caller_subject) {
     perm_resp_policy_t *resp = (perm_resp_policy_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
     if (msg_len < (int)sizeof(u32))
         goto out;
+    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+        resp->ret = ERR_DENIED; /* apps cannot export policy */
+        goto out;
+    }
     int n = policy_serialize(resp->data, (int)sizeof(resp->data));
     if (n < 0) {
         resp->ret = n;
@@ -1087,13 +1151,21 @@ out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
-/* POLICY_LOAD (P4 预留): 导入策略二进制快照（全有或全无 + 热更新）。 */
-static void do_policy_load(int token, int msg_len) {
+/* POLICY_LOAD (P4 预留): 导入策略二进制快照（全有或全无 + 热更新）。
+ * GATED (docs/ops_format.md §6, CRITICAL): the import REPLACES the
+ * engine's whole state (roles/rules/grants).  An ungated load would
+ * let any Ring-3 process inject a policy that promotes itself to
+ * OWNER with full-allow rules — complete permission takeover. */
+static void do_policy_load(int token, int msg_len, u64 caller_subject) {
     perm_resp_policy_t *resp = (perm_resp_policy_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
     if (msg_len < (int)sizeof(perm_req_policy_t))
         goto out;
+    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+        resp->ret = ERR_DENIED; /* apps cannot import policy */
+        goto out;
+    }
     perm_req_policy_t *req = (perm_req_policy_t *)s_req;
     if (req->size == 0 || req->size > (u32)sizeof(req->data)) {
         resp->ret = ERR_INVAL;
@@ -1104,13 +1176,19 @@ out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
-/* AUDIT (P3 预留): 导出审计环形缓冲区（最旧在前）。 */
-static void do_audit(int token, int msg_len) {
+/* AUDIT (P3 预留): 导出审计环形缓冲区（最旧在前）。
+ * GATED: the audit log records who accessed what — management plane
+ * only (an app must not learn other subjects' access history). */
+static void do_audit(int token, int msg_len, u64 caller_subject) {
     perm_resp_audit_t *resp = (perm_resp_audit_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
     if (msg_len < (int)sizeof(perm_req_audit_t))
         goto out;
+    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+        resp->ret = ERR_DENIED; /* apps cannot read the audit log */
+        goto out;
+    }
     u32 n     = s_audit_count;
     u32 start = (s_audit_head + PERM_AUDIT_MAX - n) % PERM_AUDIT_MAX;
     for (u32 i = 0; i < n; i++)
@@ -1124,16 +1202,16 @@ out:
 static void perm_handle_request(int token, u32 op, int msg_len, u64 caller_subject) {
     switch (op) {
     case PERM_OP_CHECK:
-        do_check(token, msg_len);
+        do_check(token, msg_len, caller_subject);
         break;
     case PERM_OP_ANSWER:
-        do_answer(token, msg_len);
+        do_answer(token, msg_len, caller_subject);
         break;
     case PERM_OP_QUERY:
-        do_query(token, msg_len);
+        do_query(token, msg_len, caller_subject);
         break;
     case PERM_OP_REVOKE:
-        do_revoke(token, msg_len);
+        do_revoke(token, msg_len, caller_subject);
         break;
     case PERM_OP_GRANT:
         do_grant(token, msg_len, caller_subject);
@@ -1142,22 +1220,22 @@ static void perm_handle_request(int token, u32 op, int msg_len, u64 caller_subje
         do_role_set(token, msg_len, caller_subject);
         break;
     case PERM_OP_DUMP:
-        do_dump(token, msg_len);
+        do_dump(token, msg_len, caller_subject);
         break;
     case PERM_OP_CONTEXT:
-        do_context(token, msg_len);
+        do_context(token, msg_len, caller_subject);
         break;
     case PERM_OP_FREQ:
-        do_freq(token, msg_len);
+        do_freq(token, msg_len, caller_subject);
         break;
     case PERM_OP_POLICY_SAVE:
-        do_policy_save(token, msg_len);
+        do_policy_save(token, msg_len, caller_subject);
         break;
     case PERM_OP_POLICY_LOAD:
-        do_policy_load(token, msg_len);
+        do_policy_load(token, msg_len, caller_subject);
         break;
     case PERM_OP_AUDIT:
-        do_audit(token, msg_len);
+        do_audit(token, msg_len, caller_subject);
         break;
     default: {
         i32 *resp = (i32 *)s_resp;

@@ -4,7 +4,7 @@
  *
  * A minimal standalone program: prints its PID, exercises the signal
  * subsystem (register handler -> self-kill -> handler runs -> control
- * returns via __restore_rt/SYS_SIGRETURN), and exits.
+ * returns via the Ring 3 dispatcher's SYS_SIGRETURN), and exits.
  *
  * It is embedded into init.elf as a binary blob (build/hello_blob.o)
  * and spawned by the shell's "spawn" command to demonstrate dynamic
@@ -29,10 +29,11 @@
 static volatile int s_usr1_count = 0; /* SIGUSR1 deliveries seen */
 
 /*
- * Signal handler for SIGUSR1.  Runs on the signal trampoline stack
- * layout set up by the kernel (user/runtime/sigrestore.S handles the
- * return).  printf is safe here: it only makes a debug_log syscall and
- * uses its own stack buffer.
+ * Signal handler for SIGUSR1.  Runs on the interrupted thread's stack
+ * below the sigframe; the Ring 3 dispatcher (user/runtime/
+ * signal_user.c) calls it and restores the interrupted context via
+ * SYS_SIGRETURN afterwards.  printf is safe here: it only makes a
+ * debug_log syscall and uses its own stack buffer.
  */
 static void sigusr1_handler(int signum) {
     (void)signum;
@@ -52,10 +53,11 @@ int main(void) {
     printf("hello: signal(SIGUSR1) -> prev=0x%x (expect 0x0)\n", (unsigned int)(uintptr_t)prev);
     sleep(50);
 
-    /* 2. Self-kill: the pending bit is latched; the handler runs at
-     *    the next delivery checkpoint (the kill syscall's own return
-     *    path).  __restore_rt then restores the interrupted context,
-     *    so the kill() call below returns normally. */
+    /* 2. Self-kill: the pending bit is latched; the Ring 3 dispatcher
+     *    runs at the next delivery checkpoint (the kill syscall's own
+     *    return path), calls this handler and then restores the
+     *    interrupted context via SYS_SIGRETURN, so the kill() call
+     *    below returns normally. */
     int ret = kill(pid, SIGUSR1);
     printf("hello: kill(self, SIGUSR1) -> %d (expect 0), count=%d (expect 1)\n", ret, s_usr1_count);
     sleep(50);
@@ -66,7 +68,8 @@ int main(void) {
     printf("hello: kill #2 -> %d, count=%d (expect 2)\n", ret, s_usr1_count);
     sleep(50);
 
-    /* 4. SIG_IGN: the bit is never latched, so the count must stay 2. */
+    /* 4. SIG_IGN: the dispatcher discards the signal at delivery, so
+     *    the count must stay 2. */
     signal(SIGUSR1, SIG_IGN);
     ret = kill(pid, SIGUSR1);
     printf("hello: kill after SIG_IGN -> %d, count=%d (expect 2)\n", ret, s_usr1_count);
@@ -92,8 +95,8 @@ int main(void) {
     sleep(50);
 
     /* 7. Default action = terminate: SIGTERM with SIG_DFL must kill us
-     *    (exit code 128+15=143) via signal_kill_process + the checkpoint.
-     *    Nothing after this line ever runs. */
+     *    (exit code 128+15=143) via the Ring 3 dispatcher's default
+     *    action (exit(128+signum)).  Nothing after this line ever runs. */
     signal(SIGTERM, SIG_DFL);
     printf("hello: sending SIGTERM (SIG_DFL) to self - expect termination\n");
     sleep(50);

@@ -427,7 +427,7 @@ void update_status_bar(void) {
 2. **鼠标支持**：点击事件、拖拽
 3. **异步输入**：非阻塞 readline
 4. **滚动缓冲**：超出屏幕高度时缓存历史
-5. **多窗口**：独立的渲染区域
+5. **多窗口**：独立的渲染区域（✅ v0.4 已落地为 wm 窗口管理器，见 §十二）
 6. **颜色调色板**：用户定义的配色方案
 
 ---
@@ -440,6 +440,9 @@ void update_status_bar(void) {
 | `user/lib/libtui/tui.h`         | TUI 客户端库头文件   | 129   |
 | `user/lib/libtui/tui.c`         | TUI 客户端库实现     | 270   |
 | `user/services/tui_demo/main.c` | TUI 演示应用         | 60+   |
+| `user/services/wm/main.c`       | 窗口管理器服务（v0.4） | 490+ |
+| `user/lib/libwm/wm.h/.c`        | wm 客户端库（v0.4）  | 60+/180+ |
+| `user/services/wm_demo/main.c`  | 桌面演示（v0.4）     | 90+   |
 | `docs/tui_design.md`            | 本文档               | —     |
 
 ---
@@ -482,3 +485,52 @@ void update_status_bar(void) {
    - 面板现渲染 `<name> (PID <pid>)`（term.c:943-961），不再显示 subject_id
 
 ---
+
+## 十二、v0.4 窗口管理器（wm）
+
+> 版本：v0.4，2026-08-22  
+> 关联：`user/services/wm/main.c`（服务）、`user/lib/libwm/`（客户端库）、
+> `user/services/wm_demo/main.c`（桌面演示）、`scripts/verify_wm.py`（验证）
+
+### 12.1 架构
+
+```
+wm_demo (桌面客户端)         其他应用 (libwm)
+      │  ipc_call("wm")            │
+      ▼                           ▼
+┌──────────────────────── wm 服务（Ring 3 独立进程）───────────────┐
+│  线程1: server（ipc_recv_from → 注册表操作 → 合成 → ipc_reply）  │
+│  线程2: input（激活时 TAKE_FOCUS → 读键 → 焦点/移动/退出）       │
+│  窗口注册表: WM_MAX_WINDOWS=16 个 {id, title, x, y, w, h, owner, │
+│             body[8][44]}；owner = 创建者 subject（不可伪造）     │
+│  合成器:   tui_clear + 逐窗口 tui_render_box/line_at + 状态栏；  │
+│            焦点窗口最后绘制（置顶）+ 标题 `*` 标记               │
+└──────────────────────────────────────────────────────────────────┘
+      │  ipc_call("term")   （wm 不直接碰 framebuffer）
+      ▼
+ term 服务（显示所有者，ATOM_SERVICE_MANAGE 门控 fb）
+```
+
+### 12.2 协议（wm.h / libwm wm_proto.h）
+
+| Op | 名称 | 请求 → 响应 | 说明 |
+|----|------|------------|------|
+| 1 | CREATE | {title,x,y,w,h} → {win_id} | 建窗口（自动聚焦，置顶） |
+| 2 | DESTROY | {win_id} → {ret} | 仅 owner/管理面 |
+| 3 | LIST | {} → {count, lines[]} | 列出 "id title" |
+| 4 | FOCUS | {win_id} → {ret} | 设焦点（0=无） |
+| 5 | MOVE | {win_id,mx,my} → {ret} | 仅 owner/管理面，越界钳制 |
+| 6 | WRITE | {win_id,row,text} → {ret} | 写内容行，仅 owner/管理面 |
+| 7 | ACTIVATE | {} → {ret} | 启动桌面会话（取键盘焦点） |
+| 8 | DEACTIVATE | {} → {ret} | 结束会话（释放焦点） |
+| 9 | GET_STATE | {} → {active,focus,count} | 会话/焦点/窗口数查询 |
+
+**安全**：DESTROY/MOVE/WRITE 用 `ipc_recv_from` 的内核 subject 与窗口
+owner 比对；管理面（`ATOM_SERVICE_MANAGE`）可跨窗口操作。wm 自身不持
+framebuffer 能力——渲染全部经 term IPC，与 window_demo 相同的安全模型。
+
+### 12.3 输入路由
+
+会话激活时 wm `TAKE_FOCUS`（keyboard 服务焦点路由）：1-9 聚焦第 N 个
+窗口，h/j/k/l 移动焦点窗口，q 结束会话（释放焦点 + 清屏）。期间 shell
+的 read_line 停在 park 表不被打扰；会话结束后 shell 立即恢复输入。

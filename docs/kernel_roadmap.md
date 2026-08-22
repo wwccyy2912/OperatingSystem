@@ -216,7 +216,7 @@
 | 服务自动重启 | manager 重启策略从 flaky-only 扩展为 perm/pkg/device_mgr/shell（每服务一 monitor 线程，MAX_RESTARTS=3）；配合端口/IRQ 清理可干净重启 | 新增 P3 Crash Recovery 回归（kill pkg → 自动重启 → 端口恢复） |
 | force_exit 槽位残留 | `alloc_thread` 漏清 `force_exit`：SIGKILL 线程槽位回收后，新线程在首个检查点被静默杀死（code 0）→ 补清零 | P3 测试一次重启成功（原为两次） |
 | blob 注册 fail-fast | BLOB_MAX_ENTRIES 静默溢出致服务缺失（sbox_demo_noperm 注册失败被吞）→ 上限 22 + 注册失败 panic | 全量 smoke 恢复 |
-| v0.4 图形最小闭环 | `window_demo` 服务：经 term（显示所有者）渲染 3 窗口 + 标题栏焦点标记 + 状态栏，键盘 1/2/3 切换焦点、q 退出（输入走 keyboard 焦点路由）——窗口概念在现有安全架构内的闭环；真实合成器/窗口注册表待续 | `scripts/verify_window_demo.py`（VGA 解码验证窗口渲染 + 焦点切换） |
+| v0.4 窗口管理器 | `window_demo` 最小闭环（经 term 渲染 3 窗口 + 焦点切换）→ 完整 `wm` 服务（2026-08-22）：窗口注册表（create/destroy/list/focus/move/write，所有者 subject 门控）+ 合成器（经 term 渲染、焦点窗口置顶 + `*` 标记）+ 键盘焦点路由（1-9 焦点、hjkl 移动、q 退出会话）；`libwm` 客户端库 + `wm_demo` 桌面演示；wm 由 manager spawn（blob 注册 +1） | `scripts/verify_window_demo.py`（最小闭环）+ `scripts/verify_wm.py` 8/8（VGA 解码验证窗口渲染/焦点切换/移动/会话退出/shell 恢复） |
 | 资源耗尽优雅降级 | 新增 P4 套件：IPC 超长消息 → ERR_INVAL（边界）；线程表耗尽（1024）→ ERR_NOMEM 且 join 全部释放后可恢复（优雅降级，不崩溃） | init 回归 54→56 项 |
 | 零拷贝读路径（P3 完成） | 内核 `SYS_SHM_CREATE`/`SYS_SHM_MAP`（67/68，管理原子门控 + 池表防任意物理映射 + 只读非执行映射）；fs_mem_driver 共享池存储（System blob 池化 + Users 增长迁移堆回退）；vfs `READ_MAP` 授权重查；`fs_read_map` | P5 回归 1/1（映射 == chunked 读）；smoke 62/62 |
 

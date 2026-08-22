@@ -147,3 +147,26 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
   `tui_input_line` 弹框前后保存/恢复屏幕区域与光标，不再残留对话框边框。
 - **MAX_THREADS 1024→2048**：P4 断言需 1000/1023 槽，user 服务 +1 线程后仅余 999；
   扩表 + P4 测试同步更新（≥2000）。
+
+---
+
+## 第四轮：v0.4 窗口管理器（2026-08-22）
+
+| 项 | 结果 |
+|---|---|
+| wm 服务启动（manager spawn，端口 `wm` 注册，3 线程：server/input/主） | ✅ |
+| wm_demo 桌面：libwm 创建 3 窗口（Terminal/Files/Settings）+ 内容行 + 注册表 3/3 | ✅ |
+| 合成器渲染：VGA 解码见三个边框窗口 + 标题 + 正文（113x38 网格内） | ✅ |
+| 焦点：新建窗口默认聚焦（`* Settings`）；`1` → `* Terminal`；`2` → `* Files` | ✅ |
+| 移动：`l` 使焦点窗口右移 1 格（几何变化，越界钳制） | ✅ |
+| 会话退出：`q` → 释放键盘焦点 + 清屏 + wm_demo 销毁窗口退出 + shell 恢复交互 | ✅ |
+| `scripts/verify_wm.py` | ✅ 8/8 |
+| 回归：classic 33/33 + P1 10/10 + P2 5/5 + P2V 4/4 + KBD 1/1 + P3 1/1 + P4 2/2 + P5 1/1 | ✅ 57/57 |
+| smoke R1-R3 全量 + `--drive`（含 wm 进程出现在 ps：PID=19 THR=3） | ✅ 全绿 |
+| `verify_users.py`（登录/建号/越权拒杀/管理员杀） | ✅ 8/8 |
+| `make iso` | ✅ 0 警告 |
+
+架构要点：wm 是纯 IPC 客户端——渲染经 term（显示所有者，ATOM_SERVICE_MANAGE
+门控 fb），输入经 keyboard 焦点路由；窗口注册表操作用 `ipc_recv_from` 的
+内核 subject 做 owner 门控（DESTROY/MOVE/WRITE），管理面
+（ATOM_SERVICE_MANAGE）可跨窗口操作。BLOB_MAX_ENTRIES 24→26（+wm/+wm_demo）。

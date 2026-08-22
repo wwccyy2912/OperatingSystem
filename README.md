@@ -53,6 +53,16 @@ OpSys 是一个从零开始的 64 位微内核操作系统项目，采用「机�
   底层屏幕原样恢复。
 - Powerbox 权限询问面板集成。
 
+### v0.4 窗口管理器（wm）
+
+- **wm 服务**（独立 Ring 3 进程）：窗口注册表（create/destroy/list/focus/
+  move/write，owner subject 门控）+ 合成器（经 term 渲染，焦点窗口置顶）+
+  键盘焦点路由（1-9 聚焦、hjkl 移动、q 退出会话）。
+- **libwm 客户端库**：`wm_create/wm_destroy/wm_list/wm_focus/wm_move/
+  wm_write/wm_activate/wm_deactivate/wm_get_state`。
+- **wm_demo 桌面演示**：`exec wm_demo` 启动三窗口桌面
+  （Terminal/Files/Settings），`scripts/verify_wm.py` 8/8 验证。
+
 ### 用户账户与系统程序退出保护
 
 - **user 账户服务**（独立 Ring 3 进程）：登录/登出/改密/建号/删号/列表；
@@ -82,9 +92,10 @@ OpSys 是一个从零开始的 64 位微内核操作系统项目，采用「机�
 │ 用户态服务（Ring 3，独立进程）                                │
 │  init · manager · shell · term · serial · keyboard          │
 │  vfs · fs_mem_driver · fs_virtio_blk_driver                 │
-│  perm · device_mgr · pkg · user                             │
+│  perm · device_mgr · pkg · user · wm                        │
 ├─────────────────────────────────────────────────────────────┤
-│ 客户端库（libipc · libos · libc · libfs · libpkg · libtui）  │
+│ 客户端库（libipc · libos · libc · libfs · libpkg · libtui    │
+│             · libwm）                                        │
 ├─────────────────────────────────────────────────────────────┤
 │ C Runtime（crt0 · malloc · errno · exit · signal）           │
 ├─────────────────────────────────────────────────────────────┤
@@ -121,7 +132,8 @@ OpSys/
 │   │   ├── libipc/           # IPC 客户端 — GPLv3
 │   │   ├── libfs/            # VFS 客户端 — GPLv3
 │   │   ├── libpkg/           # 包管理客户端 — GPLv3
-│   │   └── libtui/           # TUI 客户端库 — GPLv3
+│   │   ├── libtui/           # TUI 客户端库 — GPLv3
+│   │   └── libwm/            # 窗口管理器客户端库 — GPLv3
 │   ├── runtime/              # C Runtime — LGPLv3
 │   │   ├── crt0.S            # 启动代码
 │   │   ├── malloc.c          # 堆分配器（ASLR + 就地扩展）
@@ -143,6 +155,10 @@ OpSys/
 │       ├── sbox_demo/        # 沙盒演示
 │       ├── runtime_demo/     # Runtime 演示（已实现，未接入 Makefile）
 │       ├── tui_demo/         # TUI 演示（已实现，未接入 Makefile）
+│       ├── window_demo/      # 最小窗口闭环（未接入 Makefile）
+│       ├── user/             # 用户账户服务（登录/权限/退出保护）
+│       ├── wm/               # 窗口管理器（v0.4 桌面）
+│       ├── wm_demo/          # 桌面演示（exec wm_demo）
 │       └── flaky/            # 故障测试服务
 ├── boot/                     # GRUB 引导配置
 ├── scripts/                  # 辅助脚本

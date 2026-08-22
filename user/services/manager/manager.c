@@ -100,6 +100,7 @@ static service_t s_services[] = {
     {"pkg", -1, 0, 1},                  /* .ops app container manager */
     {"shell", -1, 0, 1},
     {"user", -1, 0, 1}, /* user account service (login/passwd/stop guard) */
+    {"wm", -1, 0, 1},   /* window manager (v0.4 desktop: registry+compositor) */
 };
 
 /* Restartable services (production hardening): crash → auto-restart up
@@ -121,6 +122,7 @@ static service_t s_services[] = {
 #define SVC_PKG           9
 #define SVC_SHELL         10
 #define SVC_USER          11
+#define SVC_WM            12
 
 /* ====================================================================
  * Serial service output (mirrors shell.c)
@@ -580,6 +582,14 @@ int main(void) {
      * mid-print and interleave the boot log. */
     manager_write("manager: starting user service\n");
     if (spawn_service(&s_services[SVC_USER], 0) < 0)
+        for (;;)
+            thread_yield();
+
+    /* wm before shell: the window manager registers its "wm" port and
+     * idles; the desktop only activates when a client (wm_demo via
+     * `exec`) starts a session. */
+    manager_write("manager: starting window manager\n");
+    if (spawn_service(&s_services[SVC_WM], 0) < 0)
         for (;;)
             thread_yield();
 

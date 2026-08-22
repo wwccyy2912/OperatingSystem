@@ -387,10 +387,11 @@ make format-check  # 检查格式是否合规（CI 用）
 
 ### 特别鸣谢
 
-**1.OpenCode ——本项目所有源代码由此工具编写**
-
-**2.DeepSeek ——本项目关键模块架构由它提供思路,本项目部分代码由它提供**
-
-**3.ChatGpt ——本项目修改建议由它提供思路**
-
-**4.Trae ——本项目的部分代码格式整理由他完成**
+#### 工具
+**1.OpenCode ：这个工具和调用的Big Pickle完成了起步设计和大部分架构**
+**2.Trae CN ：这个工具和配套的AI大模型完成了代码格式整理和修复部分Bug的工作**
+**3.DeepSeek Harness ：这个工具和配套的DeepSeek v4 flash出色的完成了操作系统生产环境大部分的代码功能添加和优化**
+#### AI大模型
+**1.OpenCode Big Pickle**
+**2.DeepSeek v4 flash**
+**3.GLM 5.2**

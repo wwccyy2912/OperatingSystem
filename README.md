@@ -389,9 +389,15 @@ make format-check  # 检查格式是否合规（CI 用）
 
 #### 工具
 **1.OpenCode ：这个工具和调用的Big Pickle完成了起步设计和大部分架构**
+
 **2.Trae CN ：这个工具和配套的AI大模型完成了代码格式整理和修复部分Bug的工作**
+
 **3.DeepSeek Harness ：这个工具和配套的DeepSeek v4 flash出色的完成了操作系统生产环境大部分的代码功能添加和优化**
+
 #### AI大模型
 **1.OpenCode Big Pickle**
+
 **2.DeepSeek v4 flash**
+
 **3.GLM 5.2**
+

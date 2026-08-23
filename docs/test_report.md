@@ -193,3 +193,12 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | PMM next-fit hint：bitmap_find_free 从上次位置续扫（两遍回绕），重复小分配 O(run) 而非 O(total) | ✅ |
 | **useradd 角色漏洞修复**：无效角色名曾静默 `atoi→0=OWNER`（可意外提权）；现严格校验角色名/纯数字，非法即报错 | ✅ `useradd bad badrole` → invalid role |
 | 回归 57/57 + P3 1/1 + P4 2/2 + P5 1/1；`make iso` 0 警告 | ✅ |
+
+### 第五轮补充 2（2026-08-23）：账户锁定/解锁 + 自动锁定策略
+
+| 项 | 结果 |
+|---|---|
+| `user_lock <name>` / `user_unlock <name>`（admin，禁自锁/禁锁最后 admin） | ✅ |
+| 自动锁定：连续 5 次错误密码 → 账户 disabled，正确密码也拒绝 | ✅ 串口 `auto-locked after 5 failed logins` |
+| 解锁重置 fail_count；`users` 列表标注锁定账户（`L` 后缀） | ✅ |
+| 回归 57/57 + P3 1/1 + P4 2/2 + P5 1/1；`make iso` 0 警告 | ✅ |

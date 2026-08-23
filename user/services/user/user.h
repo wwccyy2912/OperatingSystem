@@ -41,7 +41,12 @@ enum {
     USER_OP_WHOAMI    = 7, /* caller's bound account + role */
     USER_OP_VERIFY    = 8, /* verify name+password (used by exit guard) */
     USER_OP_STOP      = 9, /* stop a user process (admin + verified) */
+    USER_OP_LOCK      = 10, /* disable an account (admin; never self/last-admin) */
+    USER_OP_UNLOCK    = 11, /* re-enable an account (admin) */
 };
+
+/* Account lockout policy: failed logins before auto-lock. */
+#define USER_MAX_LOGIN_ATTEMPTS 5
 
 typedef struct {
     uint32_t op;

@@ -110,6 +110,8 @@ static int cmd_whoami(int argc, char *argv[]);
 static int cmd_passwd(int argc, char *argv[]);
 static int cmd_useradd(int argc, char *argv[]);
 static int cmd_userdel(int argc, char *argv[]);
+static int cmd_userlock(int argc, char *argv[]);
+static int cmd_userunlock(int argc, char *argv[]);
 static int cmd_users(int argc, char *argv[]);
 static int cmd_stop(int argc, char *argv[]);
 static int cmd_export(int argc, char *argv[]);
@@ -1728,6 +1730,8 @@ static void shell_main(void *arg) {
     shell_register_command("passwd", "Change password: passwd [name]", cmd_passwd);
     shell_register_command("useradd", "Create account (admin): useradd <name> <role> [pw]", cmd_useradd);
     shell_register_command("userdel", "Delete account (admin): userdel <name>", cmd_userdel);
+    shell_register_command("user_lock", "Disable account (admin): user_lock <name>", cmd_userlock);
+    shell_register_command("user_unlock", "Enable account (admin): user_unlock <name>", cmd_userunlock);
     shell_register_command("users", "List accounts (admin)", cmd_users);
     shell_register_command("stop", "Stop a system program (admin, confirmed): stop <svc>", cmd_stop);
     shell_register_command("export", "Set env var: export NAME=value (user prefs only)", cmd_export);
@@ -1981,6 +1985,48 @@ static int cmd_userdel(int argc, char *argv[]) {
         return -1;
     }
     shell_printf("userdel: ok\n");
+    return 0;
+}
+
+/* user_lock <name> / user_unlock <name> — admin disables or re-enables
+ * an account (also resets its lockout counter). */
+static int cmd_userlock(int argc, char *argv[]) {
+    if (argc < 2) {
+        shell_write("Usage: user_lock <name>\n");
+        return -1;
+    }
+    user_req_login_t req;
+    memset(&req, 0, sizeof(req));
+    req.op = USER_OP_LOCK;
+    strncpy(req.name, argv[1], sizeof(req.name) - 1);
+    user_resp_login_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int r = user_call(&req, (int)sizeof(req), &resp, (int)sizeof(resp));
+    if (r < 0 || resp.ret < 0) {
+        shell_printf("user_lock: FAILED (%d)\n", r < 0 ? r : resp.ret);
+        return -1;
+    }
+    shell_printf("user_lock: '%s' locked\n", argv[1]);
+    return 0;
+}
+
+static int cmd_userunlock(int argc, char *argv[]) {
+    if (argc < 2) {
+        shell_write("Usage: user_unlock <name>\n");
+        return -1;
+    }
+    user_req_login_t req;
+    memset(&req, 0, sizeof(req));
+    req.op = USER_OP_UNLOCK;
+    strncpy(req.name, argv[1], sizeof(req.name) - 1);
+    user_resp_login_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int r = user_call(&req, (int)sizeof(req), &resp, (int)sizeof(resp));
+    if (r < 0 || resp.ret < 0) {
+        shell_printf("user_unlock: FAILED (%d)\n", r < 0 ? r : resp.ret);
+        return -1;
+    }
+    shell_printf("user_unlock: '%s' unlocked\n", argv[1]);
     return 0;
 }
 

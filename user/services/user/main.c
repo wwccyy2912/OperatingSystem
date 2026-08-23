@@ -47,6 +47,8 @@ typedef struct {
     uint64_t salt;    /* per-account random salt */
     uint64_t pw_hash; /* FNV-1a(name? no: password) with salt */
     uint32_t role;    /* PERM_ROLE_* */
+    int      disabled;   /* 1 = account locked (admin or auto-lockout) */
+    int      fail_count; /* consecutive failed logins (lockout counter) */
 } user_acct_t;
 
 typedef struct {
@@ -164,10 +166,30 @@ static void do_login(int token, int msg_len, uint64_t caller) {
     req->password[USER_PW_MAX - 1] = '\0';
 
     user_acct_t *a = acct_find(req->name);
-    if (!a || !acct_verify(a, req->password)) {
-        resp->ret = ERR_DENIED; /* bad name or password */
+    if (!a) {
+        resp->ret = ERR_DENIED; /* bad name */
         goto out;
     }
+    if (a->disabled) {
+        resp->ret = ERR_DENIED; /* account locked */
+        printf("user: login '%s' rejected (account disabled)\n", a->name);
+        goto out;
+    }
+    if (!acct_verify(a, req->password)) {
+        /* Lockout: N consecutive failures disables the account. */
+        a->fail_count++;
+        if (a->fail_count >= USER_MAX_LOGIN_ATTEMPTS) {
+            a->disabled = 1;
+            printf("user: account '%s' auto-locked after %d failed logins\n",
+                   a->name, a->fail_count);
+        } else {
+            printf("user: bad password for '%s' (%d/%d)\n",
+                   a->name, a->fail_count, USER_MAX_LOGIN_ATTEMPTS);
+        }
+        resp->ret = ERR_DENIED; /* bad password */
+        goto out;
+    }
+    a->fail_count = 0; /* successful login resets the counter */
 
     /* (Re)bind: replace any existing binding for this subject. */
     for (int i = 0; i < USER_MAX_ACCOUNTS; i++) {
@@ -418,6 +440,55 @@ out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
+/* LOCK/UNLOCK: admin disables or re-enables an account.  Cannot lock
+ * yourself or the last admin (same guard as userdel). */
+static void do_lock(int token, int msg_len, uint64_t caller, int lock) {
+    user_resp_login_t *resp = (user_resp_login_t *)s_resp;
+    memset(resp, 0, sizeof(*resp));
+    resp->ret = ERR_INVAL;
+    if (msg_len < (int)sizeof(user_req_login_t))
+        goto out;
+    user_req_login_t *req = (user_req_login_t *)s_req;
+    req->name[USER_NAME_MAX - 1] = '\0';
+
+    user_acct_t *me = acct_of_subject(caller);
+    if (!acct_is_admin(me)) {
+        resp->ret = ERR_DENIED;
+        goto out;
+    }
+    user_acct_t *target = acct_find(req->name);
+    if (!target) {
+        resp->ret = ERR_NOENT;
+        goto out;
+    }
+    if (lock) {
+        if (target == me) {
+            resp->ret = ERR_DENIED; /* cannot lock yourself */
+            goto out;
+        }
+        if (acct_is_admin(target) && acct_admin_count() <= 1) {
+            resp->ret = ERR_DENIED; /* cannot lock the last admin */
+            goto out;
+        }
+        target->disabled = 1;
+        /* Unbind any subject currently bound to this account. */
+        for (int i = 0; i < USER_MAX_ACCOUNTS; i++) {
+            if (s_binds[i].acct == (int)(target - s_accts)) {
+                s_binds[i].subject = 0;
+                s_binds[i].acct    = -1;
+            }
+        }
+        printf("user: account '%s' locked\n", req->name);
+    } else {
+        target->disabled   = 0;
+        target->fail_count = 0;
+        printf("user: account '%s' unlocked\n", req->name);
+    }
+    resp->ret = 0;
+out:
+    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+}
+
 static void do_users(int token, int msg_len, uint64_t caller) {
     user_resp_login_t *resp = (user_resp_login_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
@@ -437,9 +508,10 @@ static void do_users(int token, int msg_len, uint64_t caller) {
             continue;
         int n = snprintf(dst + pos,
                          (int)sizeof(resp->reason) - pos,
-                         "%s %u;",
+                         "%s %u%s;",
                          s_accts[i].name,
-                         s_accts[i].role);
+                         s_accts[i].role,
+                         s_accts[i].disabled ? " L" : "");
         if (n < 0 || pos + n >= (int)sizeof(resp->reason))
             break;
         pos += n;
@@ -555,6 +627,12 @@ static void user_handle(int token, u32 op, int msg_len, uint64_t caller) {
         break;
     case USER_OP_STOP:
         do_stop(token, msg_len, caller);
+        break;
+    case USER_OP_LOCK:
+        do_lock(token, msg_len, caller, 1);
+        break;
+    case USER_OP_UNLOCK:
+        do_lock(token, msg_len, caller, 0);
         break;
     default: {
         i32 *resp = (i32 *)s_resp;

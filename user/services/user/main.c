@@ -31,6 +31,7 @@
 #include "../lib/libc/stdio.h"
 #include "../perm/perm.h"
 #include "../vfs/vfs.h" /* VFS_ERR_EXISTS */
+#include "../policy/policy.h" /* command policy proxy (v0.5) */
 #include "user.h"
 
 /* Request/response buffers (single-threaded service) */
@@ -596,6 +597,100 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
+/*  Command-policy proxy (v0.5)                                       */
+/*                                                                   */
+/*  POLICY_SET/DUMP proxy: the caller (shell) is not management-plane
+ *  (no ATOM_SERVICE_MANAGE), so it cannot mutate policy directly.
+ *  This service holds the atom AND can resolve the caller's account
+ *  role (OWNER/ADMIN), making it the trusted proxy: it re-checks the
+ *  caller's role, then forwards to the policy service.              */
+/* ------------------------------------------------------------------ */
+
+/* Resolve the caller's bound account; NULL when not logged in. */
+static user_acct_t *caller_acct(uint64_t caller) {
+    return acct_of_subject(caller);
+}
+
+static void do_policy_set(int token, int msg_len, uint64_t caller) {
+    user_resp_policy_t *resp = (user_resp_policy_t *)s_resp;
+    memset(resp, 0, sizeof(*resp));
+    resp->ret = ERR_INVAL;
+    if (msg_len < (int)sizeof(user_req_policy_t))
+        goto out;
+    user_req_policy_t *req = (user_req_policy_t *)s_req;
+    req->cmd[sizeof(req->cmd) - 1] = '\0';
+
+    user_acct_t *me = caller_acct(caller);
+    if (!acct_is_admin(me)) {
+        resp->ret = ERR_DENIED; /* OWNER/ADMIN only */
+        goto out;
+    }
+
+    /* Forward to the policy service (we hold ATOM_SERVICE_MANAGE). */
+    int pp = port_get(POLICY_PORT_NAME);
+    if (pp < 0) {
+        resp->ret = ERR_NOENT;
+        goto out;
+    }
+    policy_req_set_t pr;
+    memset(&pr, 0, sizeof(pr));
+    pr.op      = POLICY_OP_SET;
+    pr.role    = req->role;
+    pr.verdict = (uint8_t)req->verdict;
+    strncpy(pr.cmd, req->cmd, sizeof(pr.cmd) - 1);
+    pr.cmd[sizeof(pr.cmd) - 1] = '\0';
+    policy_resp_set_t prr;
+    memset(&prr, 0, sizeof(prr));
+    int rlen = (int)sizeof(prr);
+    int r    = ipc_call(pp, &pr, (int)sizeof(pr), &prr, &rlen);
+    if (r < 0) {
+        resp->ret = r;
+        goto out;
+    }
+    resp->ret = prr.ret;
+out:
+    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+}
+
+static void do_policy_dump(int token, int msg_len, uint64_t caller) {
+    user_resp_policy_t *resp = (user_resp_policy_t *)s_resp;
+    memset(resp, 0, sizeof(*resp));
+    resp->ret = ERR_INVAL;
+    (void)msg_len;
+
+    user_acct_t *me = caller_acct(caller);
+    if (!acct_is_admin(me)) {
+        resp->ret = ERR_DENIED; /* OWNER/ADMIN only */
+        goto out;
+    }
+
+    int pp = port_get(POLICY_PORT_NAME);
+    if (pp < 0) {
+        resp->ret = ERR_NOENT;
+        goto out;
+    }
+    policy_req_dump_t pr;
+    memset(&pr, 0, sizeof(pr));
+    pr.op = POLICY_OP_DUMP;
+    policy_resp_dump_t prr;
+    memset(&prr, 0, sizeof(prr));
+    int rlen = (int)sizeof(prr);
+    int r    = ipc_call(pp, &pr, (int)sizeof(pr), &prr, &rlen);
+    if (r < 0) {
+        resp->ret = r;
+        goto out;
+    }
+    resp->ret = prr.ret;
+    if (prr.ret == 0) {
+        resp->count = prr.count;
+        for (u32 i = 0; i < prr.count && i < 64; i++)
+            strncpy(resp->lines[i], prr.lines[i], sizeof(resp->lines[0]) - 1);
+    }
+out:
+    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+}
+
+/* ------------------------------------------------------------------ */
 /*  Dispatch                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -633,6 +728,12 @@ static void user_handle(int token, u32 op, int msg_len, uint64_t caller) {
         break;
     case USER_OP_UNLOCK:
         do_lock(token, msg_len, caller, 0);
+        break;
+    case USER_OP_POLICY_SET:
+        do_policy_set(token, msg_len, caller);
+        break;
+    case USER_OP_POLICY_DUMP:
+        do_policy_dump(token, msg_len, caller);
         break;
     default: {
         i32 *resp = (i32 *)s_resp;

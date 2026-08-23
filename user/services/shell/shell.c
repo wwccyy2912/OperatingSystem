@@ -117,6 +117,8 @@ static int cmd_stop(int argc, char *argv[]);
 static int cmd_export(int argc, char *argv[]);
 static int cmd_unset(int argc, char *argv[]);
 static int cmd_env(int argc, char *argv[]);
+static int cmd_policy_set(int argc, char *argv[]);
+static int cmd_policy_dump(int argc, char *argv[]);
 
 /* ====================================================================
  * Runtime command registry
@@ -730,6 +732,103 @@ static int cmd_env(int argc, char *argv[]) {
     }
     for (char **e = environ; *e; e++) {
         shell_write(*e);
+        shell_write("\n");
+    }
+    return 0;
+}
+
+/* policy_set <role> <cmd> <allow|deny|unset> — admin hot-updates one
+ * command's verdict for a role.  The mutation goes through the USER
+ * service (the trusted management proxy: it holds ATOM_SERVICE_MANAGE
+ * and verifies the caller is OWNER/ADMIN by account) and is applied
+ * live in the policy service.  This is the "system dynamic mechanism"
+ * for command policy: no rebuild, no restart — runtime adjustment. */
+static int cmd_policy_set(int argc, char *argv[]) {
+    if (argc < 4) {
+        shell_write("Usage: policy_set <role> <cmd> <allow|deny|unset>\n");
+        return -1;
+    }
+    int port = port_get("user");
+    if (port < 0) {
+        shell_printf("policy_set: user service unavailable (%d)\n", port);
+        return -1;
+    }
+
+    /* Role name -> PERM_ROLE_* (mirror of cmd_useradd). */
+    uint32_t role;
+    if (strcmp(argv[1], "owner") == 0) role = PERM_ROLE_OWNER;
+    else if (strcmp(argv[1], "admin") == 0) role = PERM_ROLE_ADMIN;
+    else if (strcmp(argv[1], "standard") == 0) role = PERM_ROLE_STANDARD;
+    else if (strcmp(argv[1], "child") == 0) role = PERM_ROLE_CHILD;
+    else if (strcmp(argv[1], "guest") == 0) role = PERM_ROLE_GUEST;
+    else if (strcmp(argv[1], "auditor") == 0) role = PERM_ROLE_AUDITOR;
+    else {
+        shell_printf("policy_set: invalid role '%s'\n", argv[1]);
+        return -2;
+    }
+
+    uint32_t verdict;
+    if (strcmp(argv[3], "allow") == 0) verdict = POLICY_ALLOW;
+    else if (strcmp(argv[3], "deny") == 0) verdict = POLICY_DENY;
+    else if (strcmp(argv[3], "unset") == 0) verdict = POLICY_UNSET;
+    else {
+        shell_printf("policy_set: invalid verdict '%s' (allow|deny|unset)\n", argv[3]);
+        return -2;
+    }
+
+    user_req_policy_t req;
+    memset(&req, 0, sizeof(req));
+    req.op      = USER_OP_POLICY_SET;
+    req.role    = role;
+    req.verdict = verdict;
+    strncpy(req.cmd, argv[2], sizeof(req.cmd) - 1);
+    req.cmd[sizeof(req.cmd) - 1] = '\0';
+
+    user_resp_policy_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int rlen = (int)sizeof(resp);
+    int r    = ipc_call(port, &req, (int)sizeof(req), &resp, &rlen);
+    if (r < 0) {
+        shell_printf("policy_set: ipc FAILED (%d)\n", r);
+        return -1;
+    }
+    if (resp.ret < 0) {
+        shell_printf("policy_set: FAILED (%d) (admin only)\n", resp.ret);
+        return -1;
+    }
+    shell_printf("policy_set: role=%s cmd=%s -> %s\n",
+                 argv[1], argv[2], argv[3]);
+    return 0;
+}
+
+/* policy_dump — print the full command-policy table (admin, proxied). */
+static int cmd_policy_dump(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    int port = port_get("user");
+    if (port < 0) {
+        shell_printf("policy_dump: user service unavailable (%d)\n", port);
+        return -1;
+    }
+    user_req_policy_t req;
+    memset(&req, 0, sizeof(req));
+    req.op = USER_OP_POLICY_DUMP;
+    user_resp_policy_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int rlen = (int)sizeof(resp);
+    int r    = ipc_call(port, &req, (int)sizeof(req), &resp, &rlen);
+    if (r < 0) {
+        shell_printf("policy_dump: ipc FAILED (%d)\n", r);
+        return -1;
+    }
+    if (resp.ret < 0) {
+        shell_printf("policy_dump: FAILED (%d) (admin only)\n", resp.ret);
+        return -1;
+    }
+    shell_printf("policy_dump: %u rule(s)\n", (unsigned)resp.count);
+    for (uint32_t i = 0; i < resp.count && i < 64; i++) {
+        shell_write("  ");
+        shell_write(resp.lines[i]);
         shell_write("\n");
     }
     return 0;
@@ -1737,6 +1836,8 @@ static void shell_main(void *arg) {
     shell_register_command("export", "Set env var: export NAME=value (user prefs only)", cmd_export);
     shell_register_command("unset", "Remove env var: unset NAME", cmd_unset);
     shell_register_command("env", "Print the environment", cmd_env);
+    shell_register_command("policy_set", "Hot-update cmd policy (admin): policy_set <role> <cmd> <allow|deny|unset>", cmd_policy_set);
+    shell_register_command("policy_dump", "Show cmd policy table (admin)", cmd_policy_dump);
 
     /* v0.5: load the command policy filter (rescue list on failure). */
     cmd_filter_load();

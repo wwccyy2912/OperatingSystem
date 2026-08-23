@@ -43,6 +43,8 @@ enum {
     USER_OP_STOP      = 9, /* stop a user process (admin + verified) */
     USER_OP_LOCK      = 10, /* disable an account (admin; never self/last-admin) */
     USER_OP_UNLOCK    = 11, /* re-enable an account (admin) */
+    USER_OP_POLICY_SET = 12, /* admin proxy: hot-update command policy */
+    USER_OP_POLICY_DUMP = 13, /* admin proxy: dump command policy table */
 };
 
 /* Account lockout policy: failed logins before auto-lock. */
@@ -83,6 +85,24 @@ typedef struct {
     int32_t ret;
     char     detail[64];
 } user_resp_stop_t;
+
+/* POLICY_SET/DUMP: the user service proxies command-policy updates to
+ * the policy service.  The user service holds ATOM_SERVICE_MANAGE and
+ * can resolve the CALLER's account role (OWNER/ADMIN), so it is the
+ * trusted management proxy for policy mutation — the shell does not
+ * hold the management atom and must not mutate policy directly. */
+typedef struct {
+    uint32_t op;      /* USER_OP_POLICY_SET */
+    uint32_t role;    /* PERM_ROLE_* target role */
+    uint32_t verdict; /* POLICY_ALLOW / POLICY_DENY / POLICY_UNSET */
+    char     cmd[32]; /* command name */
+} user_req_policy_t;
+
+typedef struct {
+    int32_t  ret;
+    uint32_t count; /* DUMP: number of policy lines */
+    char     lines[64][48]; /* DUMP: "ROLE cmd verdict" */
+} user_resp_policy_t;
 
 /* Compile-time guard: every message fits the 4096-byte IPC limit. */
 #define USER_IPC_MAX 4096

@@ -219,3 +219,13 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | 修复 stop 错误分支 em-dash（`" — "` → `" - "`，VGA 仅 0x20-0x7E） | ✅ |
 | QEMU 实测：free/uptime/pid/ps/help/env/tee/cat/mkdir/ls/rm 全部 PASS | ✅ |
 | 回归 57/57 + P3 1/1 + P4 2/2 + P5 1/1；`make iso` 0 警告 | ✅ |
+
+### 第五轮补充 5（2026-08-23）：系统动态机制 - 策略运行时热更新
+
+| 项 | 结果 |
+|---|---|
+| `policy_set <role> <cmd> <allow\|deny\|unset>`（admin 代理）：运行时调整命令策略，立即生效 | ✅ guest 的 exec 由 DENY→allow 后成功 spawn |
+| `policy_dump`：导出策略表（ROLE cmd verdict） | ✅ |
+| 架构：user 服务做管理代理（持 ATOM_SERVICE_MANAGE + 按调用者 subject 校验 OWNER/ADMIN）；policy 服务持管理原子可查他人能力 | ✅ |
+| 修复：cap_has_atom 查询他人需自身持原子 → policy 加入 s_svc_blobs 种子列表 | ✅ |
+| 回归 57/57 + P3 1/1 + P4 2/2 + P5 1/1；`make iso` 0 警告 | ✅ |

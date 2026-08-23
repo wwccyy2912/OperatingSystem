@@ -31,7 +31,6 @@
 #include <libc/string.h>
 #include <stdint.h>
 #include <libos/syscalls.h>
-#include "../user/user.h"  /* USER_OP_WHOAMI + user protocol */
 
 typedef uint8_t  u8;
 typedef uint32_t u32;
@@ -105,26 +104,16 @@ static u8 policy_lookup(u32 role, const char *cmd) {
     return POLICY_UNSET;
 }
 
-/* Admin identity: the user service resolves the CALLER's subject to an
- * account role (WHOAMI keys on the caller server-side).  Returns 1 when
- * OWNER/ADMIN. */
-static int caller_is_admin(void) {
-    int port = port_get(USER_PORT_NAME);
-    if (port < 0)
-        return 0;
-    user_req_login_t req;
-    memset(&req, 0, sizeof(req));
-    req.op = USER_OP_WHOAMI;
-    user_resp_login_t resp;
-    memset(&resp, 0, sizeof(resp));
-    int rlen = (int)sizeof(resp);
-    if (ipc_call(port, &req, (int)sizeof(req), &resp, &rlen) < 0)
-        return 0;
-    /* WHOAMI keys on the CALLER's subject server-side, so this is the
-     * subject's own role. */
-    if (resp.ret < 0)
-        return 0;
-    return (resp.role == 1 /* ADMIN */ || resp.role == 0 /* OWNER */) ? 1 : 0;
+/* Admin identity: the CALLER (via ipc_recv_from, unforgeable) must
+ * hold the SERVICE_MANAGE atom — the same management gate the perm
+ * service uses for ROLE_SET.  The user service's OWNER/ADMIN role is
+ * synced into capabilities at login, and the atom is seeded to the
+ * trusted services at spawn; a caller that can set policy is by
+ * definition management-plane.  (Querying the user service's WHOAMI
+ * here would resolve the policy service's OWN subject, not the
+ * caller's — wrong.  Atom check is direct and unforgeable.) */
+static int caller_is_admin(u64 subject) {
+    return cap_has_atom(subject, ATOM_SERVICE_MANAGE) == 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -152,14 +141,14 @@ out:
     (void)ipc_reply(token, &resp, (int)sizeof(resp));
 }
 
-static void do_set(int token, int msg_len, policy_req_set_t *req) {
+static void do_set(int token, int msg_len, u64 caller, policy_req_set_t *req) {
     policy_resp_set_t resp;
     memset(&resp, 0, sizeof(resp));
     if (msg_len < (int)sizeof(policy_req_set_t)) {
         resp.ret = -2;
         goto out;
     }
-    if (!caller_is_admin()) {
+    if (!caller_is_admin(caller)) {
         resp.ret = -9; /* ERR_DENIED: admin only */
         goto out;
     }
@@ -205,11 +194,11 @@ out:
     (void)ipc_reply(token, &resp, (int)sizeof(resp));
 }
 
-static void do_dump(int token, policy_req_dump_t *req) {
+static void do_dump(int token, u64 caller, policy_req_dump_t *req) {
     (void)req;
     policy_resp_dump_t resp;
     memset(&resp, 0, sizeof(resp));
-    if (!caller_is_admin()) {
+    if (!caller_is_admin(caller)) {
         resp.ret = -9;
         goto out;
     }
@@ -266,10 +255,10 @@ static void policy_server_main(void *arg) {
             do_query(token, msg_len, (policy_req_query_t *)s_req);
             break;
         case POLICY_OP_SET:
-            do_set(token, msg_len, (policy_req_set_t *)s_req);
+            do_set(token, msg_len, caller, (policy_req_set_t *)s_req);
             break;
         case POLICY_OP_DUMP:
-            do_dump(token, (policy_req_dump_t *)s_req);
+            do_dump(token, caller, (policy_req_dump_t *)s_req);
             break;
         default:
         {

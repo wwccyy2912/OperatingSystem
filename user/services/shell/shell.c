@@ -2127,7 +2127,7 @@ static int cmd_stop(int argc, char *argv[]) {
     if (r < 0 || sr.ret < 0) {
         shell_printf("stop: FAILED (%d)%s%s\n",
                      r < 0 ? r : sr.ret,
-                     sr.detail[0] ? " — " : "",
+                     sr.detail[0] ? " - " : "",
                      sr.detail);
         return -1;
     }

@@ -210,3 +210,12 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | 自检 fail-fast：每套件（classic/P1/P2/P2V/KBD/P3/P4/P5）失败即打印 `SELFTEST FAILURE` 并中止后续启动（此前失败只计数、静默继续） | ✅ |
 | 自检汇总：`init: ALL SELFTESTS PASSED (33/33)` + `entering idle loop` | ✅ 串口确认 |
 | 回归 57/57 + P3 1/1 + P4 2/2 + P5 1/1；`make iso` 0 警告 | ✅ |
+
+### 第五轮补充 4（2026-08-23）：Shell 命令全量检查
+
+| 项 | 结果 |
+|---|---|
+| 40 个注册命令逐一审查（help/echo/pid/free/clear/cap/ports/sleep/threads/mutex/exec/uptime/exit/reboot/kill/ps/ls/cat/stat/tee/fallocate/mkdir/rm/bm_*/perm_*/mv/pkg/login/logout/whoami/passwd/useradd/userdel/user_lock/user_unlock/users/stop/export/unset/env） | ✅ 全部定义齐全、逻辑正确 |
+| 修复 stop 错误分支 em-dash（`" — "` → `" - "`，VGA 仅 0x20-0x7E） | ✅ |
+| QEMU 实测：free/uptime/pid/ps/help/env/tee/cat/mkdir/ls/rm 全部 PASS | ✅ |
+| 回归 57/57 + P3 1/1 + P4 2/2 + P5 1/1；`make iso` 0 警告 | ✅ |

@@ -84,8 +84,45 @@ typedef struct block {
  * State
  * ==================================================================== */
 
-/* Head of the singly-linked free list */
+/* Head of the singly-linked free list (large blocks / overflow) */
 static block_t *s_free_list = NULL;
+
+/* ---- Size-class bins (v0.5: dynamic-memory optimization) ----
+ *
+ * Small allocations (<= BIN_MAX) are served from segregated per-size
+ * free lists (tcache style): malloc takes a block in O(1), free puts
+ * the block back in O(1).  A bin holds at most BIN_CAP blocks; when it
+ * is full, further frees overflow to the global first-fit list, which
+ * keeps coalescing working.  When a bin is empty, malloc falls back to
+ * the global first-fit path (split + heap_grow as before), so the
+ * bins are purely a fast path and never change allocation semantics.
+ *
+ * Block layout, header flags and the realloc in-place logic are
+ * unchanged: bins only reorganize WHERE free blocks are parked.
+ */
+
+/* Bin sizes: 16, 32, 64, ..., 2048 (2^4 .. 2^11). */
+#define BIN_MIN_SHIFT 4
+#define BIN_COUNT     8
+#define BIN_MAX       (1u << (BIN_MIN_SHIFT + BIN_COUNT - 1)) /* 2048 */
+
+/* Max blocks parked per bin before overflowing to the global list. */
+#define BIN_CAP 6
+
+static block_t *s_bins[BIN_COUNT];
+
+/* Bin index for a payload size, or -1 when the request is too large. */
+static int bin_index(size_t size) {
+    if (size > BIN_MAX)
+        return -1;
+    size_t asize = BLOCK_HDR_SZ + ROUND_UP(size);
+    if (asize < MALLOC_MIN_SIZE)
+        asize = MALLOC_MIN_SIZE;
+    unsigned shift = BIN_MIN_SHIFT;
+    while ((1u << shift) < asize && shift < BIN_MIN_SHIFT + BIN_COUNT)
+        shift++;
+    return (int)(shift - BIN_MIN_SHIFT);
+}
 
 /* Next virtual address to request from kernel when heap grows.
  * Defaults to HEAP_BASE_DEFAULT until the kernel's per-process
@@ -170,6 +207,12 @@ static int heap_grow(size_t need) {
     return 0;
 }
 
+/* Forward declarations: bin/block helpers used by coalesce_after and
+ * the _locked allocators below. */
+static int  bin_count(int idx);
+static int  block_is_free(block_t *blk);
+static int  block_unlink(block_t *blk);
+
 /* Coalesce adjacent free blocks.
  * After marking a block free, check if the block that immediately follows
  * it in address space is also free — if so, merge them. */
@@ -177,16 +220,12 @@ static void coalesce_after(block_t *block) {
     size_t   block_sz = BLOCK_SIZE(block);
     block_t *next     = (block_t *)((char *)block + block_sz);
 
-    /* Walk the free list to find if 'next' is a free block */
-    block_t **pp = &s_free_list;
-    while (*pp) {
-        if (*pp == next) {
-            /* Coalesce: absorb next into block */
-            block->size = (block_sz + BLOCK_SIZE(next)) | 1;
-            *pp         = next->next;
-            return;
-        }
-        pp = &(*pp)->next;
+    /* The following block may be parked in the global list OR in a
+     * size-class bin.  block_is_free/block_unlink (defined below)
+     * cover both. */
+    if (block_is_free(next)) {
+        (void)block_unlink(next);
+        block->size = (block_sz + BLOCK_SIZE(next)) | 1;
     }
 }
 
@@ -208,6 +247,17 @@ static void *malloc_locked(size_t size) {
     if (asize < MALLOC_MIN_SIZE)
         asize = MALLOC_MIN_SIZE;
 
+    /* Fast path: take a block from the matching size-class bin. */
+    if (asize <= BIN_MAX) {
+        int b = bin_index(size);
+        if (b >= 0 && s_bins[b]) {
+            block_t *blk = s_bins[b];
+            s_bins[b]    = blk->next;
+            MARK_USED(blk);
+            return (char *)blk + BLOCK_HDR_SZ;
+        }
+    }
+
     for (;;) {
         block_t **pp = &s_free_list;
         while (*pp) {
@@ -219,7 +269,7 @@ static void *malloc_locked(size_t size) {
 
                 if (remainder >= MALLOC_MIN_SIZE) {
                     block_t *newb = (block_t *)((char *)b + asize);
-                    newb->size    = remainder | 1;
+                    newb->size    = remainder | 1; /* free */
                     newb->next    = b->next;
 
                     b->size = asize;
@@ -239,12 +289,69 @@ static void *malloc_locked(size_t size) {
     }
 }
 
+/* Count the blocks currently parked in a bin. */
+static int bin_count(int idx) {
+    int n = 0;
+    for (block_t *b = s_bins[idx]; b; b = b->next)
+        n++;
+    return n;
+}
+
+/* Is `blk` a free block?  Checks the global list AND every bin (a free
+ * small block may be parked in its size-class bin). */
+static int block_is_free(block_t *blk) {
+    for (block_t *f = s_free_list; f; f = f->next)
+        if (f == blk)
+            return 1;
+    for (int i = 0; i < BIN_COUNT; i++)
+        for (block_t *f = s_bins[i]; f; f = f->next)
+            if (f == blk)
+                return 1;
+    return 0;
+}
+
+/* Unlink `blk` from wherever it is parked (global list or a bin).
+ * Returns 1 when found and removed, 0 when it was not free. */
+static int block_unlink(block_t *blk) {
+    block_t **pp = &s_free_list;
+    while (*pp) {
+        if (*pp == blk) {
+            *pp = blk->next;
+            return 1;
+        }
+        pp = &(*pp)->next;
+    }
+    for (int i = 0; i < BIN_COUNT; i++) {
+        block_t **bp = &s_bins[i];
+        while (*bp) {
+            if (*bp == blk) {
+                *bp = blk->next;
+                return 1;
+            }
+            bp = &(*bp)->next;
+        }
+    }
+    return 0;
+}
+
 static void free_locked(void *ptr) {
     if (!ptr)
         return;
 
     block_t *b = (block_t *)((char *)ptr - BLOCK_HDR_SZ);
     MARK_FREE(b);
+
+    /* Fast path: park small blocks in their size-class bin (bounded;
+     * full bins overflow to the global list so coalescing still runs). */
+    size_t bsz = BLOCK_SIZE(b);
+    if (bsz <= BIN_MAX) {
+        int idx = bin_index(bsz - BLOCK_HDR_SZ);
+        if (idx >= 0 && bin_count(idx) < BIN_CAP) {
+            b->next = s_bins[idx];
+            s_bins[idx] = b;
+            return;
+        }
+    }
 
     b->next     = s_free_list;
     s_free_list = b;
@@ -319,25 +426,19 @@ void *realloc(void *ptr, size_t size) {
         block_t *last = b;
         while (have < asize) {
             block_t *nxt = (block_t *)((char *)last + BLOCK_SIZE(last));
-            block_t *f;
-            for (f = s_free_list; f && f != nxt; f = f->next)
-                ;
-            if (!f)
+            if (!block_is_free(nxt))
                 break; /* next block is used or absent */
-            have += BLOCK_SIZE(f);
-            last = f;
+            have += BLOCK_SIZE(nxt);
+            last = nxt;
         }
 
         if (have >= asize) {
-            /* Pass 2: unlink every absorbed block from the free list. */
+            /* Pass 2: unlink every absorbed block from wherever it is
+             * parked (global list or a size-class bin). */
             block_t *cur = (block_t *)((char *)b + BLOCK_SIZE(b));
             block_t *end = (block_t *)((char *)last + BLOCK_SIZE(last));
             while (cur != end) {
-                block_t **pp = &s_free_list;
-                while (*pp && *pp != cur)
-                    pp = &(*pp)->next;
-                if (*pp)
-                    *pp = cur->next;
+                (void)block_unlink(cur);
                 cur = (block_t *)((char *)cur + BLOCK_SIZE(cur));
             }
 

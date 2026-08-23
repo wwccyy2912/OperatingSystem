@@ -27,6 +27,14 @@ static u64  s_bitmap_phys;  /* Physical address of bitmap */
 static u64  s_bitmap_pages; /* Pages occupied by bitmap */
 static u64  s_mem_end;      /* Highest physical address + 1 */
 
+/* Next-fit hint (v0.5): the page index where the previous allocation
+ * scan stopped.  bitmap_find_free() resumes from here (wrapping around)
+ * instead of always scanning from page 1 — repeated small allocations
+ * become O(run) instead of O(total).  The hint is a hint only: the scan
+ * always covers the whole map when needed, so correctness is
+ * unaffected. */
+static u64 s_next_hint = 1;
+
 /* ---- Bitmap helpers ---- */
 
 static inline void bitmap_set(u64 idx) {
@@ -51,22 +59,30 @@ static u64 bitmap_find_free(u64 count) {
         return 0;
     }
 
-    u64 total     = s_total_pages;
-    u64 run       = 0;
-    u64 run_start = 0;
+    u64 total = s_total_pages;
 
-    /* Start from page 1 to skip the null page */
-    for (u64 i = 1; i < total; i++) {
-        if (!bitmap_test(i)) {
-            if (run == 0) {
-                run_start = i;
+    /* Scan twice: from the hint to the end, then wrap to the start.
+     * This keeps the next-fit locality without ever missing a free
+     * run (a full wrap covers the entire map). */
+    for (int pass = 0; pass < 2; pass++) {
+        u64 start = (pass == 0) ? s_next_hint : 1;
+        u64 run   = 0;
+        u64 run_start = 0;
+
+        for (u64 i = start; i < total; i++) {
+            if (!bitmap_test(i)) {
+                if (run == 0)
+                    run_start = i;
+                run++;
+                if (run == count) {
+                    s_next_hint = i + 1;
+                    if (s_next_hint >= total)
+                        s_next_hint = 1;
+                    return run_start;
+                }
+            } else {
+                run = 0;
             }
-            run++;
-            if (run == count) {
-                return run_start;
-            }
-        } else {
-            run = 0;
         }
     }
     return 0;

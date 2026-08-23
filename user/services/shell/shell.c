@@ -1905,20 +1905,38 @@ static int cmd_passwd(int argc, char *argv[]) {
 }
 
 /* useradd <name> <role> [password] — create an account (admin only).
- * Role: owner|admin|standard|child|guest|auditor (or numeric). */
+ * Role: owner|admin|standard|child|guest|auditor (or numeric).  An
+ * unrecognized role name is an ERROR (never silently 0/OWNER). */
 static int cmd_useradd(int argc, char *argv[]) {
     if (argc < 3) {
         shell_write("Usage: useradd <name> <role> [password]\n");
         return -1;
     }
     uint32_t role;
+    int      role_ok = 1;
     if (strcmp(argv[2], "owner") == 0) role = PERM_ROLE_OWNER;
     else if (strcmp(argv[2], "admin") == 0) role = PERM_ROLE_ADMIN;
     else if (strcmp(argv[2], "standard") == 0) role = PERM_ROLE_STANDARD;
     else if (strcmp(argv[2], "child") == 0) role = PERM_ROLE_CHILD;
     else if (strcmp(argv[2], "guest") == 0) role = PERM_ROLE_GUEST;
     else if (strcmp(argv[2], "auditor") == 0) role = PERM_ROLE_AUDITOR;
-    else role = (uint32_t)atoi(argv[2]);
+    else {
+        /* Numeric role: accept only a pure number in [0, PERM_ROLE_MAX). */
+        char *end = NULL;
+        long  v   = strtol(argv[2], &end, 10);
+        if (end == argv[2] || *end != '\0' || v < 0 || v >= PERM_ROLE_MAX) {
+            role_ok = 0;
+            role    = 0;
+        } else {
+            role = (uint32_t)v;
+        }
+    }
+    if (!role_ok) {
+        shell_printf("useradd: invalid role '%s' "
+                     "(owner|admin|standard|child|guest|auditor)\n",
+                     argv[2]);
+        return -2; /* ERR_INVAL */
+    }
 
     char pw[USER_PW_MAX];
     if (argc >= 4) {

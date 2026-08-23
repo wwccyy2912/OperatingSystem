@@ -184,3 +184,12 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | 环境变量定位：纯用户偏好（PS1/EDITOR），**不承载安全策略**（用户架构决策） | ✅ |
 | 回归：classic 33/33 + P1 10/10 + P2 5/5 + P2V 4/4 + KBD 1/1 + P3 1/1 + P4 2/2 + P5 1/1 | ✅ 57/57 |
 | `make iso` | ✅ 0 警告 |
+
+### 第五轮补充（2026-08-23 下午）：动态内存优化 + useradd 漏洞
+
+| 项 | 结果 |
+|---|---|
+| malloc 大小分桶（tcache 风格）：16..2048 共 8 桶，小分配 O(1) 取用/归还，桶满溢出回全局 first-fit 保持合并；realloc 就地增长跨桶查找（block_is_free/unlink） | ✅ 回归含 heap guard 全过 |
+| PMM next-fit hint：bitmap_find_free 从上次位置续扫（两遍回绕），重复小分配 O(run) 而非 O(total) | ✅ |
+| **useradd 角色漏洞修复**：无效角色名曾静默 `atoi→0=OWNER`（可意外提权）；现严格校验角色名/纯数字，非法即报错 | ✅ `useradd bad badrole` → invalid role |
+| 回归 57/57 + P3 1/1 + P4 2/2 + P5 1/1；`make iso` 0 警告 | ✅ |

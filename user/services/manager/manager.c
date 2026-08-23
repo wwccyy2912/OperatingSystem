@@ -101,6 +101,7 @@ static service_t s_services[] = {
     {"shell", -1, 0, 1},
     {"user", -1, 0, 1}, /* user account service (login/passwd/stop guard) */
     {"wm", -1, 0, 1},   /* window manager (v0.4 desktop: registry+compositor) */
+    {"policy", -1, 0, 1}, /* command policy service (v0.5, before shell)    */
 };
 
 /* Restartable services (production hardening): crash → auto-restart up
@@ -123,6 +124,7 @@ static service_t s_services[] = {
 #define SVC_SHELL         10
 #define SVC_USER          11
 #define SVC_WM            12
+#define SVC_POLICY        13
 
 /* ====================================================================
  * Serial service output (mirrors shell.c)
@@ -590,6 +592,13 @@ int main(void) {
      * `exec`) starts a session. */
     manager_write("manager: starting window manager\n");
     if (spawn_service(&s_services[SVC_WM], 0) < 0)
+        for (;;)
+            thread_yield();
+
+    /* policy before shell: the shell queries the command policy at
+     * startup to build its command filter (v0.5). */
+    manager_write("manager: starting policy service\n");
+    if (spawn_service(&s_services[SVC_POLICY], 0) < 0)
         for (;;)
             thread_yield();
 

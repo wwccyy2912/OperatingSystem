@@ -34,6 +34,7 @@
 #include "../lib/libos/syscalls.h"
 #include "../perm/perm.h" /* Powerbox protocol (perm_answer/perm_revoke) */
 #include "../user/user.h" /* user account protocol */
+#include "../policy/policy.h" /* command policy service (v0.5) */
 #include "../lib/libtui/tui.h" /* interactive TUI components */
 #include <malloc.h>       /* malloc, free */
 #include <stdarg.h>
@@ -111,6 +112,9 @@ static int cmd_useradd(int argc, char *argv[]);
 static int cmd_userdel(int argc, char *argv[]);
 static int cmd_users(int argc, char *argv[]);
 static int cmd_stop(int argc, char *argv[]);
+static int cmd_export(int argc, char *argv[]);
+static int cmd_unset(int argc, char *argv[]);
+static int cmd_env(int argc, char *argv[]);
 
 /* ====================================================================
  * Runtime command registry
@@ -137,6 +141,142 @@ typedef struct cmd_node {
 
 static cmd_node_t *s_cmd_head; /* list head  (see single-writer rule) */
 static cmd_node_t *s_cmd_tail; /* list tail  (O(1) append keeps order) */
+
+/* ====================================================================
+ * Command policy filter (v0.5)
+ *
+ * Three-tier command access (docs/permission_model.md §九·五):
+ *   Capability (kernel) -> Policy DB (policy service) -> Shell override.
+ * The shell keeps its full static command table, but marks every
+ * registered command with a verdict fetched from the policy service at
+ * startup (POLICY_DENY -> not executed).  If the policy service is
+ * unreachable, a hardcoded rescue list keeps the shell usable.
+ * Environment variables NEVER gate commands (env = user prefs only).
+ * ==================================================================== */
+
+/* Per-command verdict table, indexed by command name hash. */
+#define CMD_FILTER_SLOTS 128
+
+typedef struct {
+    char name[POLICY_CMD_MAX];
+    u8   deny; /* 1 = command blocked by policy */
+} cmd_filter_t;
+
+static cmd_filter_t s_cmd_filter[CMD_FILTER_SLOTS];
+static int          s_filter_ready; /* 1 after the policy query */
+
+/* FNV-1a over the command name -> slot. */
+static u32 cmd_filter_hash(const char *s) {
+    u32 h = 2166136261u;
+    while (*s) {
+        h ^= (u8)*s++;
+        h *= 16777619u;
+    }
+    return h % CMD_FILTER_SLOTS;
+}
+
+/* Record a verdict (deny=1/0) for a command. */
+static void cmd_filter_set(const char *name, int deny) {
+    u32 slot = cmd_filter_hash(name);
+    for (u32 i = 0; i < CMD_FILTER_SLOTS; i++) {
+        u32 idx = (slot + i) % CMD_FILTER_SLOTS;
+        if (s_cmd_filter[idx].name[0] == '\0' ||
+            strcmp(s_cmd_filter[idx].name, name) == 0) {
+            strncpy(s_cmd_filter[idx].name, name, sizeof(s_cmd_filter[idx].name) - 1);
+            s_cmd_filter[idx].name[sizeof(s_cmd_filter[idx].name) - 1] = '\0';
+            s_cmd_filter[idx].deny                                    = (u8)deny;
+            return;
+        }
+    }
+    /* Table full: leave unrecorded (default allow). */
+}
+
+/* 1 when the command is blocked by policy (deny); 0 otherwise. */
+static int cmd_filter_denied(const char *name) {
+    if (!s_filter_ready)
+        return 0; /* no policy loaded -> allow (capability still gates) */
+    u32 slot = cmd_filter_hash(name);
+    for (u32 i = 0; i < CMD_FILTER_SLOTS; i++) {
+        u32 idx = (slot + i) % CMD_FILTER_SLOTS;
+        if (s_cmd_filter[idx].name[0] == '\0')
+            return 0;
+        if (strcmp(s_cmd_filter[idx].name, name) == 0)
+            return s_cmd_filter[idx].deny;
+    }
+    return 0;
+}
+
+/* Rescue list: commands guaranteed to work even if the policy service
+ * is down (admin recovery path).  These are force-ALLOWED. */
+static const char *const s_rescue_cmds[] = {
+    "help", "ls", "cat", "echo", "env", "export", "unset",
+    "login", "whoami", "exit", "reboot",
+};
+
+static int cmd_is_rescue(const char *name) {
+    for (u32 i = 0; i < sizeof(s_rescue_cmds) / sizeof(s_rescue_cmds[0]); i++)
+        if (strcmp(s_rescue_cmds[i], name) == 0)
+            return 1;
+    return 0;
+}
+
+/* Query the policy service for the caller's role and mark the command
+ * table.  Falls back to rescue-only mode on any failure. */
+static void cmd_filter_load(void) {
+    memset(s_cmd_filter, 0, sizeof(s_cmd_filter));
+    s_filter_ready = 0;
+
+    int port = port_get(POLICY_PORT_NAME);
+    if (port < 0)
+        return; /* service down: no policy -> all allowed (rescue implicit) */
+
+    /* Resolve the caller's role via the user service (WHOAMI). */
+    u32 role = 2; /* PERM_ROLE_STANDARD default */
+    {
+        int uport = port_get("user");
+        if (uport >= 0) {
+            user_req_login_t req;
+            memset(&req, 0, sizeof(req));
+            req.op = USER_OP_WHOAMI;
+            user_resp_login_t resp;
+            memset(&resp, 0, sizeof(resp));
+            int rlen = (int)sizeof(resp);
+            if (ipc_call(uport, &req, (int)sizeof(req), &resp, &rlen) == 0 && resp.ret == 0)
+                role = resp.role;
+        }
+    }
+
+    /* Build the command list from the registry (bounded). */
+    policy_req_query_t q;
+    memset(&q, 0, sizeof(q));
+    q.op    = POLICY_OP_QUERY;
+    q.role  = role;
+    q.count = 0;
+    for (cmd_node_t *n = s_cmd_head; n && q.count < POLICY_MAX_CMDS; n = n->next) {
+        strncpy(q.cmds[q.count], n->name, POLICY_CMD_MAX - 1);
+        q.cmds[q.count][POLICY_CMD_MAX - 1] = '\0';
+        q.count++;
+    }
+    if (q.count == 0)
+        return;
+
+    policy_resp_query_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int rlen = (int)sizeof(resp);
+    if (ipc_call(port, &q, (int)sizeof(q), &resp, &rlen) < 0 || resp.ret < 0)
+        return;
+
+    /* Apply verdicts; rescue commands are force-allowed. */
+    u32 n = 0;
+    for (cmd_node_t *node = s_cmd_head; node && n < resp.count; node = node->next, n++) {
+        u8 v = resp.verdicts[n];
+        if (v == POLICY_DENY && !cmd_is_rescue(node->name))
+            cmd_filter_set(node->name, 1);
+        else
+            cmd_filter_set(node->name, 0);
+    }
+    s_filter_ready = 1;
+}
 
 /*
  * Register a command with the shell.  Both name and help are strdup'd
@@ -451,6 +591,12 @@ static int execute(char *line) {
     if (argc == 0)
         return 0;
 
+    /* Policy gate (v0.5): a DENY verdict blocks execution. */
+    if (cmd_filter_denied(argv[0])) {
+        shell_printf("shell: command '%s' denied by policy\n", argv[0]);
+        return -9; /* ERR_DENIED */
+    }
+
     /* Look up command in the runtime-registered list */
     for (cmd_node_t *n = s_cmd_head; n != NULL; n = n->next) {
         if (strcmp(argv[0], n->name) == 0)
@@ -476,7 +622,13 @@ static void shell_loop(void) {
     char line[LINE_BUF_SIZE];
 
     for (;;) {
-        shell_write(SHELL_PROMPT);
+        /* PS1-driven prompt: default "opsys$ " unless the user overrides
+         * it via `export PS1=...` (environment = user preferences only;
+         * it never carries security policy). */
+        const char *prompt = getenv("PS1");
+        if (!prompt || prompt[0] == '\0')
+            prompt = SHELL_PROMPT;
+        shell_write(prompt);
         int len = read_line(line, LINE_BUF_SIZE);
         if (len < 0) {
             thread_yield(); /* serial service unavailable */
@@ -518,6 +670,66 @@ static int cmd_echo(int argc, char *argv[]) {
         shell_write(argv[i]);
     }
     shell_write("\n");
+    return 0;
+}
+
+/* export NAME=value | export NAME — set an environment variable (or
+ * print its current value).  The environment carries per-process user
+ * preferences (PS1/EDITOR/LANG); it never carries security policy. */
+static int cmd_export(int argc, char *argv[]) {
+    if (argc < 2) {
+        shell_write("Usage: export NAME=value | export NAME\n");
+        return -1;
+    }
+    const char *arg = argv[1];
+    char       *eq  = strchr(arg, '=');
+    if (eq) {
+        char saved = *eq;
+        *eq        = '\0';
+        int r      = setenv(arg, eq + 1, 1);
+        *eq        = saved;
+        if (r < 0) {
+            shell_printf("export: setenv(%s) failed\n", arg);
+            return -1;
+        }
+        shell_printf("export: %s\n", arg);
+        return 0;
+    }
+    const char *v = getenv(arg);
+    if (v)
+        shell_printf("%s=%s\n", arg, v);
+    else
+        shell_printf("%s: not set\n", arg);
+    return 0;
+}
+
+/* unset NAME — remove an environment variable. */
+static int cmd_unset(int argc, char *argv[]) {
+    if (argc < 2) {
+        shell_write("Usage: unset NAME\n");
+        return -1;
+    }
+    int r = unsetenv(argv[1]);
+    if (r < 0) {
+        shell_printf("unset: invalid name '%s'\n", argv[1]);
+        return -1;
+    }
+    shell_printf("unset: %s\n", argv[1]);
+    return 0;
+}
+
+/* env — print the whole environment, one "NAME=value" per line. */
+static int cmd_env(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    if (!environ) {
+        shell_write("env: (empty)\n");
+        return 0;
+    }
+    for (char **e = environ; *e; e++) {
+        shell_write(*e);
+        shell_write("\n");
+    }
     return 0;
 }
 
@@ -1518,6 +1730,12 @@ static void shell_main(void *arg) {
     shell_register_command("userdel", "Delete account (admin): userdel <name>", cmd_userdel);
     shell_register_command("users", "List accounts (admin)", cmd_users);
     shell_register_command("stop", "Stop a system program (admin, confirmed): stop <svc>", cmd_stop);
+    shell_register_command("export", "Set env var: export NAME=value (user prefs only)", cmd_export);
+    shell_register_command("unset", "Remove env var: unset NAME", cmd_unset);
+    shell_register_command("env", "Print the environment", cmd_env);
+
+    /* v0.5: load the command policy filter (rescue list on failure). */
+    cmd_filter_load();
 
     shell_loop();
 }
@@ -1609,6 +1827,10 @@ static int cmd_login(int argc, char *argv[]) {
         return -1;
     }
     shell_printf("login: ok - '%s' (%s)\n", resp.name, role_name(resp.role));
+
+    /* The command policy is role-dependent: reload it so the new
+     * role's allow/deny verdicts apply immediately. */
+    cmd_filter_load();
     return 0;
 }
 
@@ -1626,6 +1848,8 @@ static int cmd_logout(int argc, char *argv[]) {
         return -1;
     }
     shell_printf("logout: ok\n");
+    /* Role reverts on logout: reload the command policy. */
+    cmd_filter_load();
     return 0;
 }
 

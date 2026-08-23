@@ -301,12 +301,153 @@ _Noreturn void quick_exit(int status) {
 
 /* ====================================================================
  * Environment (C11 §7.22.4.6-7)
+ *
+ * Process-local environment: a NULL-terminated array of "NAME=value"
+ * strings.  The array is heap-allocated and grown on demand; entries
+ * are strdup'd on setenv (putenv installs the caller's string as-is,
+ * matching POSIX).  Thread-safety: the shell is single-threaded at
+ * env-mutation points; concurrent setenv from multiple threads is not
+ * a supported pattern (documented).
+ *
+ * Design note (v0.5): the environment carries ONLY per-process user
+ * preferences (PS1, EDITOR, LANG, ...).  It deliberately does NOT
+ * carry security policy — command availability is decided by the
+ * policy service (Capability → Policy DB → shell override), never by
+ * environment variables.  See docs/permission_model.md.
  * ==================================================================== */
 
+/* Initial capacity and growth step for the env pointer array. */
+#define ENV_INIT_CAP 8
+
+char **environ = NULL; /* NULL-terminated "NAME=value" array */
+
+static size_t s_env_count = 0; /* entries in use (excl. NULL terminator) */
+static size_t s_env_cap   = 0; /* allocated slots (incl. NULL terminator) */
+
+/* NAME is valid iff non-empty and contains no '='. */
+static int env_name_valid(const char *name) {
+    if (!name || name[0] == '\0')
+        return 0;
+    for (const char *p = name; *p; p++)
+        if (*p == '=')
+            return 0;
+    return 1;
+}
+
+/* Index of the entry whose NAME matches (returns -1 when absent). */
+static long env_find(const char *name) {
+    size_t nlen = strlen(name);
+    for (size_t i = 0; i < s_env_count; i++) {
+        if (strncmp(environ[i], name, nlen) == 0 && environ[i][nlen] == '=')
+            return (long)i;
+    }
+    return -1;
+}
+
 char *getenv(const char *name) {
-    /* No environment in v0.1 — always returns NULL. */
-    (void)name;
-    return NULL;
+    if (!name || !environ)
+        return NULL;
+    long i = env_find(name);
+    if (i < 0)
+        return NULL;
+    char *eq = strchr(environ[i], '=');
+    return eq ? eq + 1 : NULL;
+}
+
+int setenv(const char *name, const char *value, int overwrite) {
+    if (!env_name_valid(name) || !value)
+        return -1;
+
+    long i = env_find(name);
+    if (i >= 0 && !overwrite)
+        return -1; /* already set and overwrite disallowed */
+
+    /* Compose "NAME=value". */
+    size_t nlen = strlen(name), vlen = strlen(value);
+    char  *entry = malloc(nlen + vlen + 2);
+    if (!entry)
+        return -1;
+    memcpy(entry, name, nlen);
+    entry[nlen] = '=';
+    memcpy(entry + nlen + 1, value, vlen);
+    entry[nlen + 1 + vlen] = '\0';
+
+    if (i >= 0) {
+        /* Replace: drop the old string. */
+        free(environ[i]);
+        environ[i] = entry;
+        return 0;
+    }
+
+    /* Append: ensure capacity. */
+    if (s_env_count + 2 > s_env_cap) {
+        size_t   new_cap = s_env_cap ? s_env_cap * 2 : ENV_INIT_CAP;
+        char   **new_arr = malloc(new_cap * sizeof(char *));
+        if (!new_arr) {
+            free(entry);
+            return -1;
+        }
+        if (environ) {
+            memcpy(new_arr, environ, (s_env_count + 1) * sizeof(char *));
+            free(environ);
+        }
+        environ   = new_arr;
+        s_env_cap = new_cap;
+    }
+    environ[s_env_count++] = entry;
+    environ[s_env_count]   = NULL;
+    return 0;
+}
+
+int unsetenv(const char *name) {
+    if (!env_name_valid(name))
+        return -1;
+    long i = env_find(name);
+    if (i < 0)
+        return 0; /* not set: success, nothing to do */
+    free(environ[i]);
+    /* Shift the tail (including the NULL terminator). */
+    for (size_t j = (size_t)i; j < s_env_count; j++)
+        environ[j] = environ[j + 1];
+    s_env_count--;
+    return 0;
+}
+
+int putenv(char *string) {
+    if (!string)
+        return -1;
+    char *eq = strchr(string, '=');
+    if (!eq || eq == string)
+        return -1; /* must contain '=' and a non-empty NAME */
+
+    /* NAME = [string, eq).  Temporarily split for the lookup. */
+    char saved = *eq;
+    *eq        = '\0';
+    long i     = env_find(string);
+    *eq        = saved;
+
+    if (i >= 0) {
+        free(environ[i]);
+        environ[i] = string; /* caller-owned, not copied (POSIX) */
+        return 0;
+    }
+
+    /* Append (same growth path as setenv). */
+    if (s_env_count + 2 > s_env_cap) {
+        size_t   new_cap = s_env_cap ? s_env_cap * 2 : ENV_INIT_CAP;
+        char   **new_arr = malloc(new_cap * sizeof(char *));
+        if (!new_arr)
+            return -1;
+        if (environ) {
+            memcpy(new_arr, environ, (s_env_count + 1) * sizeof(char *));
+            free(environ);
+        }
+        environ   = new_arr;
+        s_env_cap = new_cap;
+    }
+    environ[s_env_count++] = string;
+    environ[s_env_count]   = NULL;
+    return 0;
 }
 
 int system(const char *string) {

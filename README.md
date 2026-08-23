@@ -63,6 +63,15 @@ OpSys 是一个从零开始的 64 位微内核操作系统项目，采用「机�
 - **wm_demo 桌面演示**：`exec wm_demo` 启动三窗口桌面
   （Terminal/Files/Settings），`scripts/verify_wm.py` 8/8 验证。
 
+### v0.5 环境变量 + 命令策略
+
+- **环境变量**（纯用户偏好）：`export NAME=value` / `unset NAME` / `env`；
+  `PS1` 可自定义 prompt；libc 提供 `getenv/setenv/unsetenv/putenv/environ`。
+  环境变量**不承载安全策略**。
+- **命令策略三层架构**：Capability（内核）→ Policy DB（policy 服务，角色
+  级 allow/deny）→ Shell 覆盖（登录态重载 + 救急列表）。guest 登录后
+  `exec`/`kill` 被 shell 拦截。
+
 ### 用户账户与系统程序退出保护
 
 - **user 账户服务**（独立 Ring 3 进程）：登录/登出/改密/建号/删号/列表；
@@ -159,6 +168,7 @@ OpSys/
 │       ├── user/             # 用户账户服务（登录/权限/退出保护）
 │       ├── wm/               # 窗口管理器（v0.4 桌面）
 │       ├── wm_demo/          # 桌面演示（exec wm_demo）
+│       ├── policy/           # 命令策略服务（v0.5 三层架构中 Policy DB）
 │       └── flaky/            # 故障测试服务
 ├── boot/                     # GRUB 引导配置
 ├── scripts/                  # 辅助脚本

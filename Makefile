@@ -127,6 +127,7 @@ USER_C := \
     user/services/user/main.c \
     user/services/wm/main.c \
     user/services/wm_demo/main.c \
+    user/services/policy/main.c \
     user/lib/libtui/tui.c \
     user/lib/libwm/wm.c \
     user/lib/libfs/fs.c \
@@ -175,10 +176,11 @@ USER_SVC_ENTRY_OBJ := \
     build/user/services/window_demo/main.c.o \
     build/user/services/user/main.c.o \
     build/user/services/wm/main.c.o \
-    build/user/services/wm_demo/main.c.o
+    build/user/services/wm_demo/main.c.o \
+    build/user/services/policy/main.c.o
 USER_SHARED_OBJ := $(filter-out $(USER_SVC_ENTRY_OBJ), $(USER_OBJ))
 
-SVC_NAMES := init manager serial keyboard term shell flaky crashpeer hello vfs fs_mem_driver fs_virtio_blk_driver perm device_mgr pkg sbox_demo runtime_demo tui_demo window_demo user wm wm_demo
+SVC_NAMES := init manager serial keyboard term shell flaky crashpeer hello vfs fs_mem_driver fs_virtio_blk_driver perm device_mgr pkg sbox_demo runtime_demo tui_demo window_demo user wm wm_demo policy
 SVC_BLOBS := $(addprefix build/, $(addsuffix _blob.o, $(SVC_NAMES)))
 
 # ==============================================================================
@@ -257,6 +259,7 @@ $(eval $(call SVC_LINK_RULE,window_demo,window_demo/main.c.o))
 $(eval $(call SVC_LINK_RULE,user,user/main.c.o))
 $(eval $(call SVC_LINK_RULE,wm,wm/main.c.o))
 $(eval $(call SVC_LINK_RULE,wm_demo,wm_demo/main.c.o))
+$(eval $(call SVC_LINK_RULE,policy,policy/main.c.o))
 
 # Embed each service ELF as a kernel blob object (symbols renamed to <svc>_elf_*).
 define SVC_BLOB_RULE

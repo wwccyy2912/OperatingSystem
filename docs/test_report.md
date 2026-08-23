@@ -170,3 +170,17 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 门控 fb），输入经 keyboard 焦点路由；窗口注册表操作用 `ipc_recv_from` 的
 内核 subject 做 owner 门控（DESTROY/MOVE/WRITE），管理面
 （ATOM_SERVICE_MANAGE）可跨窗口操作。BLOB_MAX_ENTRIES 24→26（+wm/+wm_demo）。
+
+---
+
+## 第五轮：环境变量 + 命令策略三层架构（2026-08-23）
+
+| 项 | 结果 |
+|---|---|
+| libc 环境：`environ`/`getenv`/`setenv`/`unsetenv`/`putenv`（C11 §7.22.4） | ✅ |
+| shell：`export`/`unset`/`env` 命令 + `PS1` 动态 prompt | ✅ QEMU 验证 |
+| policy 服务：角色→命令 verdict 表（GUEST/CHILD 禁 exec/kill/stop/useradd 等 18 条种子） | ✅ |
+| shell 命令过滤：启动/登录/登出时从 policy 拉取 verdict，执行时拦截，救急列表兜底 | ✅ guest 登录后 `exec`/`kill` 被拒 |
+| 环境变量定位：纯用户偏好（PS1/EDITOR），**不承载安全策略**（用户架构决策） | ✅ |
+| 回归：classic 33/33 + P1 10/10 + P2 5/5 + P2V 4/4 + KBD 1/1 + P3 1/1 + P4 2/2 + P5 1/1 | ✅ 57/57 |
+| `make iso` | ✅ 0 警告 |

@@ -451,3 +451,21 @@ syscall 门控依赖 P0 的 cap 扩展。
 | 资源频率 | 无 | perm-engine 计数限制每小时次数 |
 | 决策位置 | 无（内核硬编码） | perm-engine（PDP）+ 内核能力缓存（PEP） |
 | 审计 | 弱（sudo logs） | 强制加密审计，主体不可抵赖 |
+
+### 9.5.4 命令策略三层架构（v0.5）
+
+**用户架构决策**：环境变量不承载安全策略（避免多用户覆盖/沙盒逃逸/远程会话
+混淆），只存进程本地用户偏好（PS1/EDITOR/LANG）。命令可用性由三层决定：
+
+1. **Capability（内核）**——能不能做。进程缺 `ATOM_*`/能力时执行直接
+   `ERR_NOCAP`/VFS `-105`（硬限制，不可伪造）。
+2. **Policy DB（policy 服务）**——用不用。`user/services/policy/` 维护
+   `角色 → {命令 → ALLOW/DENY/UNSET}` 表（GUEST/CHILD 禁 exec/kill/stop/
+   useradd 等）；IPC：QUERY（shell 拉取）/ SET / DUMP（仅 OWNER/ADMIN）。
+3. **Shell 覆盖（启动参数/登录态）**——这一次怎么用。shell 启动/登录/登出
+   时向 policy 服务拉取当前角色的 verdict 表（FNV-1a 哈希过滤表），执行时
+   拦截 DENY；policy 服务不可达时用硬编码**救急列表**（help/ls/cat/echo/
+   env/export/unset/login/whoami/exit/reboot）保证管理员可恢复。
+
+验证：guest 登录后 `exec`/`kill` 被 shell 拦截（Policy 层）；guest 的 VFS
+读被能力层拒绝（Capability 层）。环境变量仅影响 PS1 等偏好。

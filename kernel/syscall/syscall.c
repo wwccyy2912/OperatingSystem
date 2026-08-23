@@ -1291,6 +1291,40 @@ static i64 sys_reboot(void) {
 }
 
 /*
+ * Shutdown: power off the machine.  Same capability gate as reboot
+ * (ATOM_SYS_SHUTDOWN).  Strategy, in order:
+ *   1. ACPI PM1a sleep port 0x604 (QEMU/VirtualBox ACPI shutdown event).
+ *   2. Fall back to the 8042 reset line (reboot) if the guest still
+ *      runs — the machine restarts instead of powering off, which is
+ *      the best a BIOS-only kernel without full ACPI tables can do.
+ * Does not return on success.
+ */
+static i64 sys_shutdown(void) {
+    process_t *proc = process_current();
+    if (!proc || !proc->cap_table)
+        return (i64)ERR_FAULT;
+
+    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_SYS_SHUTDOWN, 0) == CAP_NULL)
+        return (i64)ERR_NOCAP;
+
+    serial_puts("OpSys: shutdown requested\n");
+
+    __asm__ volatile("cli");
+
+    /* ACPI PM1a_CNT sleep (S5): QEMU/VirtualBox respond to the ACPI
+     * shutdown event on port 0x604 with the SLP_TYP S5 value. */
+    io_outw(0x604, 0x2000);
+    io_delay();
+
+    /* Fallback: pulse the 8042 reset line (reboot). */
+    io_outb(0x64, 0xFE);
+
+    for (;;)
+        __asm__ volatile("hlt");
+    __builtin_unreachable();
+}
+
+/*
  * Panic hook (SYS_PANIC): panic the kernel on demand.
  * Lets the shell 'panic' command exercise the unified panic path
  * (kernel/panic.c) end-to-end.
@@ -1526,6 +1560,7 @@ SYSCALL1(sys_mutex_lock)
 SYSCALL1(sys_mutex_unlock)
 SYSCALL1(sys_mutex_destroy)
 SYSCALL0(sys_reboot)
+SYSCALL0(sys_shutdown)
 SYSCALL1(sys_set_time)
 SYSCALL1(sys_fb_get_info)
 SYSCALL2(sys_fb_map)
@@ -1569,6 +1604,7 @@ static const syscall_fn_t s_syscall_table[SYS_COUNT] = {
     [SYS_IO_READ8]             = sc_sys_io_read8,
     [SYS_IO_WRITE8]            = sc_sys_io_write8,
     [SYS_REBOOT]               = sc_sys_reboot,
+    [SYS_SHUTDOWN]             = sc_sys_shutdown,
     [SYS_SET_TIME]             = sc_sys_set_time,
     [SYS_PANIC]                = sc_sys_panic,
     [SYS_GET_FREE_PAGES]       = sc_sys_get_free_pages,

@@ -197,6 +197,10 @@ int sys_reboot(void) {
     return (int)sys_call(SYS_REBOOT, 0, 0, 0, 0, 0);
 }
 
+int sys_shutdown(void) {
+    return (int)sys_call(SYS_SHUTDOWN, 0, 0, 0, 0, 0);
+}
+
 /* TEMP test hook: triggers a kernel panic; never returns on success. */
 int sys_panic(void) {
     return (int)sys_call(SYS_PANIC, 0, 0, 0, 0, 0);

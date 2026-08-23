@@ -52,6 +52,11 @@ typedef int32_t  i32;
 #define MAX_ARGS      16
 #define SHELL_PROMPT  "opsys$ "
 
+/* Current working directory (v0.5): "/" = volume list view.  All VFS
+ * commands accept paths relative to this.  Kept as "/Volumes/X/..." so
+ * cd + relative paths compose naturally with the VFS URL grammar. */
+static char s_cwd[LINE_BUF_SIZE] = "/";
+
 /* Identity: the vfs and perm servers derive the caller's identity from
  * its kernel-issued subject (ipc_recv_from), so the shell no longer
  * supplies a self-reported app identity for the Powerbox permission
@@ -119,6 +124,14 @@ static int cmd_unset(int argc, char *argv[]);
 static int cmd_env(int argc, char *argv[]);
 static int cmd_policy_set(int argc, char *argv[]);
 static int cmd_policy_dump(int argc, char *argv[]);
+static int user_call(const void *req, int req_len, void *resp, int resp_len);
+static int cmd_cd(int argc, char *argv[]);
+static int cmd_pwd(int argc, char *argv[]);
+static int cmd_shutdown(int argc, char *argv[]);
+static int cmd_bm(int argc, char *argv[]);
+static int cmd_perm(int argc, char *argv[]);
+static int cmd_policy(int argc, char *argv[]);
+static int shell_resolve_path(const char *path, char *out, size_t outsz);
 
 /* ====================================================================
  * Runtime command registry
@@ -601,6 +614,38 @@ static int execute(char *line) {
         return -9; /* ERR_DENIED */
     }
 
+    /* v0.5: resolve relative paths for VFS commands against s_cwd.
+     * Commands whose FIRST argument is a path: ls/cat/tee/mkdir/rm/
+     * stat/fallocate/mv(src).  bm_create also takes a path.  "cd" and
+     * "pwd" handle their own resolution; everything else is untouched.
+     * The rewrite happens in place on the parsed argv[] strings. */
+    {
+        static char pbuf[2][LINE_BUF_SIZE];
+        int         n = 0;
+        int         is_path_cmd =
+            strcmp(argv[0], "ls") == 0 || strcmp(argv[0], "cat") == 0 ||
+            strcmp(argv[0], "tee") == 0 || strcmp(argv[0], "mkdir") == 0 ||
+            strcmp(argv[0], "rm") == 0 || strcmp(argv[0], "stat") == 0 ||
+            strcmp(argv[0], "fallocate") == 0 || strcmp(argv[0], "mv") == 0 ||
+            strcmp(argv[0], "bm_create") == 0;
+        if (is_path_cmd && argc >= 2) {
+            for (int i = 1; i < argc && n < 2; i++) {
+                /* Skip mv's optional 3rd arg (new name) — it is not a
+                 * path.  bm_create's 2nd arg is an access mode. */
+                if (strcmp(argv[0], "mv") == 0 && i >= 3)
+                    break;
+                if (strcmp(argv[0], "bm_create") == 0 && i >= 2)
+                    break;
+                if (argv[i][0] != '/' && argv[i][0] != '\0') {
+                    if (shell_resolve_path(argv[i], pbuf[n], sizeof(pbuf[n])) == 0) {
+                        argv[i] = pbuf[n];
+                        n++;
+                    }
+                }
+            }
+        }
+    }
+
     /* Look up command in the runtime-registered list */
     for (cmd_node_t *n = s_cmd_head; n != NULL; n = n->next) {
         if (strcmp(argv[0], n->name) == 0)
@@ -735,6 +780,139 @@ static int cmd_env(int argc, char *argv[]) {
         shell_write("\n");
     }
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  cd / pwd (v0.5)                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Resolve a user-supplied path against s_cwd into a canonical URL.
+ *   - "/" or empty  -> s_cwd itself (volume-list view)
+ *   - starting with "/" -> absolute, used as-is (normalize //)
+ *   - otherwise -> s_cwd + "/" + path (relative)
+ * Writes into out (LINE_BUF_SIZE).  Returns 0 on success. */
+static int shell_resolve_path(const char *path, char *out, size_t outsz) {
+    if (!path || path[0] == '\0') {
+        strncpy(out, s_cwd, outsz - 1);
+        out[outsz - 1] = '\0';
+        return 0;
+    }
+    if (path[0] == '/') {
+        strncpy(out, path, outsz - 1);
+        out[outsz - 1] = '\0';
+        return 0;
+    }
+    /* Relative: compose s_cwd + "/" + path.  s_cwd "/" -> "/" + path. */
+    int need = (int)strlen(s_cwd) + 1 + (int)strlen(path) + 1;
+    if ((size_t)need > outsz) {
+        shell_printf("path: too long\n");
+        return -1;
+    }
+    if (strcmp(s_cwd, "/") == 0) {
+        snprintf(out, outsz, "/%s", path);
+    } else {
+        snprintf(out, outsz, "%s/%s", s_cwd, path);
+    }
+    return 0;
+}
+
+/* cd [dir] — change the working directory.  No argument -> "/".  The
+ * target must exist and be a directory (fs_get_item + type check). */
+static int cmd_cd(int argc, char *argv[]) {
+    const char *arg = (argc >= 2) ? argv[1] : "/";
+
+    char url[LINE_BUF_SIZE];
+    if (shell_resolve_path(arg, url, sizeof(url)) < 0)
+        return -1;
+
+    /* Normalize trailing "/" (e.g. "cd /Volumes/" -> "/Volumes"). */
+    size_t ulen = strlen(url);
+    while (ulen > 1 && url[ulen - 1] == '/')
+        url[--ulen] = '\0';
+
+    /* "/" (volume view) is always valid. */
+    if (strcmp(url, "/") == 0 || strcmp(url, "") == 0) {
+        strncpy(s_cwd, "/", sizeof(s_cwd) - 1);
+        s_cwd[sizeof(s_cwd) - 1] = '\0';
+        return 0;
+    }
+
+    vfs_item_info_t info;
+    int             r = fs_get_item(url, &info);
+    if (r < 0) {
+        shell_printf("cd: %s FAILED (%d)\n", url, r);
+        return -1;
+    }
+    if (info.type != VFS_ITEM_DIR) {
+        shell_printf("cd: %s: not a directory\n", url);
+        return -1;
+    }
+    strncpy(s_cwd, url, sizeof(s_cwd) - 1);
+    s_cwd[sizeof(s_cwd) - 1] = '\0';
+    return 0;
+}
+
+/* pwd — print the working directory. */
+static int cmd_pwd(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    shell_write(s_cwd);
+    shell_write("\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  UNIX-style subcommand dispatchers (v0.5)                          */
+/*                                                                   */
+/*  The legacy underscore commands (bm_resolve, perm_revoke, ...) are
+ *  kept as aliases; the UNIX-style names are the primary interface:
+ *    bm     create|resolve|revoke
+ *    perm   answer|query|revoke
+ *    policy set|dump
+ *  userlock/userunlock are single-word UNIX-style names.            */
+/* ------------------------------------------------------------------ */
+
+static int cmd_bm(int argc, char *argv[]) {
+    if (argc < 2) {
+        shell_write("Usage: bm <create|resolve|revoke> ...\n");
+        return -1;
+    }
+    if (strcmp(argv[1], "create") == 0)
+        return cmd_bm_create(argc - 1, argv + 1);
+    if (strcmp(argv[1], "resolve") == 0)
+        return cmd_bm_resolve(argc - 1, argv + 1);
+    if (strcmp(argv[1], "revoke") == 0)
+        return cmd_bm_revoke(argc - 1, argv + 1);
+    shell_printf("bm: unknown subcommand '%s'\n", argv[1]);
+    return -1;
+}
+
+static int cmd_perm(int argc, char *argv[]) {
+    if (argc < 2) {
+        shell_write("Usage: perm <answer|query|revoke> ...\n");
+        return -1;
+    }
+    if (strcmp(argv[1], "answer") == 0)
+        return cmd_perm_answer(argc - 1, argv + 1);
+    if (strcmp(argv[1], "query") == 0)
+        return cmd_perm_query(argc - 1, argv + 1);
+    if (strcmp(argv[1], "revoke") == 0)
+        return cmd_perm_revoke(argc - 1, argv + 1);
+    shell_printf("perm: unknown subcommand '%s'\n", argv[1]);
+    return -1;
+}
+
+static int cmd_policy(int argc, char *argv[]) {
+    if (argc < 2) {
+        shell_write("Usage: policy <set|dump> ...\n");
+        return -1;
+    }
+    if (strcmp(argv[1], "set") == 0)
+        return cmd_policy_set(argc - 1, argv + 1);
+    if (strcmp(argv[1], "dump") == 0)
+        return cmd_policy_dump(argc - 1, argv + 1);
+    shell_printf("policy: unknown subcommand '%s'\n", argv[1]);
+    return -1;
 }
 
 /* policy_set <role> <cmd> <allow|deny|unset> — admin hot-updates one
@@ -1085,6 +1263,18 @@ static int cmd_reboot(int argc, char *argv[]) {
     return 0;
 }
 
+/* shutdown — power off the machine (ACPI S5 via the kernel; falls back
+ * to reboot if the platform has no ACPI power button). */
+static int cmd_shutdown(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    shell_write("Shutting down...\n");
+    (void)sys_shutdown();
+    /* Only reached if the shutdown syscall failed (e.g. ERR_NOCAP). */
+    shell_write("shutdown: syscall failed, system still running\n");
+    return 0;
+}
+
 
 /*
  * Column helpers for cmd_ps.  The file-local shell_printf() has no
@@ -1194,10 +1384,46 @@ static int cmd_kill(int argc, char *argv[]) {
             return -1;
         }
     }
+
+    /* v0.5: if the caller is logged in as OWNER/ADMIN, SIGKILL other
+     * processes via the user-service proxy (the shell lacks the
+     * kernel's ATOM_SERVICE_MANAGE, so direct cross-process SIGKILL
+     * returns ERR_NOCAP).  The proxy re-checks admin + protects
+     * system-critical services.  Non-admin callers keep the direct
+     * path (self-signal still works; foreign PIDs are rejected by the
+     * kernel gate with a clear message). */
+    if (signum == SIGKILL) {
+        user_req_login_t wq;
+        memset(&wq, 0, sizeof(wq));
+        wq.op = USER_OP_WHOAMI;
+        user_resp_login_t who;
+        memset(&who, 0, sizeof(who));
+        int r = user_call(&wq, (int)sizeof(wq), &who, (int)sizeof(who));
+        if (r == 0 && who.ret == 0 &&
+            (who.role == PERM_ROLE_OWNER || who.role == PERM_ROLE_ADMIN)) {
+            user_req_kill_t kq;
+            memset(&kq, 0, sizeof(kq));
+            kq.op  = USER_OP_KILL;
+            kq.pid = pid;
+            user_resp_kill_t kr;
+            memset(&kr, 0, sizeof(kr));
+            r = user_call(&kq, (int)sizeof(kq), &kr, (int)sizeof(kr));
+            if (r < 0 || kr.ret < 0) {
+                shell_printf("kill: PID %d SIG %d FAILED (%d)%s%s\n",
+                             pid, signum, r < 0 ? r : kr.ret,
+                             kr.detail[0] ? " - " : "", kr.detail);
+                return -1;
+            }
+            shell_printf("kill: %s\n", kr.detail);
+            return 0;
+        }
+    }
+
     int ret = kill(pid, signum);
-    printf("[shell] cmd_kill: pid=%d signum=%d ret=%d tick=%d\n", pid, signum, ret, get_time());
     if (ret < 0) {
-        shell_printf("kill: PID %d SIG %d FAILED (%d)\n", pid, signum, ret);
+        shell_printf("kill: PID %d SIG %d FAILED (%d) "
+                     "(foreign PIDs need OWNER/ADMIN login)\n",
+                     pid, signum, ret);
         return -1;
     }
     shell_printf("kill: sent SIG %d to PID %d\n", signum, pid);
@@ -1800,6 +2026,7 @@ static void shell_main(void *arg) {
     shell_register_command("uptime", "Show system tick count", cmd_uptime);
     shell_register_command("exit", "Exit the shell", cmd_exit);
     shell_register_command("reboot", "Halt the system", cmd_reboot);
+    shell_register_command("shutdown", "Power off the machine", cmd_shutdown);
     shell_register_command("kill", "Send a signal: kill <pid> [signum]", cmd_kill);
     shell_register_command("ps", "List running processes", cmd_ps);
     shell_register_command(
@@ -1819,6 +2046,9 @@ static void shell_main(void *arg) {
     shell_register_command(
         "perm_query", "Show pending Powerbox query: perm_query [id]", cmd_perm_query);
     shell_register_command("perm_revoke", "Drop grants: perm_revoke [subject_id]", cmd_perm_revoke);
+    /* UNIX-style aliases: bm <create|resolve|revoke>, perm <answer|query|revoke>. */
+    shell_register_command("bm", "Bookmarks: bm <create|resolve|revoke> ...", cmd_bm);
+    shell_register_command("perm", "Powerbox: perm <answer|query|revoke> ...", cmd_perm);
     shell_register_command("mv", "Move/rename: mv <src> <dst-dir> [new-name]", cmd_mv);
     shell_register_command("pkg", "pkg-manager: pkg <install|list|run|remove>", cmd_pkg);
 
@@ -1831,6 +2061,8 @@ static void shell_main(void *arg) {
     shell_register_command("userdel", "Delete account (admin): userdel <name>", cmd_userdel);
     shell_register_command("user_lock", "Disable account (admin): user_lock <name>", cmd_userlock);
     shell_register_command("user_unlock", "Enable account (admin): user_unlock <name>", cmd_userunlock);
+    shell_register_command("userlock", "Disable account (admin): userlock <name>", cmd_userlock);
+    shell_register_command("userunlock", "Enable account (admin): userunlock <name>", cmd_userunlock);
     shell_register_command("users", "List accounts (admin)", cmd_users);
     shell_register_command("stop", "Stop a system program (admin, confirmed): stop <svc>", cmd_stop);
     shell_register_command("export", "Set env var: export NAME=value (user prefs only)", cmd_export);
@@ -1838,6 +2070,9 @@ static void shell_main(void *arg) {
     shell_register_command("env", "Print the environment", cmd_env);
     shell_register_command("policy_set", "Hot-update cmd policy (admin): policy_set <role> <cmd> <allow|deny|unset>", cmd_policy_set);
     shell_register_command("policy_dump", "Show cmd policy table (admin)", cmd_policy_dump);
+    shell_register_command("policy", "Cmd policy: policy <set|dump> ...", cmd_policy);
+    shell_register_command("cd", "Change directory: cd [dir]", cmd_cd);
+    shell_register_command("pwd", "Print working directory", cmd_pwd);
 
     /* v0.5: load the command policy filter (rescue list on failure). */
     cmd_filter_load();
@@ -1972,8 +2207,9 @@ static int cmd_whoami(int argc, char *argv[]) {
         return -1;
     }
     if (resp.ret < 0) {
-        shell_printf("whoami: not logged in (%d)\n", resp.ret);
-        return -1;
+        /* UNIX-style: not logged in -> "nobody" (exit 0). */
+        shell_write("nobody\n");
+        return 0;
     }
     shell_printf("%s (%s)\n", resp.name, role_name(resp.role));
     return 0;
@@ -2141,7 +2377,10 @@ static int cmd_users(int argc, char *argv[]) {
     memset(&resp, 0, sizeof(resp));
     int r = user_call(&req, (int)sizeof(req), &resp, (int)sizeof(resp));
     if (r < 0 || resp.ret < 0) {
-        shell_printf("users: FAILED (%d)\n", r < 0 ? r : resp.ret);
+        if (resp.ret == -9) /* ERR_DENIED */
+            shell_write("users: permission denied - OWNER/ADMIN login required\n");
+        else
+            shell_printf("users: FAILED (%d) - run 'login' first\n", r < 0 ? r : resp.ret);
         return -1;
     }
     /* reason holds "name role;name role;..." lines. */

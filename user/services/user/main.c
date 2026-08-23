@@ -691,6 +691,84 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
+/*  Kill proxy (v0.5)                                                 */
+/*                                                                   */
+/*  USER_OP_KILL: admin SIGKILLs a process by PID.  The shell cannot
+ *  pass the kernel kill gate (no ATOM_SERVICE_MANAGE), so it asks the
+ *  user service, which holds the atom and re-checks the caller is
+ *  OWNER/ADMIN.  System-critical services are protected exactly like
+ *  STOP (a mis-typed PID cannot take down the system).              */
+/* ------------------------------------------------------------------ */
+
+/* Same critical list as do_stop. */
+static int svc_is_critical_name(const char *name) {
+    static const char *const crit[] = {
+        "serial", "term", "keyboard", "vfs", "fs_mem_driver",
+        "fs_virtio_blk_driver", "perm", "manager", "user", "policy"};
+    for (unsigned i = 0; i < sizeof(crit) / sizeof(crit[0]); i++)
+        if (strcmp(crit[i], name) == 0)
+            return 1;
+    return 0;
+}
+
+static void do_kill(int token, int msg_len, uint64_t caller) {
+    user_resp_kill_t *resp = (user_resp_kill_t *)s_resp;
+    memset(resp, 0, sizeof(*resp));
+    resp->ret = ERR_INVAL;
+    if (msg_len < (int)sizeof(user_req_kill_t))
+        goto out;
+    user_req_kill_t *req = (user_req_kill_t *)s_req;
+
+    user_acct_t *me = acct_of_subject(caller);
+    if (!acct_is_admin(me)) {
+        resp->ret = ERR_DENIED; /* OWNER/ADMIN only */
+        snprintf(resp->detail, sizeof(resp->detail), "requires OWNER/ADMIN");
+        goto out;
+    }
+    if (req->pid <= 0) {
+        resp->ret = ERR_INVAL;
+        goto out;
+    }
+
+    /* Resolve the process name for the criticality check. */
+    proc_info_t list[64];
+    int         n = process_list(list, 64);
+    if (n <= 0) {
+        resp->ret = ERR_NOENT;
+        goto out;
+    }
+    int found = 0;
+    for (int i = 0; i < n; i++) {
+        if (list[i].pid == req->pid) {
+            found = 1;
+            if (svc_is_critical_name(list[i].name)) {
+                resp->ret = ERR_DENIED;
+                snprintf(resp->detail, sizeof(resp->detail),
+                         "'%s' is system-critical", list[i].name);
+                goto out;
+            }
+            int r = kill(list[i].pid, SIGKILL);
+            if (r == 0) {
+                resp->ret = 0;
+                snprintf(resp->detail, sizeof(resp->detail), "'%s' (PID %d) killed",
+                         list[i].name, list[i].pid);
+                printf("user: kill '%s' (PID %d) by %llu\n",
+                       list[i].name, list[i].pid, (unsigned long long)caller);
+            } else {
+                resp->ret = r;
+            }
+            break;
+        }
+    }
+    if (!found) {
+        resp->ret = ERR_NOENT;
+        snprintf(resp->detail, sizeof(resp->detail), "PID %d not running", req->pid);
+    }
+out:
+    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+}
+
+/* ------------------------------------------------------------------ */
 /*  Dispatch                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -734,6 +812,9 @@ static void user_handle(int token, u32 op, int msg_len, uint64_t caller) {
         break;
     case USER_OP_POLICY_DUMP:
         do_policy_dump(token, msg_len, caller);
+        break;
+    case USER_OP_KILL:
+        do_kill(token, msg_len, caller);
         break;
     default: {
         i32 *resp = (i32 *)s_resp;

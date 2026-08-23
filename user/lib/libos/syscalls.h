@@ -159,6 +159,7 @@ int io_write8(unsigned short port, unsigned char val);
 
 /* --- System power --- */
 int sys_reboot(void);
+int sys_shutdown(void);
 int sys_panic(void); /* TEMP test hook: trigger a kernel panic */
 
 /* --- Init protocol --- */

@@ -229,3 +229,15 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | 架构：user 服务做管理代理（持 ATOM_SERVICE_MANAGE + 按调用者 subject 校验 OWNER/ADMIN）；policy 服务持管理原子可查他人能力 | ✅ |
 | 修复：cap_has_atom 查询他人需自身持原子 → policy 加入 s_svc_blobs 种子列表 | ✅ |
 | 回归 57/57 + P3 1/1 + P4 2/2 + P5 1/1；`make iso` 0 警告 | ✅ |
+
+### 第五轮补充 6（2026-08-23 晚）：问题修复 + cd/关机/UNIX 风格
+
+| 项 | 结果 |
+|---|---|
+| **kill -3 修复**：admin 登录后 SIGKILL 其他进程改走 user 服务代理（USER_OP_KILL，持 ATOM_SERVICE_MANAGE + OWNER/ADMIN 校验 + 保护关键服务）；非 admin 保持内核门控并给清晰提示 | ✅ admin `kill 1` → `'init' (PID 1) killed` |
+| **whoami -4 修复**：未登录输出 `nobody`（UNIX 风格，退出码 0） | ✅ |
+| **users -9 修复**：未登录/非 admin 输出友好提示 `permission denied - OWNER/ADMIN login required` | ✅ |
+| **cd/pwd 命令**：shell 维护 cwd，`cd [dir]` 校验目录存在 + 类型；VFS 命令（ls/cat/tee/mkdir/rm/stat/fallocate/mv/bm_create）支持**相对路径** | ✅ 相对 tee/cat 工作 |
+| **shutdown 命令**：新 syscall SYS_SHUTDOWN（39，门控 ATOM_SYS_SHUTDOWN）：ACPI PM1a 端口 0x604 S5 → 回退 8042 复位 | ✅ 编译通过 |
+| **UNIX 风格**：`bm <create\|resolve\|revoke>`、`perm <answer\|query\|revoke>`、`policy <set\|dump>`、`userlock`/`userunlock` 别名（下划线原名保留兼容） | ✅ policy dump 生效 |
+| 回归 57/57 + P3 1/1 + P4 2/2 + P5 1/1；`make iso` 0 警告 | ✅ |

@@ -45,6 +45,7 @@ enum {
     USER_OP_UNLOCK    = 11, /* re-enable an account (admin) */
     USER_OP_POLICY_SET = 12, /* admin proxy: hot-update command policy */
     USER_OP_POLICY_DUMP = 13, /* admin proxy: dump command policy table */
+    USER_OP_KILL      = 14, /* admin proxy: kill a process by PID */
 };
 
 /* Account lockout policy: failed logins before auto-lock. */
@@ -103,6 +104,19 @@ typedef struct {
     uint32_t count; /* DUMP: number of policy lines */
     char     lines[64][48]; /* DUMP: "ROLE cmd verdict" */
 } user_resp_policy_t;
+
+/* KILL: admin proxy to SIGKILL a process by PID.  The shell cannot
+ * pass the kernel's kill gate (no ATOM_SERVICE_MANAGE); the user
+ * service holds it and re-checks the caller is OWNER/ADMIN. */
+typedef struct {
+    uint32_t op;   /* USER_OP_KILL */
+    int32_t  pid;  /* target PID */
+} user_req_kill_t;
+
+typedef struct {
+    int32_t ret;
+    char    detail[64];
+} user_resp_kill_t;
 
 /* Compile-time guard: every message fits the 4096-byte IPC limit. */
 #define USER_IPC_MAX 4096

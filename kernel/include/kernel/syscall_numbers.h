@@ -61,6 +61,7 @@
 
 /* ---- System power ---- */
 #define SYS_REBOOT 37
+#define SYS_SHUTDOWN 39
 
 /* ---- Temporary test hook: user-triggered kernel panic (shell 'panic') ---- */
 #define SYS_PANIC 38

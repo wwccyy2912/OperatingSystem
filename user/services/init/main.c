@@ -2372,6 +2372,23 @@ static void run_zero_copy_tests(void) {
     printf("=== P5 Zero-Copy Read: %d/%d passed ===\n", p5_pass, p5_run);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Boot selftest fail-fast (v0.5: startup/self-check optimization)   */
+/* ------------------------------------------------------------------ */
+
+/* Called when any selftest suite has failures.  Prints a loud banner
+ * and halts the boot sequence (the kernel stays alive; services already
+ * spawned keep running, but init stops launching further phases).
+ * Previously a suite failure was counted and silently ignored — the
+ * system booted into an untested state.  Now a failing self-check is
+ * impossible to miss in the serial log. */
+static void boot_selftest_fail(const char *suite, int passed, int ran) {
+    printf("\n!!! SELFTEST FAILURE: %s %d/%d passed !!!\n", suite, passed, ran);
+    printf("init: boot aborted after failed self-check\n");
+    for (;;)
+        thread_yield();
+}
+
 /* ---- Entry point ---- */
 
 int main(void) {
@@ -2407,35 +2424,52 @@ int main(void) {
      * so there is no startup race.  These run in THIS thread (subject
      * 1, seeded OWNER) and exercise the live request path end to end. */
     run_p1_perm_tests();
+    if (p1_pass != p1_run)
+        boot_selftest_fail("P1 permission engine", p1_pass, p1_run);
 
     /* P2: sensitive syscall gate tests (docs/permission_model.md §四) —
      * pure kernel cap-table lookup, zero IPC. */
     run_p2_gate_tests();
+    if (p2_pass != p2_run)
+        boot_selftest_fail("P2 syscall gate", p2_pass, p2_run);
 
     /* P2 VFS: full-op authorization — P1 gated bookmark create/resolve;
      * P2 gates the five remaining ops (create_dir/delete/enum_begin/
      * enum_next/move) and proves 能力化抹位 on the live vfs+perm stack. */
     run_p2_vfs_tests();
+    if (p2v_pass != p2v_run)
+        boot_selftest_fail("P2 VFS authorization", p2v_pass, p2v_run);
 
     /* KBD focus ownership round-trip (R2.1) — live keyboard service. */
     run_kbd_focus_tests();
+    if (kbd_pass != kbd_run)
+        boot_selftest_fail("KBD focus", kbd_pass, kbd_run);
 
     /* P3 crash recovery: kill pkg → manager auto-restarts it. */
     run_crash_recovery_tests();
+    if (p3_pass != p3_run)
+        boot_selftest_fail("P3 crash recovery", p3_pass, p3_run);
 
     /* P4 resource exhaustion: fill kernel tables to the limit, assert
      * graceful ERR_NOMEM instead of a crash, drain, and prove the
      * system recovers.  Runs AFTER the services are up; every resource
      * it grabs is released before the test returns. */
     run_resource_exhaustion_tests();
+    if (p4_pass != p4_run)
+        boot_selftest_fail("P4 resource exhaustion", p4_pass, p4_run);
 
     /* P5 zero-copy read path (Phase 3): map a pool-backed file and
      * verify its content matches the chunked path. */
     run_zero_copy_tests();
+    if (p5_pass != p5_run)
+        boot_selftest_fail("P5 zero-copy read", p5_pass, p5_run);
 
-    /* Idle forever — this thread stays alive as the last scheduler
-     * participant while the manager and service processes run. */
-    printf("init: idle loop\n");
+    /* Classic syscall suite (ran before the manager spawn). */
+    if (tests_pass != tests_run)
+        boot_selftest_fail("classic syscall suite", tests_pass, tests_run);
+
+    printf("init: ALL SELFTESTS PASSED (%d/%d)\n", tests_pass, tests_run);
+    printf("init: entering idle loop\n");
     for (;;)
         thread_yield();
 

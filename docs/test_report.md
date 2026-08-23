@@ -202,3 +202,11 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | 自动锁定：连续 5 次错误密码 → 账户 disabled，正确密码也拒绝 | ✅ 串口 `auto-locked after 5 failed logins` |
 | 解锁重置 fail_count；`users` 列表标注锁定账户（`L` 后缀） | ✅ |
 | 回归 57/57 + P3 1/1 + P4 2/2 + P5 1/1；`make iso` 0 警告 | ✅ |
+
+### 第五轮补充 3（2026-08-23）：启动/自检流程优化
+
+| 项 | 结果 |
+|---|---|
+| 自检 fail-fast：每套件（classic/P1/P2/P2V/KBD/P3/P4/P5）失败即打印 `SELFTEST FAILURE` 并中止后续启动（此前失败只计数、静默继续） | ✅ |
+| 自检汇总：`init: ALL SELFTESTS PASSED (33/33)` + `entering idle loop` | ✅ 串口确认 |
+| 回归 57/57 + P3 1/1 + P4 2/2 + P5 1/1；`make iso` 0 警告 | ✅ |

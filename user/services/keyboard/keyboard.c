@@ -269,7 +269,36 @@ static void kbd_decode_byte(u8 sc) {
         return;
     }
     if (s_extended) {
-        s_extended = 0; /* skip the extended key body */
+        s_extended = 0;
+        /* Extended (0xE0-prefixed) keys: map navigation keys to single
+         * ASCII control codes so the shell/TUI can handle them like any
+         * other byte (no multi-byte escape sequences).  Set-1 extended
+         * make codes: Up=0x48 Down=0x50 Left=0x4B Right=0x4D,
+         * Home=0x47 End=0x4F PgUp=0x49 PgDn=0x51.  Break codes (|0x80)
+         * are ignored. */
+        if (sc & 0x80)
+            return;
+        char ch = 0;
+        switch (sc) {
+        case 0x48: ch = 0x0B; break; /* Up    -> VT   */
+        case 0x50: ch = 0x0C; break; /* Down  -> FF   */
+        case 0x4B: ch = 0x08; break; /* Left  -> BS   */
+        case 0x4D: ch = 0x14; break; /* Right -> DC4  */
+        case 0x47: ch = 0x01; break; /* Home  -> SOH  */
+        case 0x4F: ch = 0x05; break; /* End   -> ENQ  */
+        case 0x49: ch = 0x02; break; /* PgUp  -> STX  */
+        case 0x51: ch = 0x06; break; /* PgDn  -> ACK  */
+        default:   return;
+        }
+        if (ch == 0)
+            return;
+        kbd_park_t *p = kbd_park_target();
+        if (p && p->resp_len < p->max) {
+            ((kbd_resp_t *)p->buf)->data[p->resp_len] = (u8)ch;
+            p->resp_len++;
+        } else {
+            kbd_rx_push((u8)ch);
+        }
         return;
     }
 

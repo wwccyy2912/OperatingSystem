@@ -252,3 +252,15 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **kill 无参 → TUI 进程选择**（process_list + tui_menu） | ✅ 菜单出现、q 取消 |
 | **users → TUI 账户弹窗**（admin） | ✅ |
 | 回归 33/33 + P1 10/10（全量 57/57 待确认）；`make iso` 0 警告 | ✅ |
+
+### 第六轮（2026-08-24）：Shell 历史/补全 + TUI 剩余功能
+
+| 项 | 结果 |
+|---|---|
+| 键盘服务：0xE0 扩展键（方向键/Home/End/PgUp/PgDn）解码为单字节控制码（Up=0x0B Down=0x0C Left=0x08 Right=0x14 Home=0x01 End=0x05 PgUp=0x02 PgDn=0x06） | ✅ |
+| **Shell 命令历史**：Up/Down 翻历史（16 条环形缓冲，去重），PgUp/PgDn 首/末，Home/End 行首/尾 | ✅ QEMU：pid→up×3→echo one |
+| **Tab 补全**：首词补命令名，后续词补路径（cwd 相对/绝对），唯一匹配补全+空格，歧义列候选 | ✅ e+Tab→echo/exec/exit/export/env |
+| **fm 重命名/复制**：r=rename（TUI 输入新名）、c=copy（读+写 .copy 副本） | ✅ rename p2vfs.bin→renamed |
+| **mv 目标目录 TUI 选择**：`mv src ?` 列出 cwd 子目录菜单 | ✅ |
+| tui_menu 增强：方向键 + Home/End/PgUp/PgDn | ✅ |
+| `make iso` 0 警告 | ✅ |

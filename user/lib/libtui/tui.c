@@ -539,19 +539,28 @@ int tui_menu(int x, int y, int w, int h, const char *title,
             result = -1;
             break;
         }
-        if (key == 'j' || key == 's') {
-            /* down */
+        if (key == 'j' || key == 's' || key == 0x0C) {
+            /* down (j/s or Down arrow -> FF) */
             if (sel + 1 < count) {
                 sel++;
                 if (sel >= scroll + rows)
                     scroll = sel - rows + 1;
             }
-        } else if (key == 'k' || key == 'w') {
+        } else if (key == 'k' || key == 'w' || key == 0x0B) {
+            /* up (k/w or Up arrow -> VT) */
             if (sel > 0) {
                 sel--;
                 if (sel < scroll)
                     scroll = sel;
             }
+        } else if (key == 0x01 || key == 0x02) {
+            /* Home (SOH) / PgUp (STX) — first item */
+            sel    = 0;
+            scroll = 0;
+        } else if (key == 0x05 || key == 0x06) {
+            /* End (ENQ) / PgDn (ACK) — last item */
+            sel    = count - 1;
+            scroll = (sel - rows + 1 > 0) ? sel - rows + 1 : 0;
         } else if (key == 'q' || key == 'Q') {
             result = -1; /* cancel */
             break;

@@ -57,6 +57,16 @@ typedef int32_t  i32;
  * cd + relative paths compose naturally with the VFS URL grammar. */
 static char s_cwd[LINE_BUF_SIZE] = "/";
 
+/* Command history (v1.3): ring of the last N executed lines, navigated
+ * with Up/Down in read_line.  The most recent entry is written into
+ * the ring on every executed (non-empty) command. */
+#define HIST_MAX  16
+#define HIST_LEN  LINE_BUF_SIZE
+static char s_history[HIST_MAX][HIST_LEN];
+static int  s_hist_count; /* entries stored */
+static int  s_hist_next;  /* ring write index */
+static int  s_hist_view;  /* -1 = live editing; else index being viewed */
+
 /* Identity: the vfs and perm servers derive the caller's identity from
  * its kernel-issued subject (ipc_recv_from), so the shell no longer
  * supplies a self-reported app identity for the Powerbox permission
@@ -476,6 +486,196 @@ static void shell_printf(const char *fmt, ...) {
  * Line editor (keyboard service input)
  * ==================================================================== */
 
+/* Redraw the whole current line on screen (used after history recall /
+ * tab completion, which rewrite the buffer in place).  Uses the term's
+ * cursor API for reliable placement. */
+static void shell_redraw_line(const char *line, int pos) {
+    const char *prompt = getenv("PS1");
+    if (!prompt || prompt[0] == '\0')
+        prompt = SHELL_PROMPT;
+    int plen = (int)strlen(prompt);
+
+    /* Current row: query the term cursor, then set back to it after
+     * re-printing (the shell's output cursor is on the prompt row). */
+    u32 row = 0;
+    if (s_term_port >= 0) {
+        u32 req[2];
+        u8  resp[16];
+        req[0] = 7; /* TERM_OP_GET_CURSOR */
+        req[1] = 0;
+        int rlen = (int)sizeof(resp);
+        if (ipc_call(s_term_port, req, 8, resp, &rlen) == 0 && rlen >= 12)
+            row = ((u32 *)resp)[2];
+    }
+
+    /* Erase the current row and re-print prompt + line. */
+    shell_write("\r");
+    for (int i = 0; i < plen + (int)strlen(line) + 4; i++)
+        shell_write(" ");
+    shell_write("\r");
+    shell_write(prompt);
+    shell_write(line);
+
+    /* Place the cursor at (plen + pos, row). */
+    if (s_term_port >= 0) {
+        u32 req[4];
+        req[0] = 6; /* TERM_OP_SET_CURSOR */
+        req[1] = 8;
+        req[2] = (u32)(plen + pos);
+        req[3] = row;
+        int resp_len = 8;
+        u8  resp[8];
+        (void)ipc_call(s_term_port, req, 8 + 8, resp, &resp_len);
+    } else {
+        int llen = (int)strlen(line);
+        for (int i = llen; i > pos; i--)
+            shell_write("\b");
+    }
+}
+
+/* Tab completion: first token -> command names; otherwise a path
+ * fragment -> directory entries (absolute or cwd-relative).  Completes
+ * to the longest common prefix; when no unique prefix, lists matches.
+ * Returns 1 if the buffer changed. */
+static int shell_complete(char *buf, int *pos, int maxlen) {
+    int tok_start = *pos;
+    while (tok_start > 0 && buf[tok_start - 1] != ' ')
+        tok_start--;
+    int is_first = 1;
+    for (int i = 0; i < tok_start; i++) {
+        if (buf[i] != ' ')
+            is_first = 0;
+    }
+    const char *tok    = buf + tok_start;
+    int         toklen = *pos - tok_start;
+
+    if (is_first) {
+        /* Command completion. */
+        static const char *matches[64];
+        int                nm = 0, common = -1;
+        for (cmd_node_t *n = s_cmd_head; n; n = n->next) {
+            if (strncmp(n->name, tok, (size_t)toklen) == 0) {
+                if (nm < 64)
+                    matches[nm++] = n->name;
+                if (common < 0)
+                    common = (int)strlen(n->name);
+                else {
+                    int k = 0;
+                    while (k < common && matches[0][k] == n->name[k])
+                        k++;
+                    common = k;
+                }
+            }
+        }
+        if (nm == 1) {
+            int need = common + 1;
+            if (tok_start + need < maxlen) {
+                for (int i = 0; i < common; i++)
+                    buf[tok_start + i] = matches[0][i];
+                buf[tok_start + common] = ' ';
+                *pos = tok_start + common + 1;
+                buf[*pos] = '\0';
+                shell_redraw_line(buf, *pos);
+                return 1;
+            }
+        } else if (nm > 1 && common > toklen) {
+            for (int i = 0; i < common; i++)
+                buf[tok_start + i] = matches[0][i];
+            *pos = tok_start + common;
+            buf[*pos] = '\0';
+            shell_redraw_line(buf, *pos);
+            return 1;
+        } else if (nm > 1) {
+            shell_write("\n");
+            for (int i = 0; i < nm; i++) {
+                shell_write("  ");
+                shell_write(matches[i]);
+                shell_write("\n");
+            }
+            shell_redraw_line(buf, *pos);
+        }
+        return 0;
+    }
+
+    /* Path completion. */
+    char dir[LINE_BUF_SIZE];
+    char frag[LINE_BUF_SIZE];
+    const char *slash = NULL;
+    for (const char *p = tok; *p; p++)
+        if (*p == '/')
+            slash = p;
+    if (slash) {
+        int dlen = (int)(slash - tok);
+        if (dlen == 0) {
+            strncpy(dir, "/", sizeof(dir) - 1);
+            dir[sizeof(dir) - 1] = '\0';
+        } else {
+            char tmp[LINE_BUF_SIZE];
+            memcpy(tmp, tok, (size_t)dlen);
+            tmp[dlen] = '\0';
+            if (shell_resolve_path(tmp, dir, sizeof(dir)) < 0)
+                return 0;
+        }
+        strncpy(frag, slash + 1, sizeof(frag) - 1);
+        frag[sizeof(frag) - 1] = '\0';
+    } else {
+        if (shell_resolve_path("", dir, sizeof(dir)) < 0)
+            return 0;
+        strncpy(frag, tok, sizeof(frag) - 1);
+        frag[sizeof(frag) - 1] = '\0';
+    }
+
+    static vfs_enum_batch_t batch;
+    static char            matches[64][64];
+    int                    nm = 0, common = -1;
+    vfs_handle_t           e;
+    int                    r = fs_enum_begin(dir, &e);
+    if (r < 0)
+        return 0;
+    for (;;) {
+        r = fs_enum_next(e, &batch);
+        if (r < 0 || batch.batch_count == 0)
+            break;
+        for (u32 i = 0; i < batch.batch_count && nm < 64; i++) {
+            if (strncmp(batch.batch[i], frag, strlen(frag)) == 0) {
+                strncpy(matches[nm], batch.batch[i], 63);
+                matches[nm][63] = '\0';
+                if (common < 0)
+                    common = (int)strlen(matches[nm]);
+                else {
+                    int k = 0;
+                    while (k < common && matches[0][k] == matches[nm][k])
+                        k++;
+                    common = k;
+                }
+                nm++;
+            }
+        }
+    }
+    fs_enum_end(e);
+
+    if (nm == 1 || (nm > 1 && common > (int)strlen(frag))) {
+        if (tok_start + common < maxlen) {
+            for (int i = 0; i < common; i++)
+                buf[tok_start + i] = matches[0][i];
+            *pos = tok_start + common;
+            buf[*pos] = '\0';
+            shell_redraw_line(buf, *pos);
+        }
+        return 1;
+    }
+    if (nm > 1) {
+        shell_write("\n");
+        for (int i = 0; i < nm; i++) {
+            shell_write("  ");
+            shell_write(matches[i]);
+            shell_write("\n");
+        }
+        shell_redraw_line(buf, *pos);
+    }
+    return 0;
+}
+
 /*
  * Read one line from keyboard input.
  * Uses a blocking READ_BLOCK: the calling thread parks inside ipc_call
@@ -529,6 +729,7 @@ static int read_line(char *buf, int maxlen) {
                     break;
                 }
                 shell_write("\r\n");
+                s_hist_view = -1; /* back to live editing */
                 buf[pos] = '\0';
                 return pos;
 
@@ -541,7 +742,101 @@ static int read_line(char *buf, int maxlen) {
                 break;
 
             case '\t':
-                /* Tab — ignore for now */
+                /* Tab — command / path completion (v1.3). */
+                (void)shell_complete(buf, &pos, maxlen);
+                break;
+
+            case 0x0B: /* Up arrow — history back */
+                if (s_hist_count > 0) {
+                    if (s_hist_view < 0)
+                        s_hist_view = (s_hist_next + HIST_MAX - 1) % HIST_MAX;
+                    else
+                        s_hist_view = (s_hist_view + HIST_MAX - 1) % HIST_MAX;
+                    /* Stop at the oldest entry. */
+                    int oldest = (s_hist_next + HIST_MAX - s_hist_count) % HIST_MAX;
+                    if (s_hist_view == (s_hist_next + HIST_MAX - 1) % HIST_MAX &&
+                        s_hist_count == 1) {
+                        /* single entry: stay */
+                    }
+                    /* Clamp: if we wrapped past the oldest, go back down. */
+                    int wrapped = 0;
+                    if (oldest < (s_hist_next + HIST_MAX - 1) % HIST_MAX) {
+                        if (s_hist_view < oldest || s_hist_view > (s_hist_next + HIST_MAX - 1) % HIST_MAX)
+                            wrapped = 1;
+                    } else {
+                        if (s_hist_view < oldest && s_hist_view >= (s_hist_next + HIST_MAX - 1) % HIST_MAX)
+                            wrapped = 1;
+                    }
+                    if (wrapped)
+                        s_hist_view = oldest;
+                    strncpy(buf, s_history[s_hist_view], (size_t)maxlen - 1);
+                    buf[maxlen - 1] = '\0';
+                    pos = (int)strlen(buf);
+                    shell_redraw_line(buf, pos);
+                }
+                break;
+
+            case 0x0C: /* Down arrow — history forward / live edit */
+                if (s_hist_view >= 0) {
+                    s_hist_view = (s_hist_view + 1) % HIST_MAX;
+                    /* Wrapped past newest -> back to live editing. */
+                    if (s_hist_view == s_hist_next) {
+                        s_hist_view = -1;
+                        buf[0] = '\0';
+                        pos    = 0;
+                    } else {
+                        /* Skip gaps beyond count. */
+                        int oldest = (s_hist_next + HIST_MAX - s_hist_count) % HIST_MAX;
+                        if (s_hist_view == (oldest + HIST_MAX - 1) % HIST_MAX && s_hist_count == 1) {
+                            /* only one entry: back to live */
+                            s_hist_view = -1;
+                            buf[0] = '\0';
+                            pos    = 0;
+                        } else {
+                            strncpy(buf, s_history[s_hist_view], (size_t)maxlen - 1);
+                            buf[maxlen - 1] = '\0';
+                            pos = (int)strlen(buf);
+                        }
+                    }
+                    shell_redraw_line(buf, pos);
+                }
+                break;
+
+            case 0x01: /* Home */
+                pos = 0;
+                shell_redraw_line(buf, pos);
+                break;
+
+            case 0x05: /* End */
+                pos = (int)strlen(buf);
+                shell_redraw_line(buf, pos);
+                break;
+
+            case 0x02: /* PgUp — first history entry */
+                if (s_hist_count > 0) {
+                    s_hist_view = (s_hist_next + HIST_MAX - s_hist_count) % HIST_MAX;
+                    strncpy(buf, s_history[s_hist_view], (size_t)maxlen - 1);
+                    buf[maxlen - 1] = '\0';
+                    pos = (int)strlen(buf);
+                    shell_redraw_line(buf, pos);
+                }
+                break;
+
+            case 0x06: /* PgDn — newest history entry */
+                if (s_hist_count > 0) {
+                    s_hist_view = (s_hist_next + HIST_MAX - 1) % HIST_MAX;
+                    strncpy(buf, s_history[s_hist_view], (size_t)maxlen - 1);
+                    buf[maxlen - 1] = '\0';
+                    pos = (int)strlen(buf);
+                    shell_redraw_line(buf, pos);
+                }
+                break;
+
+            case 0x14: /* Right arrow (DC4) — move cursor right */
+                if (pos < (int)strlen(buf)) {
+                    pos++;
+                    shell_redraw_line(buf, pos);
+                }
                 break;
 
             default:
@@ -685,6 +980,16 @@ static void shell_loop(void) {
             continue;
         }
         if (len > 0) {
+            /* Record in the history ring (skip duplicate of the last). */
+            int dup = (s_hist_count > 0 &&
+                       strcmp(s_history[(s_hist_next + HIST_MAX - 1) % HIST_MAX], line) == 0);
+            if (!dup) {
+                strncpy(s_history[s_hist_next], line, HIST_LEN - 1);
+                s_history[s_hist_next][HIST_LEN - 1] = '\0';
+                s_hist_next = (s_hist_next + 1) % HIST_MAX;
+                if (s_hist_count < HIST_MAX)
+                    s_hist_count++;
+            }
             execute(line);
         }
     }
@@ -1035,7 +1340,7 @@ static int cmd_fm(int argc, char *argv[]) {
         }
 
         /* File: wait for an action key after Enter. */
-        shell_printf("fm: %s (%d bytes) - v=view d=delete q=back\n",
+        shell_printf("fm: %s (%d bytes) - v=view d=delete r=rename c=copy q=back\n",
                      items[sel], (int)info.size);
         /* Read one key directly (READ_BLOCK on the keyboard port). */
         u32 req[2];
@@ -1058,6 +1363,49 @@ static int cmd_fm(int argc, char *argv[]) {
             if (yes > 0) {
                 int dr = fs_delete_item(full, 0);
                 shell_printf("fm: delete %s (%d)\n", items[sel], dr);
+            }
+        } else if (key == 'r' || key == 'R') {
+            /* Rename in place: TUI input line for the new name. */
+            char newname[64];
+            if (tui_input_line(5, 30, "New name: ", newname, sizeof(newname), 0) >= 0 &&
+                newname[0] != '\0') {
+                vfs_item_info_t ri;
+                int mr = fs_move_item(full, dir, newname, &ri);
+                shell_printf("fm: rename %s -> %s (%d)\n", items[sel], newname, mr);
+            }
+        } else if (key == 'c' || key == 'C') {
+            /* Copy: read the file and write a "copy" sibling. */
+            vfs_handle_t h;
+            int          or = fs_open_item(full, VFS_OPEN_READONLY, VFS_ACCESS_READ, &h);
+            if (or < 0) {
+                shell_printf("fm: copy open FAILED (%d)\n", or);
+            } else {
+                char dst[LINE_BUF_SIZE];
+                char copy_name[96];
+                snprintf(copy_name, sizeof(copy_name), "%s.copy", items[sel]);
+                fm_join(dir, copy_name, dst, sizeof(dst));
+                vfs_handle_t dh;
+                int          wr = fs_open_item(dst, VFS_OPEN_CREATE | VFS_OPEN_TRUNCATE,
+                                               VFS_ACCESS_WRITE, &dh);
+                if (wr < 0) {
+                    shell_printf("fm: copy create FAILED (%d)\n", wr);
+                } else {
+                    static u8 cbuf[1024];
+                    u64       off = 0;
+                    int       cr  = 0;
+                    for (;;) {
+                        u32 got = 0;
+                        cr = fs_read(h, off, cbuf, sizeof(cbuf), &got);
+                        if (cr < 0 || got == 0)
+                            break;
+                        if (fs_write(dh, off, cbuf, got) < 0)
+                            break;
+                        off += (u64)got;
+                    }
+                    fs_close(dh);
+                    fs_close(h);
+                    shell_printf("fm: copied to %s (%d)\n", copy_name, cr < 0 ? cr : (int)off);
+                }
             }
         }
     }
@@ -2087,12 +2435,46 @@ static int cmd_perm_revoke(int argc, char *argv[]) {
  * fs_mem_driver keeps itemID stable, so cached bookmarks survive. */
 static int cmd_mv(int argc, char *argv[]) {
     if (argc < 3) {
-        shell_write("Usage: mv <src-url> <dst-dir-url> [new-name]\n");
+        shell_write("Usage: mv <src-url> <dst-dir-url|?> [new-name]\n");
         return -1;
+    }
+    char dst[LINE_BUF_SIZE];
+    if (strcmp(argv[2], "?") == 0) {
+        /* v1.3: TUI directory picker for the destination. */
+        static char items[64][64];
+        static const char *ptrs[64];
+        int n = fm_enum(s_cwd, items, 64);
+        if (n <= 0) {
+            shell_printf("mv: no directories in %s\n", s_cwd);
+            return -1;
+        }
+        int shown = 0;
+        for (int i = 0; i < n && shown < 64; i++) {
+            /* Only directories are valid move targets. */
+            char full[LINE_BUF_SIZE];
+            fm_join(s_cwd, items[i], full, sizeof(full));
+            vfs_item_info_t it;
+            if (fs_get_item(full, &it) == 0 && it.type == VFS_ITEM_DIR) {
+                ptrs[shown] = items[i];
+                shown++;
+            }
+        }
+        if (shown == 0) {
+            shell_printf("mv: no directories in %s\n", s_cwd);
+            return -1;
+        }
+        int sel = tui_menu(30, 8, 50, (shown + 2 < 16) ? shown + 2 : 16,
+                           "Move to dir (j/k Enter q)", ptrs, shown, NULL);
+        if (sel < 0)
+            return 0; /* cancelled */
+        fm_join(s_cwd, ptrs[sel], dst, sizeof(dst));
+    } else {
+        strncpy(dst, argv[2], sizeof(dst) - 1);
+        dst[sizeof(dst) - 1] = '\0';
     }
     /* v1.3: mutating command -> TUI confirm dialog. */
     char msg[200];
-    snprintf(msg, sizeof(msg), "Move '%s' to '%s'?", argv[1], argv[2]);
+    snprintf(msg, sizeof(msg), "Move '%s' to '%s'?", argv[1], dst);
     int yes = tui_confirm(20, 14, 60, "Confirm Move", msg,
                           "Type y to confirm, n to cancel");
     if (yes < 0)
@@ -2102,7 +2484,7 @@ static int cmd_mv(int argc, char *argv[]) {
         return 0;
     }
     vfs_item_info_t item;
-    int             r = fs_move_item(argv[1], argv[2], (argc >= 4) ? argv[3] : "", &item);
+    int             r = fs_move_item(argv[1], dst, (argc >= 4) ? argv[3] : "", &item);
     if (r < 0) {
         shell_printf("mv: FAILED (%d)\n", r);
         return -1;

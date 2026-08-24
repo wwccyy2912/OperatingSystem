@@ -241,3 +241,14 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **shutdown 命令**：新 syscall SYS_SHUTDOWN（39，门控 ATOM_SYS_SHUTDOWN）：ACPI PM1a 端口 0x604 S5 → 回退 8042 复位 | ✅ 编译通过 |
 | **UNIX 风格**：`bm <create\|resolve\|revoke>`、`perm <answer\|query\|revoke>`、`policy <set\|dump>`、`userlock`/`userunlock` 别名（下划线原名保留兼容） | ✅ policy dump 生效 |
 | 回归 57/57 + P3 1/1 + P4 2/2 + P5 1/1；`make iso` 0 警告 | ✅ |
+
+### 第五轮补充 7（2026-08-23 深夜）：TUI 组件库 + 文件管理器 + 命令交互 TUI 化
+
+| 项 | 结果 |
+|---|---|
+| libtui 新增 `tui_menu`（v1.3）：标题+盒子+滚动列表，j/k/s/w 移动、Enter 选择、q 取消，非破坏性覆盖（快照/恢复同 tui_confirm） | ✅ |
+| **`fm` TUI 文件管理器**：浏览目录/卷，Enter 进目录，文件 v=查看/d=删除（确认框），q 退出；相对/绝对路径 | ✅ QEMU 验证 |
+| **rm/mv TUI 确认对话框**（破坏性/变更操作） | ✅ `rm` 弹 Confirm Delete，n 取消 |
+| **kill 无参 → TUI 进程选择**（process_list + tui_menu） | ✅ 菜单出现、q 取消 |
+| **users → TUI 账户弹窗**（admin） | ✅ |
+| 回归 33/33 + P1 10/10（全量 57/57 待确认）；`make iso` 0 警告 | ✅ |

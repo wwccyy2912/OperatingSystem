@@ -131,6 +131,7 @@ static int cmd_shutdown(int argc, char *argv[]);
 static int cmd_bm(int argc, char *argv[]);
 static int cmd_perm(int argc, char *argv[]);
 static int cmd_policy(int argc, char *argv[]);
+static int cmd_fm(int argc, char *argv[]);
 static int shell_resolve_path(const char *path, char *out, size_t outsz);
 
 /* ====================================================================
@@ -915,6 +916,154 @@ static int cmd_policy(int argc, char *argv[]) {
     return -1;
 }
 
+/* ------------------------------------------------------------------ */
+/*  fm — TUI file manager (v1.3)                                      */
+/*                                                                   */
+/*  Browses the current directory (or an absolute/relative path) with
+ *  a tui_menu.  Keys: j/k move, Enter enter a directory / select a
+ *  file, 'v' view a file (cat), 'd' delete (confirm), q quit.  The
+ *  menu is a non-destructive overlay, so the shell prompt stays put
+ *  underneath.                                                        */
+/* ------------------------------------------------------------------ */
+
+/* Enumerate `dir` (an absolute URL) into items[]; returns count. */
+static int fm_enum(const char *dir, char items[][64], int cap) {
+    static vfs_enum_batch_t batch; /* ~16.5 KB — keep off the stack */
+    vfs_handle_t            e;
+    int                     r = fs_enum_begin(dir, &e);
+    if (r < 0)
+        return r;
+    int total = 0;
+    for (;;) {
+        r = fs_enum_next(e, &batch);
+        if (r < 0) {
+            fs_enum_end(e);
+            return r;
+        }
+        if (batch.batch_count == 0)
+            break;
+        for (u32 i = 0; i < batch.batch_count && total < cap; i++) {
+            strncpy(items[total], batch.batch[i], 63);
+            items[total][63] = '\0';
+            total++;
+        }
+    }
+    fs_enum_end(e);
+    return total;
+}
+
+/* Compose dir + "/" + name into out. */
+static void fm_join(const char *dir, const char *name, char *out, size_t outsz) {
+    if (strcmp(dir, "/") == 0)
+        snprintf(out, outsz, "/%s", name);
+    else
+        snprintf(out, outsz, "%s/%s", dir, name);
+}
+
+static int cmd_fm(int argc, char *argv[]) {
+    char dir[LINE_BUF_SIZE];
+    if (argc >= 2) {
+        if (shell_resolve_path(argv[1], dir, sizeof(dir)) < 0)
+            return -1;
+    } else {
+        strncpy(dir, s_cwd, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = '\0';
+    }
+    /* "/" shows the volume list — enumerate the root view. */
+    if (strcmp(dir, "/") == 0) {
+        static vfs_vol_info_t vols[VFS_MAX_VOLS];
+        u32                   vcount = 0;
+        int                   r      = fs_list_volumes(vols, &vcount);
+        if (r < 0) {
+            shell_printf("fm: volume list FAILED (%d)\n", r);
+            return -1;
+        }
+        /* tui_menu needs a stable items array; reuse a static one. */
+        static char items[64][64];
+        for (u32 i = 0; i < vcount && i < 64; i++) {
+            snprintf(items[i], 64, "%s%s", vols[i].mount_name,
+                     vols[i].read_only ? " (ro)" : "");
+        }
+        const char *ptrs[64];
+        for (u32 i = 0; i < vcount && i < 64; i++)
+            ptrs[i] = items[i];
+        int sel = tui_menu(30, 8, 50, (int)vcount + 2, "Volumes (j/k, Enter, q)",
+                           ptrs, (int)vcount, NULL);
+        if (sel < 0)
+            return 0; /* cancelled */
+        /* Enter a volume: cd to /Volumes/<name> (strip (ro) suffix). */
+        char *space = strchr(items[sel], ' ');
+        if (space)
+            *space = '\0';
+        snprintf(dir, sizeof(dir), "/Volumes/%s", items[sel]);
+    }
+
+    for (;;) {
+        static char items[64][64];
+        static const char *ptrs[64];
+        int n = fm_enum(dir, items, 64);
+        if (n < 0) {
+            shell_printf("fm: %s FAILED (%d)\n", dir, n);
+            return -1;
+        }
+        for (int i = 0; i < n; i++)
+            ptrs[i] = items[i];
+
+        char title[128];
+        snprintf(title, sizeof(title), "fm: %s (j/k Enter v d q)", dir);
+        int rows = (n + 2 < 20) ? n + 2 : 20;
+        int sel  = tui_menu(4, 4, 80, rows, title, ptrs, n, NULL);
+        if (sel < 0)
+            break; /* q = quit */
+
+        char full[LINE_BUF_SIZE];
+        fm_join(dir, items[sel], full, sizeof(full));
+
+        vfs_item_info_t info;
+        int             r = fs_get_item(full, &info);
+        if (r < 0) {
+            shell_printf("fm: %s FAILED (%d)\n", full, r);
+            continue;
+        }
+        if (info.type == VFS_ITEM_DIR) {
+            /* Enter directory. */
+            strncpy(dir, full, sizeof(dir) - 1);
+            dir[sizeof(dir) - 1] = '\0';
+            strncpy(s_cwd, dir, sizeof(s_cwd) - 1);
+            s_cwd[sizeof(s_cwd) - 1] = '\0';
+            continue;
+        }
+
+        /* File: wait for an action key after Enter. */
+        shell_printf("fm: %s (%d bytes) - v=view d=delete q=back\n",
+                     items[sel], (int)info.size);
+        /* Read one key directly (READ_BLOCK on the keyboard port). */
+        u32 req[2];
+        u8  resp[8];
+        req[0]       = KBD_OP_READ_BLOCK;
+        req[1]       = 1;
+        int resp_len = (int)sizeof(resp);
+        u8  key      = 0;
+        if (ipc_call(s_kbd_port, req, 8, resp, &resp_len) == 0 && resp_len >= 4)
+            key = resp[4];
+
+        if (key == 'v' || key == 'V') {
+            /* View: reuse cmd_cat logic via a fresh argv. */
+            char *vargv[2] = {(char *)"cat", full};
+            (void)cmd_cat(2, vargv);
+        } else if (key == 'd' || key == 'D') {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Delete '%s'?", items[sel]);
+            int yes = tui_confirm(20, 14, 60, "Delete", msg, "y = delete, n = cancel");
+            if (yes > 0) {
+                int dr = fs_delete_item(full, 0);
+                shell_printf("fm: delete %s (%d)\n", items[sel], dr);
+            }
+        }
+    }
+    return 0;
+}
+
 /* policy_set <role> <cmd> <allow|deny|unset> — admin hot-updates one
  * command's verdict for a role.  The mutation goes through the USER
  * service (the trusted management proxy: it holds ATOM_SERVICE_MANAGE
@@ -1367,14 +1516,34 @@ static int cmd_ps(int argc, char *argv[]) {
  * registered handler / default action.
  */
 static int cmd_kill(int argc, char *argv[]) {
+    int pid = 0;
     if (argc < 2) {
-        shell_write("Usage: kill <pid> [signum]\n");
-        return -1;
-    }
-    int pid = atoi(argv[1]);
-    if (pid <= 0) {
-        shell_printf("kill: invalid pid '%s'\n", argv[1]);
-        return -1;
+        /* v1.3: no PID -> TUI process picker. */
+        static proc_info_t plist[64];
+        static char        lines[64][32];
+        static const char *ptrs[64];
+        int                n = process_list(plist, 64);
+        if (n <= 0) {
+            shell_write("kill: no processes\n");
+            return -1;
+        }
+        int shown = 0;
+        for (int i = 0; i < n && shown < 64; i++) {
+            snprintf(lines[shown], 32, "%d  %s", (int)plist[i].pid, plist[i].name);
+            ptrs[shown] = lines[shown];
+            shown++;
+        }
+        int sel = tui_menu(30, 6, 44, (shown + 2 < 20) ? shown + 2 : 20,
+                           "Processes (j/k Enter q)", ptrs, shown, NULL);
+        if (sel < 0)
+            return 0; /* cancelled */
+        pid = (int)plist[sel].pid;
+    } else {
+        pid = atoi(argv[1]);
+        if (pid <= 0) {
+            shell_printf("kill: invalid pid '%s'\n", argv[1]);
+            return -1;
+        }
     }
     int signum = SIGKILL;
     if (argc >= 3) {
@@ -1664,6 +1833,17 @@ static int cmd_rm(int argc, char *argv[]) {
         shell_write("Usage: rm <url>\n");
         return -1;
     }
+    /* v1.3: destructive command -> TUI confirm dialog. */
+    char msg[160];
+    snprintf(msg, sizeof(msg), "Delete '%s'?", argv[1]);
+    int yes = tui_confirm(20, 14, 60, "Confirm Delete", msg,
+                          "Type y to confirm, n to cancel");
+    if (yes < 0)
+        return -1;
+    if (!yes) {
+        shell_write("rm: cancelled\n");
+        return 0;
+    }
     int r = fs_delete_item(argv[1], 0);
     if (r < 0) {
         shell_printf("rm: %s FAILED (%d)\n", argv[1], r);
@@ -1910,6 +2090,17 @@ static int cmd_mv(int argc, char *argv[]) {
         shell_write("Usage: mv <src-url> <dst-dir-url> [new-name]\n");
         return -1;
     }
+    /* v1.3: mutating command -> TUI confirm dialog. */
+    char msg[200];
+    snprintf(msg, sizeof(msg), "Move '%s' to '%s'?", argv[1], argv[2]);
+    int yes = tui_confirm(20, 14, 60, "Confirm Move", msg,
+                          "Type y to confirm, n to cancel");
+    if (yes < 0)
+        return -1;
+    if (!yes) {
+        shell_write("mv: cancelled\n");
+        return 0;
+    }
     vfs_item_info_t item;
     int             r = fs_move_item(argv[1], argv[2], (argc >= 4) ? argv[3] : "", &item);
     if (r < 0) {
@@ -2073,6 +2264,7 @@ static void shell_main(void *arg) {
     shell_register_command("policy", "Cmd policy: policy <set|dump> ...", cmd_policy);
     shell_register_command("cd", "Change directory: cd [dir]", cmd_cd);
     shell_register_command("pwd", "Print working directory", cmd_pwd);
+    shell_register_command("fm", "TUI file manager (j/k Enter v d q)", cmd_fm);
 
     /* v0.5: load the command policy filter (rescue list on failure). */
     cmd_filter_load();
@@ -2385,15 +2577,26 @@ static int cmd_users(int argc, char *argv[]) {
     }
     /* reason holds "name role;name role;..." lines. */
     char *p = resp.reason;
-    shell_printf("Accounts (%d):\n", (int)resp.count);
-    while (*p) {
+    if (resp.count == 0) {
+        shell_write("Accounts: (none)\n");
+        return 0;
+    }
+    /* v1.3: TUI popup listing the accounts (Enter/q to dismiss). */
+    static char lines[USER_MAX_ACCOUNTS][40];
+    static const char *ptrs[USER_MAX_ACCOUNTS];
+    int shown = 0;
+    while (*p && shown < USER_MAX_ACCOUNTS) {
         char *semi = strchr(p, ';');
         if (!semi)
             break;
         *semi = '\0';
-        shell_printf("  %s\n", p);
+        strncpy(lines[shown], p, sizeof(lines[shown]) - 1);
+        lines[shown][sizeof(lines[shown]) - 1] = '\0';
+        ptrs[shown] = lines[shown];
+        shown++;
         p = semi + 1;
     }
+    (void)tui_menu(40, 8, 36, shown + 2, "Accounts (Enter/q)", ptrs, shown, NULL);
     return 0;
 }
 

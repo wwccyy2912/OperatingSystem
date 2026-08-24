@@ -474,3 +474,100 @@ int tui_confirm(int x, int y, int w, const char *title, const char *msg, const c
     }
     return result;
 }
+
+/* ====================================================================
+ * Menu component (v1.3)
+ *
+ * tui_menu: a titled, boxed, scrollable item list with keyboard
+ * selection.  Keys: j/k or up/down-style (we map j/k and w/s), Enter
+ * selects, q/Esc cancels.  Non-destructive: the covered region and
+ * cursor are saved and restored, exactly like tui_confirm.
+ *
+ * Returns the selected index (0-based) on Enter, -1 on cancel/error.
+ * ==================================================================== */
+
+int tui_menu(int x, int y, int w, int h, const char *title,
+             const char *const *items, int count, int *scroll_out) {
+    if (!items || count <= 0 || h < 3)
+        return -1;
+    if (w < 16)
+        w = 16;
+    if (w > 100)
+        w = 100;
+
+    /* Save the covered region + cursor (non-destructive overlay). */
+    u8  saved[TUI_MAX_REGION_CELLS];
+    int has_saved = 0;
+    u32 cx = 0, cy = 0;
+    int have_cursor = 0;
+    if ((uint64_t)w * h <= TUI_MAX_REGION_CELLS &&
+        tui_region_save((u32)x, (u32)y, (u32)w, (u32)h, saved) == 0) {
+        has_saved = 1;
+        if (tui_get_cursor(&cx, &cy) == 0)
+            have_cursor = 1;
+    }
+
+    int sel    = 0;   /* selected item index */
+    int scroll = 0;   /* first visible row */
+    int rows   = h - 2; /* box interior rows (title + 2 borders) */
+
+    int result = -1;
+    for (;;) {
+        /* Redraw the menu each key. */
+        tui_render_box(x, y, (u32)w, (u32)h, title);
+        int visible = (count - scroll < rows) ? count - scroll : rows;
+        for (int r = 0; r < visible; r++) {
+            int idx = scroll + r;
+            char line[TUI_MAX_TEXT];
+            int  ln = 0;
+            if (idx == sel) {
+                line[ln++] = '>';
+                line[ln++] = ' ';
+            } else {
+                line[ln++] = ' ';
+                line[ln++] = ' ';
+            }
+            const char *it = items[idx];
+            while (*it && ln < w - 2 && ln < (int)sizeof(line) - 1)
+                line[ln++] = *it++;
+            line[ln] = '\0';
+            tui_render_line_at((u32)(x + 1), (u32)(y + 1 + r), line, (u32)ln);
+        }
+
+        u8 key = 0;
+        if (tui_kbd_read_key(&key) < 0) {
+            result = -1;
+            break;
+        }
+        if (key == 'j' || key == 's') {
+            /* down */
+            if (sel + 1 < count) {
+                sel++;
+                if (sel >= scroll + rows)
+                    scroll = sel - rows + 1;
+            }
+        } else if (key == 'k' || key == 'w') {
+            if (sel > 0) {
+                sel--;
+                if (sel < scroll)
+                    scroll = sel;
+            }
+        } else if (key == 'q' || key == 'Q') {
+            result = -1; /* cancel */
+            break;
+        } else if (key == '\r' || key == '\n') {
+            result = sel; /* select */
+            break;
+        }
+    }
+
+    /* Restore the covered region and the previous cursor position. */
+    if (has_saved) {
+        (void)tui_region_restore((u32)x, (u32)y, (u32)w, (u32)h, saved);
+        if (have_cursor)
+            (void)tui_set_cursor(cx, cy);
+    }
+    if (scroll_out)
+        *scroll_out = scroll;
+    return result;
+}

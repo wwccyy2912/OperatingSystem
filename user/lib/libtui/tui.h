@@ -171,3 +171,10 @@ int tui_input_line(int x, int y, const char *prompt, char *buf, int maxlen, int 
  * or a negative error. */
 int tui_confirm(int x, int y, int w, const char *title, const char *msg,
                 const char *hint);
+
+/* Render a titled, boxed, scrollable item list with keyboard selection
+ * (j/k/s/w move, Enter select, q cancel).  Non-destructive overlay.
+ * Returns the selected 0-based index on Enter, -1 on cancel/error.
+ * items[] must stay valid for the call; count > 0. */
+int tui_menu(int x, int y, int w, int h, const char *title,
+             const char *const *items, int count, int *scroll_out);

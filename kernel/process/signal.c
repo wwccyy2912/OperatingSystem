@@ -32,6 +32,7 @@
  */
 
 #include <kernel/signal.h>
+#include <kernel/gdt.h>
 #include <kernel/process.h>
 #include <kernel/thread.h>
 #include <kernel/sched.h>
@@ -140,7 +141,7 @@ bool signal_check_syscall(u64 *frame) {
         return false;
 
     /* Only user-mode frames can be diverted into handlers */
-    if (frame[SF_CS_IDX] != 0x1B)
+    if (frame[SF_CS_IDX] != GDT_SEL_UCODE)
         return false;
 
     /* Force-kill: terminate now with the recorded exit code */
@@ -273,10 +274,10 @@ i64 signal_restore(u64 frame_ptr) {
     for (int i = 0; i < 15; i++)
         frame[i] = sf.gprs[i];
     frame[SF_RIP_IDX]    = sf.rip;
-    frame[SF_CS_IDX]     = 0x1B;
+    frame[SF_CS_IDX]     = GDT_SEL_UCODE;
     frame[SF_RFLAGS_IDX] = sf.rflags;
     frame[SF_RSP_IDX]    = sf.rsp;
-    frame[SF_SS_IDX]     = 0x23;
+    frame[SF_SS_IDX]     = GDT_SEL_UDATA;
 
     /* The restored RAX is what the interrupted code sees the syscall
      * returning (the entry stub re-stores it from the return value). */

@@ -528,8 +528,15 @@ int tui_menu(int x, int y, int w, int h, const char *title,
                 line[ln++] = ' ';
             }
             const char *it = items[idx];
-            while (*it && ln < w - 2 && ln < (int)sizeof(line) - 1)
+            while (*it && ln < w - 3 && ln < (int)sizeof(line) - 1)
                 line[ln++] = *it++;
+            /* Scroll indicators in the right margin: '^' on the first
+             * visible row when scrolled down, 'v' on the last visible
+             * row when more items remain below. */
+            if (r == 0 && scroll > 0)
+                line[ln++] = '^';
+            else if (r == visible - 1 && scroll + visible < count)
+                line[ln++] = 'v';
             line[ln] = '\0';
             tui_render_line_at((u32)(x + 1), (u32)(y + 1 + r), line, (u32)ln);
         }

@@ -341,3 +341,14 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **排障中确认**:控制组(无 malloc 改动)的 disk write -6(ERR_AGAIN,virtio-blk DMA 超时)是宿主负载下的环境性抖动,驱动自带 reset 自愈;本轮修复后全量通过 | ✅ |
 | 全量冒烟（--drive）：65 项 OK，0 FAIL；串口 0 SIGSEGV/unreachable | ✅ |
 | `make iso` 0 警告 | ✅ |
+
+### 第八轮补充 4（2026-08-25）：启动画面 + TUI 滚动指示符 + 选择子去重
+
+| 项 | 结果 |
+|---|---|
+| **启动体验**：term 初始化后居中显示 "OpSys Microkernel / starting services..."，服务启动期间替代黑屏；光标复位 (0,0) 让 shell banner 覆盖 | ✅ QEMU 抓屏验证居中渲染 |
+| **TUI 组件深化**：tui_menu 滚动指示符——首可见行有更多项在上方时显示 `^`，末可见行有更多项在下方时显示 `v`（右缘 1 格，不覆盖项文本；TUI_MAX_TEXT=256 ≥ w≤100 无越界） | ✅ |
+| **可读性/去重**：段选择子 GDT_SEL_UCODE/UDATA 从 gdt.c 移到 gdt.h 单一来源；signal.c 的裸 0x1B/0x23 改用命名常量 | ✅ |
+| **排障结论**：此前一轮"同时含 splash+TUI 指示符"的 5 项失败经隔离测试（仅 GDT 通过 / 仅 splash 通过 / 全量通过）确认为宿主负载抖动而非代码回归 | ✅ |
+| 全量冒烟（--drive）：65 项 OK，0 FAIL（含 splash+GDT+指示符全量） | ✅ |
+| `make iso` 0 警告 | ✅ |

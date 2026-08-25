@@ -1368,6 +1368,35 @@ static void term_service_main(void *arg) {
     /* 6. Blank the screen and show the cursor. */
     term_clear();
 
+    /* 6b. Boot splash: rendered once during service startup so the
+     * user sees progress instead of a blank screen.  The cursor is
+     * then reset to (0,0), so the shell banner (written when the
+     * shell connects) overwrites the splash. */
+    {
+        static const char *const splash[] = {
+            "OpSys Microkernel",
+            "starting services...",
+        };
+        u32 nlines = sizeof(splash) / sizeof(splash[0]);
+        u32 row    = (s_rows > nlines) ? (s_rows - nlines) / 2 : 0;
+        s_cursor_x = 0;
+        s_cursor_y = row; /* center vertically */
+        for (u32 i = 0; i < nlines; i++) {
+            u32 len = (u32)strlen(splash[i]);
+            u32 col = (len < s_cols) ? (s_cols - len) / 2 : 0;
+            for (u32 c = 0; c < col; c++)
+                term_putc(' ');
+            for (u32 c = 0; c < len; c++)
+                term_putc(splash[i][c]);
+            if (i + 1 < nlines)
+                term_putc('\n');
+        }
+        /* Reset the cursor so the next writer starts at the top. */
+        s_cursor_x = 0;
+        s_cursor_y = 0;
+        term_draw_cursor();
+    }
+
     /* 7. Serve clients. */
     printf("term: serving on port %d\n", port);
     term_server_loop(port);

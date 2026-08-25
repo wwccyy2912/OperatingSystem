@@ -8,6 +8,13 @@
 
 #include <kernel/types.h>
 
+/* Segment selectors (single source of truth).  GDT layout in gdt.c:
+ * 0x08 kernel code, 0x10 kernel data, 0x18 user code, 0x20 user data,
+ * each with RPL=3 for the user variants.  Used by the signal frame
+ * rebuild (signal.c) and by gdt.c itself. */
+#define GDT_SEL_UCODE 0x1B /* 0x18 | RPL=3 */
+#define GDT_SEL_UDATA 0x23 /* 0x20 | RPL=3 */
+
 /**
  * Initialize the GDT with kernel and user segments.
  */

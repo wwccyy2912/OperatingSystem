@@ -20,8 +20,6 @@
 #define GDT_SEL_NULL  0x00
 #define GDT_SEL_KCODE 0x08
 #define GDT_SEL_KDATA 0x10
-#define GDT_SEL_UCODE 0x1B /* 0x18 | RPL=3 */
-#define GDT_SEL_UDATA 0x23 /* 0x20 | RPL=3 */
 #define GDT_SEL_TSS   0x28
 
 /* GDT entry count (including TSS which takes 2 slots) */

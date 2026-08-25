@@ -9,7 +9,6 @@
 #include <kernel/types.h>
 #include <kernel/vmm.h>
 #include <kernel/cap.h>
-#include <kernel/cred.h>
 #include <kernel/signal.h>
 #include <kernel/proc_info.h>
 
@@ -28,7 +27,6 @@ typedef struct process {
     proc_state_t    state;
     addr_space_t   *addr_space;
     cap_table_t    *cap_table;
-    cred_t          cred;     /* User/group credentials (POSIX) */
     tid_t           main_tid; /* Main thread ID */
     u32             thread_count;
     char            name[64];
@@ -46,10 +44,8 @@ typedef struct process {
 
     /* P0 地基: permission-model identity (docs/permission_model.md §三).
      * subject_id is kernel-issued, globally unique, never reused
-     * (0 = System/kernel; init gets 1).  persona_id is the person's
-     * persona (工作/儿童模式...); not used further in P0. */
+     * (0 = System/kernel; init gets 1). */
     subject_id_t subject_id;
-    u32          persona_id;
 
     /* Unit 1 (TUI 权限查询): App Subject (uuid) — the 128-bit
      * kernel-issued app identity, allocated at app instantiation

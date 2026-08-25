@@ -75,4 +75,12 @@ static inline size_t strlen(const char *s) {
     return len;
 }
 
+static inline int strcmp(const char *a, const char *b) {
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return (int)(u8)*a - (int)(u8)*b;
+}
+
 #endif /* KERNEL_STRING_H */

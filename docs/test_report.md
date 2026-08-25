@@ -306,3 +306,15 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **审计确认无洞**：SYS_NOTIFY 限同进程（无异进程信息泄漏）；VFS 句柄主体匹配+逐操作权限重检（revoke 立即生效）；mutex/notify 锁纪律与唤醒重验证；sigreturn 帧指针校验+cs/ss 防御性重写；VFS 路径拒绝 `..`/`.` 段；TUI 区域保存边界检查；键盘 READ 缓冲 32+4 一致 | ✅ |
 | 全量冒烟（--drive）：65 项 OK，0 FAIL（含栈保护下的全部服务启动、信号自检、磁盘持久化） | ✅ |
 | `make iso` 0 警告 | ✅ |
+
+### 第八轮补充 1（2026-08-25）：死字段清理 + strcmp 去重
+
+| 项 | 结果 |
+|---|---|
+| **thread_t.time_slice 死字段**：仅 4 处写入、零读取（CFS 用 vruntime 非时间片）、无汇编引用 → 移除字段与写入 | ✅ 0 警告 |
+| **process_t.cred 死字段 + cred.h 整文件**：cred 仅写入未读取（POSIX 凭据机制从未实现——权限模型用 subject_id/atom）；cred_create/clone/destroy 无实现无调用 → 移除字段、`#include <kernel/cred.h>` 与头文件本身 | ✅ 0 警告 |
+| **process_t.persona_id 死字段**：仅 4 处写入、零读取（注释自认 "not used further in P0"）→ 移除 | ✅ |
+| **ipc_strcmp 去重**：内核 string.h 补 `strcmp`（与 ipc_strcmp 逐字节相同语义），删除 ipc.c 本地副本，2 处调用点改共享实现 | ✅ |
+| 全量冒烟（--drive）：65 项 OK，0 FAIL | ✅ |
+| 启动验证（死字段后 iso）：回归 33/33 + P1 10/10、12 服务端口注册、shell 启动（strcmp 去重后） | ✅ |
+| `make iso` 0 警告 | ✅ |

@@ -40,14 +40,6 @@ extern thread_t *thread_current(void);
 extern void      sched_enqueue(thread_t *t);
 
 
-static i32 ipc_strcmp(const char *a, const char *b) {
-    while (*a && *a == *b) {
-        a++;
-        b++;
-    }
-    return (i32)(u8)*a - (i32)(u8)*b;
-}
-
 #define PENDING_POOL_SIZE  128
 #define PORT_REGISTRY_SIZE 64
 
@@ -639,7 +631,7 @@ void ipc_abort_wait(thread_t *t) {
 port_t ipc_get_port(const char *name) {
     spin_lock(&s_ipc_lock);
     for (u32 i = 0; i < s_port_registry_count; i++) {
-        if (ipc_strcmp(s_port_registry[i].name, name) == 0) {
+        if (strcmp(s_port_registry[i].name, name) == 0) {
             port_t port = s_port_registry[i].port;
             spin_unlock(&s_ipc_lock);
             return port;
@@ -652,7 +644,7 @@ port_t ipc_get_port(const char *name) {
 error_t ipc_register_port(const char *name, port_t port) {
     spin_lock(&s_ipc_lock);
     for (u32 i = 0; i < s_port_registry_count; i++) {
-        if (ipc_strcmp(s_port_registry[i].name, name) == 0) {
+        if (strcmp(s_port_registry[i].name, name) == 0) {
             spin_unlock(&s_ipc_lock);
             return ERR_BUSY;
         }

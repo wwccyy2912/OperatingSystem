@@ -170,7 +170,6 @@ static thread_t *alloc_thread(void) {
         t->held_mutexes[i] = 0;
     t->held_mutex_count = 0;
     t->next             = NULL;
-    t->time_slice       = 0;
     t->affinity         = 0;
     t->exit_code        = 0;
     t->joiner_tid       = -1;
@@ -347,7 +346,6 @@ void thread_init(void) {
     idle->pid        = 0;
     idle->state      = THREAD_STATE_RUNNING;
     idle->priority   = 0;
-    idle->time_slice = 1;  /* will be rescheduled after 1 tick */
     idle->affinity   = -1; /* any CPU */
     idle->addr_space = vmm_get_kernel_addr_space();
     fpu_state_init(0);     /* idle's FPU slot: valid for fxrstor */
@@ -371,7 +369,6 @@ tid_t thread_create_kernel(void (*entry)(void *), void *arg, int priority) {
     t->pid        = 0; /* kernel thread — no user process */
     t->state      = THREAD_STATE_READY;
     t->priority   = priority;
-    t->time_slice = (u64)(priority + 1);
     t->affinity   = -1;
     t->addr_space = vmm_get_kernel_addr_space();
 
@@ -395,7 +392,6 @@ tid_t thread_create_user(u64 entry, u64 arg, addr_space_t *as, int priority) {
     t->pid        = 0; /* caller (process_create) will set pid */
     t->state      = THREAD_STATE_READY;
     t->priority   = priority;
-    t->time_slice = (u64)(priority + 1);
     t->affinity   = -1;
     t->addr_space = as;
 

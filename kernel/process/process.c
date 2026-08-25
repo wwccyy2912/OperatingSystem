@@ -96,7 +96,6 @@ void process_init(void) {
     kern->main_tid     = 0; /* idle thread */
     kern->thread_count = 1;
     kern->subject_id   = 0; /* System (reserved, kernel) */
-    kern->persona_id   = 0;
     kern->next         = NULL;
     copy_string(kern->name, "kernel", sizeof(kern->name));
     /* PID 0 does NOT appear in the user process list */
@@ -109,12 +108,10 @@ void process_init(void) {
     init->state        = PROC_STATE_CREATED;
     init->addr_space   = vmm_create_addr_space();
     init->cap_table    = cap_table_create(1);
-    init->cred         = (cred_t)CRED_ROOT_VAL(0); /* root: uid=0, gid=0 */
     init->main_tid     = -1;                       /* thread not created yet */
     init->thread_count = 0;
     /* P0 地基: init is the first user subject (subject 1). */
     init->subject_id = s_next_subject++;
-    init->persona_id = 0;
     /* Unit 1: kernel-issued App Subject (uuid), drawn from the PRNG
      * at app instantiation.  The kernel/system process (PID 0,
      * subject 0) keeps (0,0). */
@@ -153,15 +150,11 @@ process_t *process_create(const char *name, u64 entry, addr_space_t *as) {
     proc->state      = PROC_STATE_CREATED;
     proc->addr_space = as; /* caller-loaded ELF; ownership transferred */
     proc->cap_table  = cap_table_create(proc->pid);
-    /* Inherit credentials from the parent (current process) */
-    process_t *parent  = process_current();
-    proc->cred         = parent ? parent->cred : (cred_t)CRED_ROOT_VAL(0);
     proc->thread_count = 0;
     proc->exit_code    = 0;
     proc->waiting_tid  = -1;
     /* P0 地基: every new process gets a fresh, never-reused subject. */
     proc->subject_id = s_next_subject++;
-    proc->persona_id = 0;
     /* Unit 1: kernel-issued App Subject (uuid), drawn from the PRNG
      * at app instantiation.  Unforgeable: never user-supplied. */
     proc->app_uuid_hi = rng_u64();
@@ -348,7 +341,6 @@ void process_reap(process_t *proc) {
     proc->exit_code      = 0;
     proc->waiting_tid    = -1;
     proc->subject_id     = 0;
-    proc->persona_id     = 0;
     proc->next           = NULL;
     s_process_used[slot] = false;
 }

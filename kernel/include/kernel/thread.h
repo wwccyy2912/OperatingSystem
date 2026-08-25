@@ -57,7 +57,6 @@ typedef struct thread {
 
     /* Scheduling */
     struct thread *next; /* Linked list for scheduler queue */
-    u64            time_slice;
 
     /* CPU affinity (-1 = any) */
     i32 affinity;

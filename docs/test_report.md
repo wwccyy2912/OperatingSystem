@@ -318,3 +318,13 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | 全量冒烟（--drive）：65 项 OK，0 FAIL | ✅ |
 | 启动验证（死字段后 iso）：回归 33/33 + P1 10/10、12 服务端口注册、shell 启动（strcmp 去重后） | ✅ |
 | `make iso` 0 警告 | ✅ |
+
+### 第八轮补充 2（2026-08-25）：bash 风格 cwd 提示符
+
+| 项 | 结果 |
+|---|---|
+| **shell 提示符显示当前目录**：默认提示符 `opsys$ ` → `opsys:<cwd>$ `（bash 风格，cd 后即时反映）；PS1 环境变量覆盖仍优先；`shell_prompt()` 供 shell_loop 与 shell_redraw_line 共享（光标数学一致） | ✅ QEMU 验证 `opsys:/$` |
+| **删除死宏 SHELL_PROMPT**（新实现不再引用） | ✅ |
+| **冒烟脚本同步**：3 处 `opsys\$` 正则改为 `opsys:[^$]*\$`（提示符/重启提示/flood 回显） | ✅ |
+| 全量冒烟（--drive）：65 项 OK，0 FAIL | ✅ |
+| `make iso` 0 警告 | ✅ |

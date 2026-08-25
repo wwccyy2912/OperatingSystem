@@ -50,7 +50,6 @@ typedef int32_t  i32;
 
 #define LINE_BUF_SIZE 256
 #define MAX_ARGS      16
-#define SHELL_PROMPT  "opsys$ "
 
 /* Current working directory (v0.5): "/" = volume list view.  All VFS
  * commands accept paths relative to this.  Kept as "/Volumes/X/..." so
@@ -486,13 +485,25 @@ static void shell_printf(const char *fmt, ...) {
  * Line editor (keyboard service input)
  * ==================================================================== */
 
+/* Build the prompt string: PS1 if set, else "opsys:<cwd>$ " (bash-style
+ * cwd-aware default).  Shared by shell_loop and shell_redraw_line so the
+ * on-screen prompt always matches the redraw cursor math. */
+static void shell_prompt(char *out, size_t outsz) {
+    const char *ps1 = getenv("PS1");
+    if (ps1 && ps1[0] != '\0') {
+        strncpy(out, ps1, outsz - 1);
+        out[outsz - 1] = '\0';
+        return;
+    }
+    snprintf(out, outsz, "opsys:%s$ ", s_cwd);
+}
+
 /* Redraw the whole current line on screen (used after history recall /
  * tab completion, which rewrite the buffer in place).  Uses the term's
  * cursor API for reliable placement. */
 static void shell_redraw_line(const char *line, int pos) {
-    const char *prompt = getenv("PS1");
-    if (!prompt || prompt[0] == '\0')
-        prompt = SHELL_PROMPT;
+    char prompt[LINE_BUF_SIZE + 16];
+    shell_prompt(prompt, sizeof(prompt));
     int plen = (int)strlen(prompt);
 
     /* Current row: query the term cursor, then set back to it after
@@ -973,12 +984,11 @@ static void shell_loop(void) {
     char line[LINE_BUF_SIZE];
 
     for (;;) {
-        /* PS1-driven prompt: default "opsys$ " unless the user overrides
-         * it via `export PS1=...` (environment = user preferences only;
-         * it never carries security policy). */
-        const char *prompt = getenv("PS1");
-        if (!prompt || prompt[0] == '\0')
-            prompt = SHELL_PROMPT;
+        /* Prompt: PS1 override, else "opsys:<cwd>$ " (bash-style).
+         * Environment is user preference only; it never carries
+         * security policy. */
+        char prompt[LINE_BUF_SIZE + 16];
+        shell_prompt(prompt, sizeof(prompt));
         shell_write(prompt);
         int len = read_line(line, LINE_BUF_SIZE);
         if (len < 0) {

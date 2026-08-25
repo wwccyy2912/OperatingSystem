@@ -577,7 +577,7 @@ def run_round3_flow():
     # every key survived; the stat line (used = 32768 KB after R3.2)
     # proves the command executed.
     flood_command("stat /Volumes/Users")
-    passed = wait_vga(r"opsys\$ stat /Volumes/Users", 20, "R3.4 flood echo")
+    passed = wait_vga(r"opsys:[^$]*\$ stat /Volumes/Users", 20, "R3.4 flood echo")
     if passed:
         passed = wait_vga(r"/Volumes/Users: \d+ KB total, \d+ KB used, read-write",
                           15, "R3.4 flood result")
@@ -614,7 +614,7 @@ def run_disk_persist_flow():
                              BOOT_TIMEOUT, "reboot shell"):
         print("  FAIL reboot (no shell CREATE)")
         return False
-    if not wait_vga(r"opsys\$", BOOT_TIMEOUT, "reboot prompt"):
+    if not wait_vga(r"opsys:[^$]*\$", BOOT_TIMEOUT, "reboot prompt"):
         print("  FAIL reboot (no prompt)")
         return False
     answer_panels()  # fresh boot: init's pending panel appears again
@@ -655,7 +655,7 @@ def main():
         cleanup()
         sys.exit(1)
     print("    shell process created", flush=True)
-    if not wait_vga(r"opsys\$", BOOT_TIMEOUT, "shell prompt"):
+    if not wait_vga(r"opsys:[^$]*\$", BOOT_TIMEOUT, "shell prompt"):
         print("BOOT FAILED (no VGA prompt)")
         dump_tail()
         cleanup()

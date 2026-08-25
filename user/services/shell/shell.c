@@ -508,9 +508,12 @@ static void shell_redraw_line(const char *line, int pos) {
             row = ((u32 *)resp)[2];
     }
 
-    /* Erase the current row and re-print prompt + line. */
+    /* Erase the current row and re-print prompt + line.  The extra
+     * ERASE_MARGIN cells cover the row's right edge past the text
+     * (leftovers from a longer previous line). */
+    const int erase_margin = 4;
     shell_write("\r");
-    for (int i = 0; i < plen + (int)strlen(line) + 4; i++)
+    for (int i = 0; i < plen + (int)strlen(line) + erase_margin; i++)
         shell_write(" ");
     shell_write("\r");
     shell_write(prompt);

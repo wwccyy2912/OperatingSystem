@@ -1184,6 +1184,14 @@ static bool proc_has_io_port_cap(rights_t need, u16 port) {
 
     for (u32 i = 0; i < MAX_CAPS; i++) {
         cap_entry_t *e = &proc->cap_table->entries[i];
+        /* Lazy expiry, same rule as cap_lookup: an expired entry is
+         * treated as absent.  This scan has no handle to pass to
+         * cap_lookup, so mirror the check inline (hardening: an
+         * expiring IO_PORT cap must not outlive its deadline). */
+        if (e->type == CAP_TYPE_NONE)
+            continue;
+        if (e->expiry_ticks != 0 && e->expiry_ticks <= sched_get_ticks())
+            continue;
         if (e->type == CAP_TYPE_IO_PORT && (e->rights & need) == need) {
             u16 base  = (u16)(e->obj_id & 0xFFFF);
             u16 count = (u16)((e->obj_id >> 16) & 0xFFFF);

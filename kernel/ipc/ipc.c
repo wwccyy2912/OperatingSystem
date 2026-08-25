@@ -29,6 +29,7 @@
  */
 
 #include <kernel/ipc.h>
+#include <kernel/string.h> /* memcpy: qword-optimized (shared) */
 #include <kernel/serial.h>
 #include <kernel/sched.h>
 #include <kernel/spinlock.h>
@@ -38,31 +39,6 @@
 extern thread_t *thread_current(void);
 extern void      sched_enqueue(thread_t *t);
 
-static void ipc_memcpy(void *d, const void *s, u64 n) {
-    u8       *dp = (u8 *)d;
-    const u8 *sp = (const u8 *)s;
-    /* Hot path: every IPC message and reply is copied through this.
-     * Most messages are small (a few words), and the 8-byte path below
-     * turns a 4-byte message into a single MOV instead of 4 loads +
-     * 4 stores + 4 loop iterations.  Alignment: byte loop first to get
-     * both pointers 8-aligned, then qword MOVs, then the tail. */
-    while (((uptr)dp & 7) && n > 0) {
-        *dp++ = *sp++;
-        n--;
-    }
-    if (n >= 8) {
-        u64       *dq = (u64 *)dp;
-        const u64 *sq = (const u64 *)sp;
-        do {
-            *dq++ = *sq++;
-            n -= 8;
-        } while (n >= 8);
-        dp = (u8 *)dq;
-        sp = (const u8 *)sq;
-    }
-    while (n-- > 0)
-        *dp++ = *sp++;
-}
 
 static i32 ipc_strcmp(const char *a, const char *b) {
     while (*a && *a == *b) {
@@ -227,7 +203,7 @@ static void deliver_to_waiter(port_entry_t *p,
         u32           n     = (len < *rs->len_ptr) ? len : *rs->len_ptr;
         addr_space_t *saved = thread_current()->addr_space;
         vmm_switch_addr_space(recv->addr_space);
-        ipc_memcpy(rs->buf, msg, n);
+        memcpy(rs->buf, msg, n);
         *rs->len_ptr = len;
         vmm_switch_addr_space(saved);
     }
@@ -254,7 +230,7 @@ static error_t block_with_pending(port_t port, ipc_pending_msg_t *m, const void 
     thread_t *cur = thread_current();
     m->msg_len    = len;
     if (msg && len > 0)
-        ipc_memcpy(m->msg_data, msg, len);
+        memcpy(m->msg_data, msg, len);
     m->next                  = s_pending_head[port - 1];
     s_pending_head[port - 1] = m;
     /* Lock held (IF=0): the state change + ready-tree dequeue are
@@ -396,7 +372,7 @@ error_t ipc_send(port_t port, const void *msg, u32 len) {    spin_lock(&s_ipc_lo
         m->msg_len        = len;
         m->sender_subject = ipc_sender_subject();
         if (msg && len > 0)
-            ipc_memcpy(m->msg_data, msg, len);
+            memcpy(m->msg_data, msg, len);
         deliver_to_waiter(p, recv, m->msg_data, len, 0, m->sender_subject);
         pending_free(m);
         spin_unlock(&s_ipc_lock);
@@ -442,7 +418,7 @@ ipc_recv_from(port_t port, void *buf, u32 *len, u32 *tok_ptr, subject_id_t *send
         m->next                  = NULL;
         if (buf) {
             u32 n = (m->msg_len < *len) ? m->msg_len : *len;
-            ipc_memcpy(buf, m->msg_data, n);
+            memcpy(buf, m->msg_data, n);
         }
         *len = m->msg_len;
         /* P0 地基: expose the kernel-filled sender subject */
@@ -526,14 +502,14 @@ error_t ipc_call(port_t port, const void *req, u32 req_len, void *resp, u32 *res
          * its recv slot, park m on the reply-wait list. */
         m->msg_len = req_len;
         if (req && req_len > 0)
-            ipc_memcpy(m->msg_data, req, req_len);
+            memcpy(m->msg_data, req, req_len);
         deliver_to_waiter(p, recv, m->msg_data, req_len, token_of(m), m->sender_subject);
         m->next                = s_reply_wait[port - 1];
         s_reply_wait[port - 1] = m;
     } else {
         m->msg_len = req_len;
         if (req && req_len > 0)
-            ipc_memcpy(m->msg_data, req, req_len);
+            memcpy(m->msg_data, req, req_len);
         m->next                  = s_pending_head[port - 1];
         s_pending_head[port - 1] = m;
     }
@@ -548,7 +524,7 @@ error_t ipc_call(port_t port, const void *req, u32 req_len, void *resp, u32 *res
     spin_lock(&s_ipc_lock);
     error_t err = m->err;
     if (err == OK && resp) {
-        ipc_memcpy(resp, m->resp_data, m->resp_len);
+        memcpy(resp, m->resp_data, m->resp_len);
         *resp_len = m->resp_len;
     }
     /* We own m; free it.  (ipc_reply only copies + wakes.) */
@@ -574,7 +550,7 @@ error_t ipc_reply(u32 token, const void *msg, u32 len) {
         return ERR_BUSY;
     }
 
-    ipc_memcpy(m->resp_data, msg, len);
+    memcpy(m->resp_data, msg, len);
     m->resp_len = len;
     m->replied  = true;
 

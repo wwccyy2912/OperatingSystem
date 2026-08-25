@@ -45,7 +45,8 @@ USER_CFLAGS := -ffreestanding -ffunction-sections -fdata-sections \
                -std=c11 -Wall -Wextra -O2 \
                -MD -MP
 
-USER_LDFLAGS := -T scripts/user.ld -nostdlib -z max-page-size=0x1000
+USER_LDFLAGS := -T scripts/user.ld -nostdlib -z max-page-size=0x1000 \
+                --gc-sections -z separate-code
 
 # Source files ----------------------------------------------------------------
 KERNEL_ASM := \

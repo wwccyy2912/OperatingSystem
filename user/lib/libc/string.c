@@ -272,8 +272,24 @@ void *memset(void *dest, int c, size_t n) {
 void *memcpy(void *dest, const void *src, size_t n) {
     unsigned char       *d = (unsigned char *)dest;
     const unsigned char *s = (const unsigned char *)src;
-    for (size_t i = 0; i < n; i++)
-        d[i] = s[i];
+    /* Hot path (realloc, file blocks, term screen buffer): byte-align
+     * both pointers to 8 bytes, then copy qwords, then the tail. */
+    while (((uintptr_t)d & 7) && n > 0) {
+        *d++ = *s++;
+        n--;
+    }
+    if (n >= 8) {
+        uint64_t       *dq = (uint64_t *)d;
+        const uint64_t *sq = (const uint64_t *)s;
+        do {
+            *dq++ = *sq++;
+            n -= 8;
+        } while (n >= 8);
+        d = (unsigned char *)dq;
+        s = (const unsigned char *)sq;
+    }
+    while (n-- > 0)
+        *d++ = *s++;
     return dest;
 }
 

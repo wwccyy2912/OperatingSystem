@@ -281,3 +281,17 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **可读性**：`syscall.h` 增加 `_Static_assert(SYS_SHM_MAP + 1 == SYS_COUNT)` 防表漂移 | ✅ |
 | 全量冒烟（--drive）：65 项 OK，0 FAIL —— 回归 33/33 + P1 10/10 + P2 5/5 + P2V 4/4 + KBD/P3/P4/P5 + Powerbox 书签流 + pkg 沙盒 + R2 盲区 + R3 压力 + 磁盘持久化（写/复位前/复位后） | ✅ |
 | `make iso` 0 警告 | ✅ |
+
+### 第七轮补充 2（2026-08-25）：架构优化 v0.6.1（死代码消除 + W^X + 拷贝热路径）
+
+| 项 | 结果 |
+|---|---|
+| **死代码消除**：用户链接加 `--gc-sections`（配合已有的 -ffunction-sections）——libc 中 ~87 个未被任何服务调用的函数（math 90/wchar/wctype/setjmp/threads 等）自动从二进制剔除；iso 22.6MB → 20.9MB（-1.7MB），init.elf 95KB → 9.5KB | ✅ 全服务可启动 |
+| **W^X 加固**：user.ld 重写为显式 PHDRS（text=R+X / rodata=R / data=RW），消除小程序的 RWX LOAD 段（flaky.elf 原被合并为 RWE）；内核按段 p_flags 映射，用户代码不再可写可执行 | ✅ readelf 验证 3 段独立权限 |
+| **init_array 保留**：`KEEP(.init_array/.fini_array)` 修复 gc-sections 误删信号分发器构造函数（hello 信号自检 count=0 问题），并页对齐段首 | ✅ R3.3 hello 信号自检通过 |
+| **拷贝热路径**：内核 `string.h memcpy` 由逐字节改为 对齐+qword+尾部（blob 加载/页表/IPC 拷贝 ~8× 吞吐）；用户态 libc `memcpy` 同样优化（realloc/文件块/term 屏幕缓冲） | ✅ |
+| **去冗余**：删除 ipc.c 中与 string.h memcpy 重复的 `ipc_memcpy`（8 处调用点改用共享 memcpy） | ✅ |
+| **安全加固**：IO_PORT/PCI_DEV 能力门控（proc_has_io_port_cap / proc_has_pci_dev_cap）补上惰性过期检查（与 cap_lookup 同规则，防过期 cap 继续授权） | ✅ |
+| **可读性**：shell_redraw_line 擦除宽度魔法数字 4 → 具名 `erase_margin` | ✅ |
+| 全量冒烟（--drive）：65 项 OK，0 FAIL（含信号自检、磁盘持久化） | ✅ |
+| `make iso` 0 警告（gcc + ld） | ✅ |

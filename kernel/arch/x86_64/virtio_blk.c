@@ -38,6 +38,7 @@
 #include <kernel/pci.h>
 #include <kernel/pmm.h>
 #include <kernel/process.h>
+#include <kernel/sched.h>
 #include <kernel/serial.h>
 #include <kernel/spinlock.h>
 #include <kernel/string.h>
@@ -481,6 +482,12 @@ static bool proc_has_pci_dev_cap(u64 obj_id) {
 
     for (u32 i = 0; i < MAX_CAPS; i++) {
         cap_entry_t *e = &proc->cap_table->entries[i];
+        /* Lazy expiry, same rule as cap_lookup (see the io-port gate in
+         * syscall.c): an expired PCI_DEV cap must not grant access. */
+        if (e->type == CAP_TYPE_NONE)
+            continue;
+        if (e->expiry_ticks != 0 && e->expiry_ticks <= sched_get_ticks())
+            continue;
         if (e->type == CAP_TYPE_PCI_DEV && e->obj_id == obj_id &&
             (e->rights & (RIGHT_READ | RIGHT_WRITE)) == (RIGHT_READ | RIGHT_WRITE))
             return true;

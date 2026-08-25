@@ -22,8 +22,26 @@ static inline void *memset(void *dst, int c, size_t n) {
 static inline void *memcpy(void *dst, const void *src, size_t n) {
     u8       *d = (u8 *)dst;
     const u8 *s = (const u8 *)src;
-    for (size_t i = 0; i < n; i++)
-        d[i] = s[i];
+    /* Hot path (blob loads, IPC buffers, page tables): align both
+     * pointers to 8 bytes with a byte prefix, then copy qwords, then
+     * the tail.  The former byte-at-a-time loop made large copies (ELF
+     * blobs up to ~100 KB) run at ~1/8 of memory throughput. */
+    while (((uptr)d & 7) && n > 0) {
+        *d++ = *s++;
+        n--;
+    }
+    if (n >= 8) {
+        u64       *dq = (u64 *)d;
+        const u64 *sq = (const u64 *)s;
+        do {
+            *dq++ = *sq++;
+            n -= 8;
+        } while (n >= 8);
+        d = (u8 *)dq;
+        s = (const u8 *)sq;
+    }
+    while (n-- > 0)
+        *d++ = *s++;
     return dst;
 }
 

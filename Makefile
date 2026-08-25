@@ -36,7 +36,8 @@ LDFLAGS := -T kernel/arch/x86_64/linker.ld -nostdlib -z max-page-size=0x1000
 
 # User-space flags (different include paths, large model for position-independent)
 USER_CFLAGS := -ffreestanding -ffunction-sections -fdata-sections \
-               -fno-stack-protector -nostdlib -nostdinc -mcmodel=large \
+               -fstack-protector-strong -mstack-protector-guard=global \
+               -nostdlib -nostdinc -mcmodel=large \
                -mno-red-zone \
                -isystem $(FREESTANDING_INC) \
                -I user/lib -I user/lib/libos -I user/lib/libc \
@@ -93,6 +94,7 @@ USER_C := \
     user/runtime/errno.c \
     user/runtime/malloc.c \
     user/runtime/signal_user.c \
+    user/runtime/stack_chk.c \
     user/lib/libc/stdio.c \
     user/lib/libc/stdlib.c \
     user/lib/libc/string.c \

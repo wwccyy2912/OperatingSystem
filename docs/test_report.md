@@ -295,3 +295,14 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **可读性**：shell_redraw_line 擦除宽度魔法数字 4 → 具名 `erase_margin` | ✅ |
 | 全量冒烟（--drive）：65 项 OK，0 FAIL（含信号自检、磁盘持久化） | ✅ |
 | `make iso` 0 警告（gcc + ld） | ✅ |
+
+### 第八轮（2026-08-25）：架构优化加深（用户态栈保护 + 纵深防御）
+
+| 项 | 结果 |
+|---|---|
+| **用户态栈保护**：USER_CFLAGS `-fno-stack-protector` → `-fstack-protector-strong -mstack-protector-guard=global`；新增 `user/runtime/stack_chk.c`（哨兵初值 → `_init()` 首步用 ticks/heap_base/pid/栈地址混合熵逐进程随机化，低字节置 0 防字符串溢出；`__stack_chk_fail` 记日志 + exit(134)） | ✅ term.elf 12 处 canary、5+ 函数插桩 |
+| **ELF 段重叠显式校验**：process_desc.c 增加段虚拟区间两两重叠检查（纵深防御——原先仅靠 vmm_alloc_and_map ERR_BUSY 隐式拒绝） | ✅ |
+| **malloc bin_index 潜在越界修复**：payload=BIN_MAX(2048) 时 asize 含 16B 头达 2064 → shift=12 → 索引 8 越界 s_bins[]（当前调用方恰好规避）；钳位到最大桶（可服务任意更小请求，安全） | ✅ |
+| **审计确认无洞**：SYS_NOTIFY 限同进程（无异进程信息泄漏）；VFS 句柄主体匹配+逐操作权限重检（revoke 立即生效）；mutex/notify 锁纪律与唤醒重验证；sigreturn 帧指针校验+cs/ss 防御性重写；VFS 路径拒绝 `..`/`.` 段；TUI 区域保存边界检查；键盘 READ 缓冲 32+4 一致 | ✅ |
+| 全量冒烟（--drive）：65 项 OK，0 FAIL（含栈保护下的全部服务启动、信号自检、磁盘持久化） | ✅ |
+| `make iso` 0 警告 | ✅ |

@@ -16,7 +16,13 @@
 
 #include <runtime.h>
 
+/* Seed the per-process stack canary before ANY constructor runs (see
+ * stack_chk.c): instrumented constructors read __stack_chk_guard in
+ * their prologue, so the guard must be randomized first. */
+extern void __stack_chk_init(void);
+
 void _init(void) {
+    __stack_chk_init();
     for (init_func_t *p = __init_array_start; p < __init_array_end; p++) {
         if (*p)
             (*p)();

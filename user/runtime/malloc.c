@@ -118,8 +118,14 @@ static int bin_index(size_t size) {
     size_t asize = BLOCK_HDR_SZ + ROUND_UP(size);
     if (asize < MALLOC_MIN_SIZE)
         asize = MALLOC_MIN_SIZE;
+    /* Find the smallest bin whose capacity covers asize.  The upper
+     * bound is BIN_COUNT - 1 (not BIN_COUNT): asize includes the 16-byte
+     * header, so a payload of BIN_MAX (2048) yields asize = 2064, which
+     * would otherwise compute shift = 12 and return index 8 — an
+     * out-of-bounds s_bins[] access.  Clamping parks such blocks in the
+     * largest bin, which is safe (it can serve any smaller request). */
     unsigned shift = BIN_MIN_SHIFT;
-    while ((1u << shift) < asize && shift < BIN_MIN_SHIFT + BIN_COUNT)
+    while ((1u << shift) < asize && shift < BIN_MIN_SHIFT + BIN_COUNT - 1)
         shift++;
     return (int)(shift - BIN_MIN_SHIFT);
 }

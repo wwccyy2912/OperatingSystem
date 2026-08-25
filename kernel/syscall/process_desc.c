@@ -216,6 +216,26 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
         }
     }
 
+    /* ---- Segment virtual ranges must not overlap ----
+     * Defense in depth: map_segment would reject a collision anyway
+     * (vmm_alloc_and_map -> ERR_BUSY on an already-mapped VA), but an
+     * explicit upfront check reports the offending pair clearly and
+     * validates the whole layout before the allocator is touched.
+     * seg_count is caller-controlled but capped (ELF_MAX_LOAD_SEGS=8),
+     * so the pairwise scan is bounded and cheap. */
+    for (u64 i = 0; i < desc.seg_count; i++) {
+        for (u64 j = i + 1; j < desc.seg_count; j++) {
+            u64 a_lo = segs[i].vaddr;
+            u64 a_hi = segs[i].vaddr + segs[i].memsz; /* overflow-safe: checked above */
+            u64 b_lo = segs[j].vaddr;
+            u64 b_hi = segs[j].vaddr + segs[j].memsz;
+            if (a_lo < b_hi && b_lo < a_hi) {
+                serial_printf("proc: seg %d and %d overlap\n", (int)i, (int)j);
+                return (i64)ERR_INVAL;
+            }
+        }
+    }
+
     serial_printf(
         "proc: CREATE name=%s entry=0x%x segs=%d\n", name, (u32)desc.entry, (int)desc.seg_count);
 

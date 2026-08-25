@@ -49,6 +49,13 @@ typedef int32_t  i32;
  * ==================================================================== */
 
 #define LINE_BUF_SIZE 256
+
+/* Completion / fm list caps: max candidates shown by Tab completion
+ * and max entries per fm screen.  The 64x64 second dim is the per-item
+ * name buffer (VFS names are capped at 64 by the server). */
+#define COMPLETE_MAX_MATCHES 64
+#define FM_MAX_ITEMS         64
+#define PROC_MAX_ITEMS       64 /* ps / kill-picker list caps */
 #define MAX_ARGS      16
 
 /* Current working directory (v0.5): "/" = volume list view.  All VFS
@@ -565,11 +572,11 @@ static int shell_complete(char *buf, int *pos, int maxlen) {
 
     if (is_first) {
         /* Command completion. */
-        static const char *matches[64];
+        static const char *matches[COMPLETE_MAX_MATCHES];
         int                nm = 0, common = -1;
         for (cmd_node_t *n = s_cmd_head; n; n = n->next) {
             if (strncmp(n->name, tok, (size_t)toklen) == 0) {
-                if (nm < 64)
+                if (nm < COMPLETE_MAX_MATCHES)
                     matches[nm++] = n->name;
                 if (common < 0)
                     common = (int)strlen(n->name);
@@ -640,7 +647,7 @@ static int shell_complete(char *buf, int *pos, int maxlen) {
     }
 
     static vfs_enum_batch_t batch;
-    static char            matches[64][64];
+    static char matches[COMPLETE_MAX_MATCHES][64];
     int                    nm = 0, common = -1;
     vfs_handle_t           e;
     int                    r = fs_enum_begin(dir, &e);
@@ -650,7 +657,7 @@ static int shell_complete(char *buf, int *pos, int maxlen) {
         r = fs_enum_next(e, &batch);
         if (r < 0 || batch.batch_count == 0)
             break;
-        for (u32 i = 0; i < batch.batch_count && nm < 64; i++) {
+        for (u32 i = 0; i < batch.batch_count && nm < COMPLETE_MAX_MATCHES; i++) {
             if (strncmp(batch.batch[i], frag, strlen(frag)) == 0) {
                 strncpy(matches[nm], batch.batch[i], 63);
                 matches[nm][63] = '\0';
@@ -1301,12 +1308,12 @@ static int cmd_fm(int argc, char *argv[]) {
             return -1;
         }
         /* tui_menu needs a stable items array; reuse a static one. */
-        static char items[64][64];
-        for (u32 i = 0; i < vcount && i < 64; i++) {
+        static char items[FM_MAX_ITEMS][64];
+        for (u32 i = 0; i < vcount && i < FM_MAX_ITEMS; i++) {
             snprintf(items[i], 64, "%s%s", vols[i].mount_name,
                      vols[i].read_only ? " (ro)" : "");
         }
-        const char *ptrs[64];
+        const char *ptrs[FM_MAX_ITEMS];
         for (u32 i = 0; i < vcount && i < 64; i++)
             ptrs[i] = items[i];
         int sel = tui_menu(30, 8, 50, (int)vcount + 2, "Volumes (j/k, Enter, q)",
@@ -1321,9 +1328,9 @@ static int cmd_fm(int argc, char *argv[]) {
     }
 
     for (;;) {
-        static char items[64][64];
-        static const char *ptrs[64];
-        int n = fm_enum(dir, items, 64);
+        static char items[FM_MAX_ITEMS][64];
+        static const char *ptrs[FM_MAX_ITEMS];
+        int n = fm_enum(dir, items, FM_MAX_ITEMS);
         if (n < 0) {
             shell_printf("fm: %s FAILED (%d)\n", dir, n);
             return -1;
@@ -1824,9 +1831,9 @@ static void shell_pad_str(const char *s, int width) {
 static int cmd_ps(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
-    static proc_info_t s_ps_info[64];
+    static proc_info_t s_ps_info[PROC_MAX_ITEMS];
 
-    int n = process_list(s_ps_info, 64);
+    int n = process_list(s_ps_info, PROC_MAX_ITEMS);
     if (n < 0) {
         shell_printf("ps: process_list failed (%d)\n", n);
         return -1;
@@ -1882,10 +1889,10 @@ static int cmd_kill(int argc, char *argv[]) {
     int pid = 0;
     if (argc < 2) {
         /* v1.3: no PID -> TUI process picker. */
-        static proc_info_t plist[64];
-        static char        lines[64][32];
-        static const char *ptrs[64];
-        int                n = process_list(plist, 64);
+        static proc_info_t plist[PROC_MAX_ITEMS];
+        static char        lines[PROC_MAX_ITEMS][32];
+        static const char *ptrs[PROC_MAX_ITEMS];
+        int                n = process_list(plist, PROC_MAX_ITEMS);
         if (n <= 0) {
             shell_write("kill: no processes\n");
             return -1;
@@ -2462,9 +2469,9 @@ static int cmd_mv(int argc, char *argv[]) {
     char dst[LINE_BUF_SIZE];
     if (strcmp(argv[2], "?") == 0) {
         /* v1.3: TUI directory picker for the destination. */
-        static char items[64][64];
-        static const char *ptrs[64];
-        int n = fm_enum(s_cwd, items, 64);
+        static char items[FM_MAX_ITEMS][64];
+        static const char *ptrs[FM_MAX_ITEMS];
+        int n = fm_enum(s_cwd, items, FM_MAX_ITEMS);
         if (n <= 0) {
             shell_printf("mv: no directories in %s\n", s_cwd);
             return -1;

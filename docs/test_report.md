@@ -370,3 +370,11 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **shell 调试行**：`cmd_ps`/`cmd_exec` 的 `[shell] ...` 串口行每次执行都输出 → 移除 | ✅ |
 | 全量冒烟（--drive）：65 项 OK，0 FAIL | ✅ |
 | `make iso` 0 警告 | ✅ |
+
+### 第八轮补充 7（2026-08-25）：shell 魔法数字命名化
+
+| 项 | 结果 |
+|---|---|
+| **魔法数字命名**：shell 中重复的 64 上限 → `COMPLETE_MAX_MATCHES`(Tab 补全候选)、`FM_MAX_ITEMS`(fm 列表)、`PROC_MAX_ITEMS`(ps/kill 选择器)；补全 4 处遗漏的调用点参数 | ✅ 0 警告 |
+| 全量冒烟（--drive）：65 项 OK，0 FAIL | ✅ |
+| `make iso` 0 警告 | ✅ |

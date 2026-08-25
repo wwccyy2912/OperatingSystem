@@ -361,3 +361,12 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **UX 修正**：`fallocate` 对任何写错误都标 "NOSPC"（误导）——卷满才标 NOSPC，其他错误（如驱动失效 ERR_NOENT）标 `write FAILED at N MiB` | ✅ |
 | 全量冒烟（--drive）：65 项 OK，0 FAIL | ✅ |
 | `make iso` 0 警告 | ✅ |
+
+### 第八轮补充 6（2026-08-25）：热路径串口噪音清除
+
+| 项 | 结果 |
+|---|---|
+| **内核 syscall 噪音**：`SYS_LIST`/`SYS_PROC_INFO_BY_SUBJECT` 每次调用都打串口（一次 ps ≈ 16 行刷屏）→ 移除（无任何测试依赖，冒烟仅依赖 "proc: CREATE name=shell"） | ✅ 串口 0 噪音行 |
+| **shell 调试行**：`cmd_ps`/`cmd_exec` 的 `[shell] ...` 串口行每次执行都输出 → 移除 | ✅ |
+| 全量冒烟（--drive）：65 项 OK，0 FAIL | ✅ |
+| `make iso` 0 警告 | ✅ |

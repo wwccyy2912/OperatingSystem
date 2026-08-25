@@ -1015,7 +1015,6 @@ static i64 sys_process_list(u64 buf_ptr, u64 max_entries) {
     if (!validate_user_ptr(buf_ptr, max_entries * sizeof(proc_info_t), true))
         return (i64)ERR_FAULT;
     i64 n = process_list_fill((proc_info_t *)USER_PTR(buf_ptr), (u32)max_entries);
-    serial_printf("proc: SYS_LIST n=%d max=%d\n", (int)n, (int)max_entries);
     return n;
 }
 
@@ -1046,11 +1045,6 @@ static i64 sys_proc_info_by_subject(u64 subject, u64 out_ptr) {
         ident.name[i] = proc->name[i];
 
     memcpy(USER_PTR(out_ptr), &ident, sizeof(ident));
-    serial_printf("proc: SYS_PROC_INFO subj=%d pid=%d uuid=%016x%016x\n",
-                  (int)subject,
-                  (int)proc->pid,
-                  ident.uuid_hi,
-                  ident.uuid_lo);
     return 0;
 }
 

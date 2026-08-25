@@ -1554,7 +1554,6 @@ static int cmd_exec(int argc, char *argv[]) {
         return 1;
     }
     shell_printf("exec: created PID %d\n", pid);
-    printf("[shell] cmd_exec: pid=%d tick=%d\n", pid, get_time());
     return 0;
 }
 
@@ -1828,7 +1827,6 @@ static int cmd_ps(int argc, char *argv[]) {
     static proc_info_t s_ps_info[64];
 
     int n = process_list(s_ps_info, 64);
-    printf("[shell] cmd_ps: n=%d tick=%d\n", n, get_time());
     if (n < 0) {
         shell_printf("ps: process_list failed (%d)\n", n);
         return -1;

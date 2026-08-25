@@ -2161,7 +2161,13 @@ static int cmd_fallocate(int argc, char *argv[]) {
     for (;;) {
         r = fs_write(h, off, s_fill_buf, sizeof(s_fill_buf));
         if (r < 0) {
-            shell_printf("fallocate: NOSPC at %d MiB (err %d)\n", (int)(off >> 20), r);
+            /* Only a full volume is NOSPC; other failures (e.g. a dead
+             * driver returning ERR_NOENT) are labelled accurately. */
+            if (r == VFS_ERR_NOSPC)
+                shell_printf("fallocate: NOSPC at %d MiB (err %d)\n", (int)(off >> 20), r);
+            else
+                shell_printf("fallocate: write FAILED at %d MiB (err %d)\n",
+                             (int)(off >> 20), r);
             fs_close(h);
             return 0;
         }

@@ -118,7 +118,6 @@ typedef struct {
     u32           vol_index;
     vfs_item_id_t item_id;
     u32           access; /* VFS_ACCESS_* (perm-granted ∩ requested) */
-    u32           flags;  /* VFS_OPEN_* */
     /* P1 authz: identity captured at open time so do_read/do_write can
      * re-run perm_check on every operation — a perm_revoke between open
      * and read/write takes effect immediately instead of being shadowed
@@ -441,7 +440,6 @@ static int vfs_getattr(u32 vol_index, vfs_item_id_t id, vfs_item_info_t *out) {
 static vfs_handle_ent_t *handle_alloc(u32                   vol_index,
                                       vfs_item_id_t         id,
                                       u32                   access,
-                                      u32                   flags,
                                       u64                   subject_id,
                                       const vfs_resource_t *res,
                                       vfs_handle_t         *tok) {
@@ -455,7 +453,6 @@ static vfs_handle_ent_t *handle_alloc(u32                   vol_index,
             h->vol_index  = vol_index;
             h->item_id    = id;
             h->access     = access;
-            h->flags      = flags;
             h->subject_id = subject_id;
             if (res)
                 h->resource = *res;
@@ -1031,7 +1028,7 @@ static void do_open(int token, int msg_len, u64 caller_subject) {
     }
 
     vfs_handle_t      htok;
-    vfs_handle_ent_t *h = handle_alloc(vi, fid, granted, req->flags, caller_subject, &res, &htok);
+    vfs_handle_ent_t *h = handle_alloc(vi, fid, granted, caller_subject, &res, &htok);
     if (!h) {
         resp->ret = ERR_NOMEM;
         goto out;
@@ -1583,7 +1580,7 @@ static void do_resolve_bookmark(int token, int msg_len, u64 subject_id) {
 
     vfs_handle_t      htok;
     vfs_handle_ent_t *h =
-        handle_alloc(b->vol_index, live_id, granted, 0, subject_id, &res, &htok);
+        handle_alloc(b->vol_index, live_id, granted, subject_id, &res, &htok);
     if (!h) {
         resp->ret = ERR_NOMEM;
         goto out;

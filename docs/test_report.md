@@ -352,3 +352,12 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **排障结论**：此前一轮"同时含 splash+TUI 指示符"的 5 项失败经隔离测试（仅 GDT 通过 / 仅 splash 通过 / 全量通过）确认为宿主负载抖动而非代码回归 | ✅ |
 | 全量冒烟（--drive）：65 项 OK，0 FAIL（含 splash+GDT+指示符全量） | ✅ |
 | `make iso` 0 警告 | ✅ |
+
+### 第八轮补充 5（2026-08-25）：句柄死字段移除 + fallocate 错误标签修正
+
+| 项 | 结果 |
+|---|---|
+| **死字段**：`vfs_handle_ent_t.flags`（VFS_OPEN_*）只写不读（handle_alloc 赋值后无任何读取）→ 移除字段与 `handle_alloc` 的 flags 参数（2 处调用点同步） | ✅ 0 警告 |
+| **UX 修正**：`fallocate` 对任何写错误都标 "NOSPC"（误导）——卷满才标 NOSPC，其他错误（如驱动失效 ERR_NOENT）标 `write FAILED at N MiB` | ✅ |
+| 全量冒烟（--drive）：65 项 OK，0 FAIL | ✅ |
+| `make iso` 0 警告 | ✅ |

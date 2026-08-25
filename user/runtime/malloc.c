@@ -135,6 +135,12 @@ static int bin_index(size_t size) {
  * randomized base is fetched (see heap_grow). */
 static uint64_t s_next_virt = HEAP_BASE_DEFAULT;
 
+/* First mapped heap address (set on the first heap_grow).  Heap chunks
+ * are mapped contiguously, so [s_heap_base, s_next_virt) is exactly the
+ * mapped region — block_is_free uses it to avoid dereferencing
+ * by-address candidates past the heap end. */
+static uintptr_t s_heap_base = 0;
+
 /* Heap region end = base + HEAP_USER_SIZE (updated with the base). */
 static uint64_t s_heap_max = HEAP_BASE_DEFAULT + HEAP_USER_SIZE;
 
@@ -208,6 +214,8 @@ static int heap_grow(size_t need) {
     /* Capability is no longer needed — the mapping persists in the page table */
     cap_revoke(cap);
 
+    if (s_heap_base == 0)
+        s_heap_base = (uintptr_t)addr; /* first chunk: the heap floor */
     heap_add_chunk(addr, chunk);
     s_next_virt += chunk;
     return 0;
@@ -304,8 +312,25 @@ static int bin_count(int idx) {
 }
 
 /* Is `blk` a free block?  Checks the global list AND every bin (a free
- * small block may be parked in its size-class bin). */
+ * small block may be parked in its size-class bin).  O(1) fast reject:
+ * a block with the FREE bit clear is used and can never be on a free
+ * list — this is the common case in realloc's in-place growth, where
+ * the following block is almost always used (previously O(n) per call
+ * -> O(n^2) while growing a file block 4 KiB at a time).
+ *
+ * SAFETY: `blk` is a by-ADDRESS candidate (block + BLOCK_SIZE) that may
+ * point past the mapped heap end (the block after the last one in a
+ * chunk).  Dereferencing it would #PF, so the pointer is first checked
+ * against the mapped range [s_heap_base, s_next_virt) — the old
+ * pointer-scan-only version never dereferenced it, and treating an
+ * out-of-range address as "not free" is exactly what the list scan
+ * would conclude anyway. */
 static int block_is_free(block_t *blk) {
+    uintptr_t p = (uintptr_t)blk;
+    if (p < s_heap_base || p >= s_next_virt)
+        return 0; /* past the heap: never a list node */
+    if (!IS_FREE(blk))
+        return 0;
     for (block_t *f = s_free_list; f; f = f->next)
         if (f == blk)
             return 1;
@@ -323,6 +348,7 @@ static int block_unlink(block_t *blk) {
     while (*pp) {
         if (*pp == blk) {
             *pp = blk->next;
+            blk->size &= ~(size_t)1; /* keep invariant: set bit <=> on a list */
             return 1;
         }
         pp = &(*pp)->next;
@@ -332,6 +358,7 @@ static int block_unlink(block_t *blk) {
         while (*bp) {
             if (*bp == blk) {
                 *bp = blk->next;
+                blk->size &= ~(size_t)1;
                 return 1;
             }
             bp = &(*bp)->next;

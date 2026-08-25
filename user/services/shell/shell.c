@@ -979,6 +979,7 @@ static void shell_loop(void) {
     shell_write("Welcome to OpSys \n");
     shell_write("  Copyright (c) 2026 OpSys Project \n");
     shell_write("  shell.c - Simple terminal shell (TTY-like) \n");
+    shell_write("  Type 'help' for a command list. \n");
     shell_write("\n");
 
     char line[LINE_BUF_SIZE];

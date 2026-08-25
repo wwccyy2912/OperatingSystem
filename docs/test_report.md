@@ -328,3 +328,16 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **冒烟脚本同步**：3 处 `opsys\$` 正则改为 `opsys:[^$]*\$`（提示符/重启提示/flood 回显） | ✅ |
 | 全量冒烟（--drive）：65 项 OK，0 FAIL | ✅ |
 | `make iso` 0 警告 | ✅ |
+
+### 第八轮补充 3（2026-08-25）：malloc 快速路径 + 崩溃根因修复
+
+| 项 | 结果 |
+|---|---|
+| **block_is_free O(1) 快速拒绝**：realloc 原地增长路径常用情况(邻块已用)从 O(n) 列表扫描降为 O(1) 位检查(头部位 0 = 已用) | ✅ |
+| **崩溃根因修复(自引入)**:快速路径先解引用块头,而 by-address 候选可能指向堆末端之外(未映射)→ fs_mem_driver 在 0x77aa0000 触发 #PF → SIGSEGV → 驱动死亡 → vfs 丢卷 → R3.4 stat -4 级联 | ✅ 修复 |
+| **修复方式**:新增 `s_heap_base`(首个 chunk 地址),`block_is_free` 先检查指针在映射范围 [s_heap_base, s_next_virt) 内再解引用(越界视为"非空闲"= 旧指针扫描的结论) | ✅ |
+| **block_unlink 不变量加固**：解链时清 FREE 位("置位 ⟺ 在空闲表"),支撑 O(1) 快速拒绝的正确性 | ✅ |
+| **shell banner 帮助提示**：新增 "Type 'help' for a command list." | ✅ |
+| **排障中确认**:控制组(无 malloc 改动)的 disk write -6(ERR_AGAIN,virtio-blk DMA 超时)是宿主负载下的环境性抖动,驱动自带 reset 自愈;本轮修复后全量通过 | ✅ |
+| 全量冒烟（--drive）：65 项 OK，0 FAIL；串口 0 SIGSEGV/unreachable | ✅ |
+| `make iso` 0 警告 | ✅ |

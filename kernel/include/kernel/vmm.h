@@ -147,4 +147,11 @@ error_t vmm_alloc_and_map(addr_space_t *as, u64 virt, u64 flags);
  */
 bool vmm_validate_user_range(addr_space_t *as, u64 ptr, u64 size, bool need_write);
 
+/* Validate a user pointer range against the CURRENT process's address
+ * space: non-zero, overflow-free, below USER_PTR_MAX, and every page
+ * mapped (writable iff need_write).  Single shared implementation for
+ * all syscall handlers (was duplicated in syscall.c, process_desc.c,
+ * pci.c and virtio_blk.c). */
+bool vmm_validate_user_ptr(u64 ptr, u64 size, bool need_write);
+
 #endif /* KERNEL_VMM_H */

@@ -74,6 +74,11 @@ static const int cfs_weights[32] = {
     /* 24 */ 1630, 1960, 2350, 2820, 3380, 4060, 4870, 5850,
 };
 
+/* Precomputed vruntime step (NICE_0_LOAD / weight, clamped to >= 1)
+ * per priority.  Computed once at init so the tick path never performs
+ * a 64-bit division. */
+static u64 s_vruntime_step[32];
+
 /* ------------------------------------------------------------------ */
 /*  Internal data                                                      */
 /* ------------------------------------------------------------------ */
@@ -124,18 +129,10 @@ void sched_init(void) {
     rb_init(&s_ready_tree);
     for (int i = 0; i < MAX_CPUS; i++)
         s_current[i] = NULL;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Weight helper                                                      */
-/* ------------------------------------------------------------------ */
-
-static int sched_weight(int priority) {
-    if (priority < 0)
-        priority = 0;
-    if (priority > 31)
-        priority = 31;
-    return cfs_weights[priority];
+    for (int p = 0; p < 32; p++) {
+        u64 step = (u64)(NICE_0_LOAD / cfs_weights[p]);
+        s_vruntime_step[p] = (step == 0) ? 1 : step;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -202,14 +199,14 @@ static void reschedule(int resume_if) {
         return;
 
     /* Increment vruntime: delta = 1 tick, scaled by weight.
-     * Integer division truncates; if weight > NICE_0_LOAD the
-     * result is zero, which would let high-priority threads never
-     * advance vruntime and thus monopolise the CPU.  Clamp to 1. */
-    int weight = sched_weight(cur->priority);
-    u64 delta  = (u64)(NICE_0_LOAD / weight);
-    if (delta == 0)
-        delta = 1;
-    cur->vruntime += delta;
+     * step is precomputed per priority (NICE_0_LOAD / weight, clamped
+     * to >= 1) so high-priority threads never stall at delta 0.
+     * Defensive clamp: priority is a user-controlled value at thread
+     * creation, so index the table only with a valid [0,31] entry. */
+    int pri = cur->priority;
+    if (pri < 0 || pri > 31)
+        pri = 0;
+    cur->vruntime += s_vruntime_step[pri];
 
     /* Preempt if a ready thread has lower vruntime */
     thread_t *next = pick_next();

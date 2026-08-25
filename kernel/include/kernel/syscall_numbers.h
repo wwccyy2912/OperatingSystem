@@ -54,7 +54,7 @@
 #define SYS_BIND_IRQ   32
 #define SYS_UNBIND_IRQ 33
 
-/* ---- Serial service (P0-A): IPC reply + I/O port access ---- */
+/* ---- I/O port access (used by device drivers) ---- */
 #define SYS_IPC_REPLY 34
 #define SYS_IO_READ8  35
 #define SYS_IO_WRITE8 36
@@ -85,9 +85,6 @@
 
 /* ---- Wall clock (RTC/CMOS) ---- */
 #define SYS_GET_RTC_TIME 42
-
-/* ---- Process kill ---- */
-#define SYS_PROCESS_KILL 43
 
 /* ---- Framebuffer ---- */
 #define SYS_FB_GET_INFO 44

@@ -10,6 +10,7 @@
  */
 
 #include <kernel/vmm.h>
+#include <kernel/process.h>
 #include <kernel/pmm.h>
 #include <kernel/rng.h>
 #include <kernel/serial.h>
@@ -193,6 +194,21 @@ bool vmm_validate_user_range(addr_space_t *as, u64 ptr, u64 size, bool need_writ
             return false;
     }
     return true;
+}
+
+/* Shared user-pointer validation against the current process.  This
+ * is the ONE implementation every syscall handler uses; the former
+ * per-file copies (syscall.c, process_desc.c, pci.c, virtio_blk.c)
+ * are removed (dedup: v0.6 architecture cleanup).
+ *
+ * Race-freedom: syscalls run with IF=0 (0x80 interrupt gate, see
+ * syscall_entry.S), so no timer IRQ can preempt between this check and
+ * the caller's subsequent copy — the mapping cannot change mid-syscall. */
+bool vmm_validate_user_ptr(u64 ptr, u64 size, bool need_write) {
+    process_t *proc = process_current();
+    if (!proc || !proc->addr_space)
+        return false;
+    return vmm_validate_user_range(proc->addr_space, ptr, size, need_write);
 }
 
 void vmm_init(void) {

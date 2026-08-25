@@ -225,13 +225,22 @@ def wait_serial_since(offset, pattern, timeout=STEP_TIMEOUT, label=""):
 
 
 def run_vga_cmd(text, pattern, timeout=STEP_TIMEOUT, label="", retries=4):
-    """Type a command; if a Powerbox panel appears, answer it (y) and
-    RE-TYPE the command (the blocked call returned -105 already).  Loop
+    """Type a command; answer any interactive dialogs and keep polling
     until the expected text shows or the timeout budget is exhausted.
+
+    Two dialog kinds are handled:
+      - Powerbox panel "Allow? (y/n)": the blocked call already returned
+        -105, so after answering (y) the command is RE-TYPED.
+      - TUI confirm box "Type y to confirm / y = delete, n = cancel"
+        (mv/rm/fm, v1.3): the command is still running and blocked on the
+        box; answering (y) lets it resume, so we KEEP polling instead of
+        re-typing (a re-type would queue a second invocation).
+
     Each attempt gets a short window (max 15s) so a stuck scenario can
     not burn retries*timeout seconds of wall clock."""
     rex = re.compile(pattern)
     panel_rex = re.compile(r"Allow\? \(y/n\)")
+    confirm_rex = re.compile(r"Type y to confirm|y = delete, n = cancel")
     attempt_to = min(timeout, 15)
     for attempt in range(retries + 1):
         if attempt:
@@ -242,6 +251,10 @@ def run_vga_cmd(text, pattern, timeout=STEP_TIMEOUT, label="", retries=4):
             txt = vga_joined()
             if rex.search(txt):
                 return True
+            if confirm_rex.search(txt):
+                mon_cmd("sendkey y")
+                time.sleep(2)
+                continue  # TUI confirm answered: command resumes
             if panel_rex.search(txt):
                 mon_cmd("sendkey y")
                 time.sleep(3)

@@ -19,6 +19,18 @@
 ; (from thread_t.kstack_top) before saving any GPRs.  This avoids
 ; corrupting another thread's saved state when TSS.RSP0 is shared.
 ;
+; SECURITY INVARIANT (TOCTOU): vector 0x80 is an INTERRUPT gate (see
+; idt.c), so the CPU clears IF on entry and the whole handler — from
+; here through syscall_dispatch() and every user-pointer copy inside
+; it — runs with interrupts disabled.  The PIT tick (the only
+; preemption source on this single-CPU kernel) therefore cannot fire
+; between a handler's vmm_validate_user_ptr() check and its memcpy of
+; the same range: no other thread of the process can unmap the pages
+; mid-syscall, so validate-then-copy is race-free by construction.
+; Handlers that block (IPC wait, sleep) yield with IF=0 and resume
+; with IF=0; sched_sleep() is the only path that re-enables IF, and
+; only AFTER the thread is already BLOCKED and out of the ready tree.
+;
 ; Exports:
 ;   syscall_entry_stub - placed at IDT vector 0x80
 ;   syscall_entry_iretq - return to user mode after syscall dispatch

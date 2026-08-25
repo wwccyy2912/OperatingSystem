@@ -20,6 +20,10 @@
  */
 #define SYS_COUNT (SYS_SHM_MAP + 1)
 
+/* Compile-time guard: SYS_SHM_MAP (68) is the highest syscall number;
+ * if a higher one is ever added, update SYS_COUNT to match. */
+_Static_assert(SYS_SHM_MAP + 1 == SYS_COUNT, "SYS_COUNT drift");
+
 /* System call result passed in RAX */
 typedef struct {
     i64 value; /* Result or negative error code */

@@ -47,10 +47,7 @@
  * sys_process_create in syscall.c.
  */
 static bool validate_user_ptr(u64 ptr, u64 size, bool need_write) {
-    process_t *proc = process_current();
-    if (!proc || !proc->addr_space)
-        return false;
-    return vmm_validate_user_range(proc->addr_space, ptr, size, need_write);
+    return vmm_validate_user_ptr(ptr, size, need_write);
 }
 
 /* Convenience: cast a validated user pointer */

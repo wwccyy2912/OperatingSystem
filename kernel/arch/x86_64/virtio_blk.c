@@ -160,12 +160,7 @@ static spinlock_t s_vq_lock = SPINLOCK_INIT;
  * calling process's address space — the kernel then dereferences it
  * directly under the caller's CR3 (the repo-wide convention). */
 static bool blk_validate_user_ptr(u64 ptr, u64 size, bool need_write) {
-    process_t *proc = process_current();
-    if (!proc || !proc->addr_space)
-        return false;
-    if (ptr == 0 || ptr >= USER_PTR_MAX || size > USER_PTR_MAX - ptr)
-        return false;
-    return vmm_validate_user_range(proc->addr_space, ptr, size, need_write);
+    return vmm_validate_user_ptr(ptr, size, need_write);
 }
 
 /* Convenience: cast a validated user pointer */

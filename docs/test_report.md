@@ -264,3 +264,20 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **mv 目标目录 TUI 选择**：`mv src ?` 列出 cwd 子目录菜单 | ✅ |
 | tui_menu 增强：方向键 + Home/End/PgUp/PgDn | ✅ |
 | `make iso` 0 警告 | ✅ |
+
+### 第七轮（2026-08-24）：架构优化 v0.6（性能/安全/UX/可读性/去冗余）
+
+| 项 | 结果 |
+|---|---|
+| **性能**：PMM 单页分配 word-at-a-time（`__builtin_ctzll`，每候选字一次加载+ctz，取代逐 bit 扫描；保持 next-fit 局部性 + 回绕） | ✅ `make iso` 0 警告 |
+| **性能**：CFS vruntime 步长按优先级预计算表（`s_vruntime_step[32]`），tick/reschedule 热路径移除 64 位除法 | ✅ |
+| **安全**：4 份重复的用户指针校验器（syscall.c / process_desc.c / pci.c / virtio_blk.c）统一为 `vmm_validate_user_ptr`（单实现，溢出/边界/逐页校验语义不变） | ✅ |
+| **安全**：`SYS_THREAD_CREATE` 优先级越界（>31）由静默截断改为拒绝 `ERR_INVAL`（此前会越界索引 CFS 权重表）；`reschedule` 加防御性钳位 | ✅ |
+| **安全**：文档化 TOCTOU 不变量——0x80 为中断门（IF=0 贯穿 syscall），校验与拷贝之间不可能被定时器抢占，validate-then-copy 天然无竞态（syscall_entry.S / vmm.c 注释） | ✅ |
+| **审计**：shm 池创建/映射（cap 门控 + 溢出检查）、process_create 段校验/blob 边界、cap 表边界、新页零初始化（无内核内存泄漏到用户态）均确认无洞 | ✅ |
+| **UX 修复**：`tee <url> <text>` 的 text 参数被相对路径解析错误改写（`hello`→`/hello`，写出 6 字节错误内容）——路径解析仅作用于 tee 的 argv[1] | ✅ QEMU：tee/cat 5 字节一致 |
+| **UX/测试**：smoke_test 支持 v1.3 TUI 确认框（`Type y to confirm`，mv/rm/fm），与 Powerbox 面板应答区分（确认框应答后不重输命令） | ✅ |
+| **去冗余**：删除未实现/未引用的 `SYS_PROCESS_KILL 43`（真实 kill 为 SYS_KILL 49）；删除死函数 `sched_weight`；修正 34/35/36 误导性注释 | ✅ |
+| **可读性**：`syscall.h` 增加 `_Static_assert(SYS_SHM_MAP + 1 == SYS_COUNT)` 防表漂移 | ✅ |
+| 全量冒烟（--drive）：65 项 OK，0 FAIL —— 回归 33/33 + P1 10/10 + P2 5/5 + P2V 4/4 + KBD/P3/P4/P5 + Powerbox 书签流 + pkg 沙盒 + R2 盲区 + R3 压力 + 磁盘持久化（写/复位前/复位后） | ✅ |
+| `make iso` 0 警告 | ✅ |

@@ -42,10 +42,9 @@ static bool proc_has_io_port_cap(rights_t need, u16 port);
  *     write into the range); pass false for read-only user buffers
  */
 static bool validate_user_ptr(u64 ptr, u64 size, bool need_write) {
-    process_t *proc = process_current();
-    if (!proc || !proc->addr_space)
-        return false;
-    return vmm_validate_user_range(proc->addr_space, ptr, size, need_write);
+    /* Single shared implementation (vmm.c); kept as a thin alias so the
+     * many call sites read naturally. */
+    return vmm_validate_user_ptr(ptr, size, need_write);
 }
 
 /* Convenience: cast a validated user pointer */
@@ -687,6 +686,11 @@ static i64 sys_fb_map(u64 virt, u64 size) {
 static i64 sys_thread_create(u64 entry, u64 arg, u64 priority) {
     /* Entry must be a user-mode address */
     if (entry == 0 || entry >= USER_PTR_MAX)
+        return (i64)ERR_INVAL;
+
+    /* Priority is a CFS table index: out-of-range values would index
+     * s_vruntime_step[] out of bounds (hardening: reject, don't clamp). */
+    if (priority > 31)
         return (i64)ERR_INVAL;
 
     process_t *proc = process_current();

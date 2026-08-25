@@ -50,6 +50,31 @@ static inline bool bitmap_test(u64 idx) {
 }
 
 /*
+ * Find the first free (zero) bit at or above `start`, scanning to the end
+ * of the bitmap.  Returns the page index, or 0 if the range has none.
+ * Word-at-a-time: one load + ctz per candidate word instead of one load
+ * per bit.  Page index 0 is never returned.
+ */
+static u64 bitmap_find_free_bit(u64 start) {
+    u64 total  = s_total_pages;
+    u64 nwords = (total + 63) / 64;
+    u64 first  = start / 64;
+    u64 bit0   = start % 64;
+
+    for (u64 w = first; w < nwords; w++) {
+        u64 free = ~s_bitmap[w];
+        if (w == first)
+            free &= ~((1ULL << bit0) - 1); /* skip bits below start */
+        if (free != 0) {
+            u64 idx = w * 64 + (u64)__builtin_ctzll(free);
+            if (idx < total && idx != 0)
+                return idx;
+        }
+    }
+    return 0;
+}
+
+/*
  * Find the first contiguous run of `count` free (zero) bits in the bitmap.
  * Returns the starting page index, or 0 if not found.
  * Page index 0 is never returned (physical page 0 is never allocated).
@@ -60,6 +85,21 @@ static u64 bitmap_find_free(u64 count) {
     }
 
     u64 total = s_total_pages;
+
+    /* Fast path for single-page allocations (the common case: page
+     * faults, malloc heap growth, process creation): word-at-a-time
+     * scan from the next-fit hint, wrapping to page 1 if needed. */
+    if (count == 1) {
+        u64 idx = bitmap_find_free_bit(s_next_hint);
+        if (idx == 0 && s_next_hint > 1)
+            idx = bitmap_find_free_bit(1);
+        if (idx != 0) {
+            s_next_hint = idx + 1;
+            if (s_next_hint >= total)
+                s_next_hint = 1;
+        }
+        return idx;
+    }
 
     /* Scan twice: from the hint to the end, then wrap to the start.
      * This keeps the next-fit locality without ever missing a free

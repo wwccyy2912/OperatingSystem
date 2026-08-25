@@ -927,10 +927,13 @@ static int execute(char *line) {
         if (is_path_cmd && argc >= 2) {
             for (int i = 1; i < argc && n < 2; i++) {
                 /* Skip mv's optional 3rd arg (new name) — it is not a
-                 * path.  bm_create's 2nd arg is an access mode. */
+                 * path.  bm_create's 2nd arg is an access mode.  tee's
+                 * 2nd arg is the TEXT to write, never a path. */
                 if (strcmp(argv[0], "mv") == 0 && i >= 3)
                     break;
                 if (strcmp(argv[0], "bm_create") == 0 && i >= 2)
+                    break;
+                if (strcmp(argv[0], "tee") == 0 && i >= 2)
                     break;
                 if (argv[i][0] != '/' && argv[i][0] != '\0') {
                     if (shell_resolve_path(argv[i], pbuf[n], sizeof(pbuf[n])) == 0) {

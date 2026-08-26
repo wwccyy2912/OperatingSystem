@@ -28,6 +28,7 @@ extern char term_elf_start[], term_elf_end[], term_elf_size[];
 extern char shell_elf_start[], shell_elf_end[], shell_elf_size[];
 extern char flaky_elf_start[], flaky_elf_end[], flaky_elf_size[];
 extern char crashpeer_elf_start[], crashpeer_elf_end[], crashpeer_elf_size[];
+extern char canarytest_elf_start[], canarytest_elf_end[], canarytest_elf_size[];
 extern char vfs_elf_start[], vfs_elf_end[], vfs_elf_size[];
 extern char fs_mem_driver_elf_start[], fs_mem_driver_elf_end[], fs_mem_driver_elf_size[];
 extern char fs_virtio_blk_driver_elf_start[], fs_virtio_blk_driver_elf_end[],
@@ -65,6 +66,7 @@ void blob_init(void) {
     BLOB_REG("shell", shell_elf_start, (u64)shell_elf_size);
     BLOB_REG("flaky", flaky_elf_start, (u64)flaky_elf_size);
     BLOB_REG("crashpeer", crashpeer_elf_start, (u64)crashpeer_elf_size);
+    BLOB_REG("canarytest", canarytest_elf_start, (u64)canarytest_elf_size);
     BLOB_REG("hello", hello_elf_start, (u64)hello_elf_size);
     BLOB_REG("vfs", vfs_elf_start, (u64)vfs_elf_size);
     BLOB_REG("fs_mem_driver", fs_mem_driver_elf_start, (u64)fs_mem_driver_elf_size);

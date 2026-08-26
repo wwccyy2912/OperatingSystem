@@ -116,6 +116,7 @@ USER_C := \
     user/services/term/term.c \
     user/services/flaky/main.c \
     user/services/crashpeer/main.c \
+    user/services/canarytest/main.c \
     user/services/hello/main.c \
     user/services/vfs/vfs_server.c \
     user/services/vfs/fs_mem_driver.c \
@@ -166,6 +167,7 @@ USER_SVC_ENTRY_OBJ := \
     build/user/services/shell/shell.c.o \
     build/user/services/flaky/main.c.o \
     build/user/services/crashpeer/main.c.o \
+    build/user/services/canarytest/main.c.o \
     build/user/services/hello/main.c.o \
     build/user/services/vfs/vfs_server.c.o \
     build/user/services/vfs/fs_mem_driver.c.o \
@@ -183,7 +185,7 @@ USER_SVC_ENTRY_OBJ := \
     build/user/services/policy/main.c.o
 USER_SHARED_OBJ := $(filter-out $(USER_SVC_ENTRY_OBJ), $(USER_OBJ))
 
-SVC_NAMES := init manager serial keyboard term shell flaky crashpeer hello vfs fs_mem_driver fs_virtio_blk_driver perm device_mgr pkg sbox_demo runtime_demo tui_demo window_demo user wm wm_demo policy
+SVC_NAMES := init manager serial keyboard term shell flaky crashpeer canarytest hello vfs fs_mem_driver fs_virtio_blk_driver perm device_mgr pkg sbox_demo runtime_demo tui_demo window_demo user wm wm_demo policy
 SVC_BLOBS := $(addprefix build/, $(addsuffix _blob.o, $(SVC_NAMES)))
 
 # ==============================================================================
@@ -248,6 +250,7 @@ $(eval $(call SVC_LINK_RULE,term,term/term.c.o))
 $(eval $(call SVC_LINK_RULE,shell,shell/shell.c.o))
 $(eval $(call SVC_LINK_RULE,flaky,flaky/main.c.o))
 $(eval $(call SVC_LINK_RULE,crashpeer,crashpeer/main.c.o))
+$(eval $(call SVC_LINK_RULE,canarytest,canarytest/main.c.o))
 $(eval $(call SVC_LINK_RULE,hello,hello/main.c.o))
 $(eval $(call SVC_LINK_RULE,vfs,vfs/vfs_server.c.o))
 $(eval $(call SVC_LINK_RULE,fs_mem_driver,vfs/fs_mem_driver.c.o))

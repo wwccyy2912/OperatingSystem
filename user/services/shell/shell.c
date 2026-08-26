@@ -143,6 +143,7 @@ static int cmd_policy_dump(int argc, char *argv[]);
 static int user_call(const void *req, int req_len, void *resp, int resp_len);
 static int cmd_cd(int argc, char *argv[]);
 static int cmd_pwd(int argc, char *argv[]);
+static int cmd_scroll(int argc, char *argv[]);
 static int cmd_shutdown(int argc, char *argv[]);
 static int cmd_bm(int argc, char *argv[]);
 static int cmd_perm(int argc, char *argv[]);
@@ -1188,6 +1189,44 @@ static int cmd_pwd(int argc, char *argv[]) {
     (void)argv;
     shell_write(s_cwd);
     shell_write("\n");
+    return 0;
+}
+
+/* scroll [lines|end] — page the terminal view through the term's
+ * scrollback buffer (v0.7 Track 4).  Positive delta pages back (older
+ * lines), negative forward; "end" or 0 returns to the live screen.
+ * The next shell output (a write to the term) resets the view. */
+static int cmd_scroll(int argc, char *argv[]) {
+    if (s_term_port < 0) {
+        shell_write("scroll: terminal unavailable\n");
+        return -1;
+    }
+    /* Default (no arg): page back one screen (~20 lines). */
+    i32 delta = 20;
+    if (argc >= 2) {
+        if (strcmp(argv[1], "end") == 0)
+            delta = 0;
+        else {
+            char *end = NULL;
+            long  v   = strtol(argv[1], &end, 10);
+            if (!end || *end != '\0') {
+                shell_write("scroll: invalid line count (use a number or 'end')\n");
+                return -1;
+            }
+            delta = (i32)v;
+        }
+    }
+    u32 req[3];
+    req[0] = 10; /* TERM_OP_SCROLLVIEW */
+    req[1] = 4;
+    req[2] = (u32)delta;
+    int resp_len = 8;
+    u8  resp[8];
+    int r = ipc_call(s_term_port, req, 12, resp, &resp_len);
+    if (r < 0 || (i32)((u32 *)resp)[0] < 0) {
+        shell_write("scroll: term op failed\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -2674,6 +2713,9 @@ static void shell_main(void *arg) {
     shell_register_command("policy", "Cmd policy: policy <set|dump> ...", cmd_policy);
     shell_register_command("cd", "Change directory: cd [dir]", cmd_cd);
     shell_register_command("pwd", "Print working directory", cmd_pwd);
+    shell_register_command("scroll",
+                           "Page through terminal scrollback: scroll [lines] | scroll end",
+                           cmd_scroll);
     shell_register_command("fm", "TUI file manager (j/k Enter v d q)", cmd_fm);
 
     /* v0.5: load the command policy filter (rescue list on failure). */

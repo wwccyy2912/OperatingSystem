@@ -97,6 +97,9 @@
  * spec minimum and must NOT be assumed. */
 #define VQ_MAX_NUM    256
 #define VQ_POLL_LIMIT 10000000ULL
+/* Retry window (after the first window expires): 4x longer, giving a
+ * host-scheduling spike time to drain before we declare a timeout. */
+#define VQ_POLL_LIMIT_RETRY (4ULL * VQ_POLL_LIMIT)
 
 /* Descriptor table entries (16 bytes each, at offset 0) */
 typedef struct {
@@ -406,14 +409,31 @@ static error_t blk_io_one(u64 disk, bool is_write, u64 sector, u32 nsectors, voi
 
     io_outw(s_io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
-    /* Bounded poll: QEMU completes a 7-sector request in microseconds.
-     * used->idx is written by the DEVICE (DMA), so it must be re-read
-     * every iteration — the compiler barrier defeats hoisting of the
-     * plain (non-volatile) memory load out of the loop. */
+    /* Bounded poll with a retry window: QEMU completes a 7-sector
+     * request in microseconds, but a host-scheduling spike (e.g. the
+     * smoke suite running QEMU under load) can delay the virtio-blk
+     * thread past the first window.  used->idx is written by the
+     * DEVICE (DMA), so it must be re-read every iteration — the
+     * compiler barrier defeats hoisting of the plain (non-volatile)
+     * memory load out of the loop.  Only after BOTH windows do we give
+     * up and reset — an immediate reset would abort a request the
+     * device was about to complete. */
     u64 spins = 0;
+    u64 limit  = VQ_POLL_LIMIT;
     while (used->idx == s_last_used) {
         __asm__ volatile("" ::: "memory");
-        if (++spins >= VQ_POLL_LIMIT) {
+        if (++spins >= limit) {
+            if (limit == VQ_POLL_LIMIT) {
+                /* First window expired: re-kick the queue (the device
+                 * may have missed the notify under host load) and wait
+                 * a second, longer window before declaring a timeout. */
+                limit = VQ_POLL_LIMIT_RETRY;
+                spins = 0;
+                serial_puts("blk: I/O slow (retry window)\n");
+                io_outw(s_io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
+                continue;
+            }
+            /* Both windows expired: the device is wedged. */
             spin_unlock(&s_vq_lock);
             blk_virtio_reset(s_io_base);
             s_initialized = false; /* re-negotiate on the next call */

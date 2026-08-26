@@ -82,6 +82,7 @@ typedef int32_t  i32;
 #define TERM_OP_GET_CURSOR  7 /* query cursor position */
 #define TERM_OP_SNAPSHOT    8 /* save a cell region: {x,y,w,h} -> cells[] */
 #define TERM_OP_RESTORE     9 /* redraw a saved cell region: {x,y,w,h,cells} */
+#define TERM_OP_SCROLLVIEW  10 /* {i32 delta}: page through scrollback */
 
 #define TERM_MAX_DATA 256 /* max payload bytes per request */
 
@@ -161,6 +162,17 @@ static u8  s_cells[TERM_MAX_ROWS][TERM_MAX_COLS]; /* screen buffer */
 static u32 s_cursor_x;                            /* cell coordinates              */
 static u32 s_cursor_y;
 static int s_render_lock = -1; /* mutex: term loop ⇄ perm.ui     */
+
+/* ---- Scrollback ring (v0.7 Track 4) ----
+ * Rows scrolled off the top are saved here so the user can page back
+ * through history (TERM_OP_SCROLLVIEW).  s_sb_view is the look-back
+ * depth: 0 = live screen; when > 0 the display shows scrollback rows
+ * ending (s_sb_next - s_sb_view).  Any WRITE resets the view to live. */
+#define SCROLLBACK_ROWS 200
+static u8  s_sb[SCROLLBACK_ROWS][TERM_MAX_COLS];
+static u32 s_sb_next;   /* next ring slot to write */
+static u32 s_sb_count;  /* rows accumulated so far */
+static u32 s_sb_view;   /* look-back depth (0 = live) */
 
 /* ====================================================================
  * Color helpers (mirror of kernel rgb_to_vga_attr)
@@ -315,6 +327,12 @@ static void term_erase_cursor(void) {
  * the new bottom row is cleared with the background color.
  */
 static void term_scroll(void) {
+    /* Preserve the row being scrolled off into the scrollback ring. */
+    memcpy(s_sb[s_sb_next], s_cells[0], s_cols);
+    s_sb_next = (s_sb_next + 1) % SCROLLBACK_ROWS;
+    if (s_sb_count < SCROLLBACK_ROWS)
+        s_sb_count++;
+
     /* Shift the character buffer up by one row */
     for (u32 r = 1; r < s_rows; r++)
         memcpy(s_cells[r - 1], s_cells[r], s_cols);
@@ -403,7 +421,37 @@ static void term_putc(char ch) {
  * output.  The mirror is therefore compiled out by default; define
  * TERM_DEBUG_SERIAL_MIRROR to re-enable it for debugging only.
  */
+/* Redraw every live row from s_cells to the framebuffer (used to leave
+ * the scrollback view). */
+static void term_redraw_screen(void) {
+    for (u32 r = 0; r < s_rows; r++)
+        for (u32 c = 0; c < s_cols; c++)
+            term_draw_cell(c, r, s_cells[r][c], TERM_FG, TERM_BG);
+}
+
+/* Render the scrollback view: display the `view` most-recent scrollback
+ * rows, oldest first, filling the screen.  The live s_cells buffer is
+ * NOT touched — a later write resets the view and redraws live. */
+static void term_show_scrollback(u32 view) {
+    for (u32 r = 0; r < s_rows; r++) {
+        for (u32 c = 0; c < s_cols; c++) {
+            u8 ch = ' ';
+            if (view + r <= s_sb_count) {
+                u32 idx = (s_sb_next + r - view + SCROLLBACK_ROWS) % SCROLLBACK_ROWS;
+                if (idx < SCROLLBACK_ROWS)
+                    ch = s_sb[idx][c];
+            }
+            term_draw_cell(c, r, ch, TERM_FG, TERM_BG);
+        }
+    }
+}
+
 static i32 term_write(const u8 *data, u32 len) {
+    if (s_sb_view != 0) {
+        /* Any write while paging through history returns to live. */
+        s_sb_view = 0;
+        term_redraw_screen();
+    }
 #ifdef TERM_DEBUG_SERIAL_MIRROR
     /* Debug-only mirror to the kernel serial log (COM1).  Disabled by
      * default to avoid racing the user-space serial service. */
@@ -820,6 +868,38 @@ static void term_handle_request(int token, int msg_len) {
                 s_cells[y + r][x + c] = ch;
                 term_draw_cell(x + c, y + r, ch, TERM_FG, TERM_BG);
             }
+        if (s_render_lock >= 0)
+            (void)mutex_unlock(s_render_lock);
+        term_reply(token, 0);
+    } else if (req->op == TERM_OP_SCROLLVIEW) {
+        /* SCROLLVIEW: {i32 delta}.  delta > 0 pages back (older),
+         * delta < 0 pages forward, delta == 0 returns to live. */
+        if (req->len < 4) {
+            term_reply(token, ERR_INVAL);
+            return;
+        }
+        i32 delta = (i32)((u32 *)req->data)[0];
+        /* Clamp to the scrollback depth so the arithmetic cannot
+         * overflow (s_sb_view <= SCROLLBACK_ROWS). */
+        if (delta > (i32)SCROLLBACK_ROWS)
+            delta = (i32)SCROLLBACK_ROWS;
+        if (delta < -(i32)SCROLLBACK_ROWS)
+            delta = -(i32)SCROLLBACK_ROWS;
+        if (s_render_lock >= 0)
+            (void)mutex_lock(s_render_lock);
+        if (delta == 0) {
+            s_sb_view = 0;
+            term_redraw_screen();
+        } else if (delta < 0) {
+            u32 back = (u32)(-delta);
+            s_sb_view = (back >= s_sb_view) ? 0 : s_sb_view - back;
+            term_show_scrollback(s_sb_view);
+        } else {
+            s_sb_view += (u32)delta;
+            if (s_sb_view > s_sb_count)
+                s_sb_view = s_sb_count;
+            term_show_scrollback(s_sb_view);
+        }
         if (s_render_lock >= 0)
             (void)mutex_unlock(s_render_lock);
         term_reply(token, 0);

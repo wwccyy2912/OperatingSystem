@@ -646,6 +646,33 @@ static void test_ipc_peer_death(void) {
     PASS();
 }
 
+/*
+ * Stack-canary self-test (v0.7 Track 3): spawn the canarytest blob,
+ * which deliberately overflows its stack.  GCC's -fstack-protector-
+ * strong epilogue must catch it and __stack_chk_fail() must exit the
+ * process with 128+SIGABRT = 134 (after logging "STACK SMASHING
+ * DETECTED" to the debug log — asserted by the smoke suite's serial
+ * anchor).  If the protector is ever disabled or broken, the process
+ * dies with a different code (or runs off into garbage) and this
+ * assertion fails.
+ */
+static void test_stack_canary(void) {
+    TEST("user stack canary fires on overflow");
+    static char blob[262144]; /* must hold canarytest.elf */
+    int size = blob_get("canarytest", blob, sizeof(blob));
+    ASSERT(size > 0, "blob_get(canarytest) failed");
+
+    int pid = process_create("canarytest", blob, size);
+    ASSERT(pid > 0, "process_create(canarytest) failed");
+
+    int exit_code = 0;
+    int r         = process_wait(pid, &exit_code);
+    ASSERT(r == pid, "process_wait(canarytest) failed");
+    printf("(exit=%d) ", exit_code);
+    ASSERT(exit_code == 128 + 6 /* SIGABRT */, "canary test did not exit 134");
+    PASS();
+}
+
 static void test_set_affinity(void) {
     TEST("set_affinity");
     /* Set affinity of init thread (tid=1) to CPU 0 */
@@ -980,6 +1007,7 @@ static void run_tests(void) {
     test_subject_identity();
     test_ipc_call_err();
     test_ipc_peer_death();
+    test_stack_canary();
     test_set_affinity();
     bench_syscall_100k();
     bench_yield_solo();

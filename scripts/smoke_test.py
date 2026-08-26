@@ -334,7 +334,8 @@ VGA_SCENARIOS = [
 
 # Serial scenarios: no input, wait for service output in serial log.
 SERIAL_ANCHORS = [
-    ("regression classic", r"=== Results: 33/33 passed ==="),  # +FPU/SSE, +IPC peer-death
+    ("regression classic", r"=== Results: 34/34 passed ==="),
+    ("stack canary", r"STACK SMASHING DETECTED: user stack canary mismatch"),  # +FPU/SSE, +IPC peer-death, +stack canary
     ("regression P1",      r"=== P1 Permissions: 10/10 passed ==="),
     # P2 gate/P2V: summaries are now reliable - the sys_debug_log token
     # bucket (kernel/syscall/syscall.c DEBUG_LOG_TICK_BUDGET 512 + bucket

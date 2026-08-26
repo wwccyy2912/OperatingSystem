@@ -390,3 +390,14 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **排障记录**：4 层根因——帧写错位置（线程结构≠内核栈）、上下文切换破坏 swapgs 配对、wrmsr 在 pops 后冲掉 RAX 返回值——逐一修复 | ✅ |
 | 全量冒烟（--drive）：65 项 OK，0 FAIL | ✅ |
 | `make iso` 0 警告 | ✅ |
+
+### 第九轮补充 1（2026-08-25）：v0.7 Track 2/3/4
+
+| 项 | 结果 |
+|---|---|
+| **Track 2 — virtio-blk DMA 超时重试**：轮询分两窗——首窗(10M spins)超时后重新 kick 队列 + 更长窗口(40M spins)再判定;两次窗口均超时才 reset + ERR_AGAIN(宿主调度尖峰不再误伤即将完成的请求) | ✅ 0 警告 |
+| **Track 3 — 栈保护 canary 自检**：新增 canarytest 服务(故意溢出栈缓冲触发 canary);init 套件新增 test_stack_canary(process_wait 断言退出码 134);冒烟新增 `STACK SMASHING DETECTED` 串口锚点 | ✅ 经典 33→34/34,冒烟 65→66 |
+| **Track 4 — term 滚动历史**：term 环形滚动缓冲(200 行,term_scroll 保存顶行);TERM_OP_SCROLLVIEW(10) 翻页视图(正=后翻/负=前翻/0=回实时,任意写自动复位);shell 新增 `scroll [lines\|end]` 命令 | ✅ QEMU 验证翻页显示早期启动横幅 |
+| **排障**：canary 自检 3 层修正——process_wait 需先注册等待(0.5s 延迟)、越界 64B 写穿 1 页栈(改 24B 只覆盖 canary 槽)、process_wait 返回 PID 非 0(断言修正);P3 假失败为无磁盘测试环境(manager 等 virtio-blk 端口)非回归 | ✅ |
+| 全量冒烟（--drive）：66 项 OK，0 FAIL | ✅ |
+| `make iso` 0 警告 | ✅ |

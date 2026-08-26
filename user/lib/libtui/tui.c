@@ -390,6 +390,10 @@ int tui_input_line(int x, int y, const char *prompt, char *buf, int maxlen, int 
         for (int i = 0; i < pos && d < (int)sizeof(disp) - 2; i++)
             disp[d++] = mask ? '*' : buf[i];
         disp[d++] = '_'; /* cursor */
+        /* Pad to the saved row width so a shorter frame (e.g. after
+         * backspace) erases the tail instead of leaving residue. */
+        while (d < (int)rw && d < (int)sizeof(disp) - 1)
+            disp[d++] = ' ';
         disp[d]   = '\0';
         tui_render_line_at(x, y, disp, (u32)d);
         tui_set_cursor((u32)(x + d), (u32)y);

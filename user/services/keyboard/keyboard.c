@@ -288,7 +288,9 @@ static void kbd_decode_byte(u8 sc) {
         switch (sc) {
         case 0x48: ch = 0x0B; break; /* Up    -> VT   */
         case 0x50: ch = 0x0C; break; /* Down  -> FF   */
-        case 0x4B: ch = 0x08; break; /* Left  -> BS   */
+        case 0x4B: ch = 0x10; break; /* Left  -> DLE (NOT 0x08: that is
+                                      * Backspace's code — the shell line
+                                      * editor must tell them apart) */
         case 0x4D: ch = 0x14; break; /* Right -> DC4  */
         case 0x47: ch = 0x01; break; /* Home  -> SOH  */
         case 0x4F: ch = 0x05; break; /* End   -> ENQ  */

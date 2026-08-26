@@ -725,6 +725,12 @@ static int read_line_impl(char *buf, int maxlen, int mask) {
     u32 req[2 + 1];  /* { op; len }        */
     u32 resp[1 + 8]; /* { ret; data[32] }  */
 
+    /* The caller's buffer is reused across commands (shell_loop's
+     * `line`): start NUL-terminated and keep it that way after every
+     * edit, or a short second command would carry the tail of the
+     * previous one ("w" typed after "xyz" becoming "wxyz"). */
+    buf[0] = '\0';
+
     for (;;) {
         req[0]       = KBD_OP_READ_BLOCK;
         req[1]       = KBD_CHUNK;
@@ -765,14 +771,28 @@ static int read_line_impl(char *buf, int maxlen, int mask) {
                 }
                 shell_write("\r\n");
                 s_hist_view = -1; /* back to live editing */
-                buf[pos] = '\0';
-                return pos;
+                /* Commit the FULL buffer: never NUL-cut at the cursor
+                 * (pos) — after a mid-line insert/delete pos != strlen,
+                 * and truncating there would chop the tail off the
+                 * recalled/edited command.  The buffer is already
+                 * NUL-terminated at its true end. */
+                return (int)strlen(buf);
 
             case '\b':
-            case 0x7F: /* DEL */
+            case 0x7F: /* DEL — Backspace */
                 if (pos > 0) {
                     pos--;
-                    shell_write("\b \b"); /* erase on screen */
+                    if (pos < (int)strlen(buf)) {
+                        /* Deleting in the middle: shift the tail left
+                         * and redraw (a bare "\b \b" would leave the
+                         * rest of the line out of place). */
+                        for (int k = pos; buf[k] != '\0'; k++)
+                            buf[k] = buf[k + 1];
+                        shell_redraw_line(buf, pos);
+                    } else {
+                        shell_write("\b \b"); /* erase at end of line */
+                        buf[pos] = '\0';
+                    }
                 }
                 break;
 
@@ -867,6 +887,13 @@ static int read_line_impl(char *buf, int maxlen, int mask) {
                 }
                 break;
 
+            case 0x10: /* Left arrow (DLE) — move cursor left */
+                if (pos > 0) {
+                    pos--;
+                    shell_redraw_line(buf, pos);
+                }
+                break;
+
             case 0x14: /* Right arrow (DC4) — move cursor right */
                 if (pos < (int)strlen(buf)) {
                     pos++;
@@ -876,11 +903,25 @@ static int read_line_impl(char *buf, int maxlen, int mask) {
 
             default:
                 if (ch >= ' ' && ch < 0x7F) {
-                    if (pos < maxlen - 1) {
-                        buf[pos++] = (char)ch;
-                        /* The function name is the mask flag: echo '*'
-                         * for passwords, the char itself otherwise. */
-                        shell_putc(mask ? '*' : (char)ch);
+                    int l = (int)strlen(buf);
+                    if (pos < maxlen - 1 && pos <= l) {
+                        if (pos < l) {
+                            /* Insert in the middle: shift the tail right
+                             * and redraw — a bare echo would OVERWRITE
+                             * the following characters (the v1.3 "can't
+                             * edit a recalled command" bug). */
+                            for (int k = l + 1; k > pos; k--)
+                                buf[k] = buf[k - 1];
+                            buf[pos] = (char)ch;
+                            pos++;
+                            shell_redraw_line(buf, pos);
+                        } else {
+                            buf[pos++] = (char)ch;
+                            /* The function name is the mask flag: echo '*'
+                             * for passwords, the char itself otherwise. */
+                            shell_putc(mask ? '*' : (char)ch);
+                        }
+                        buf[pos] = '\0';
                     }
                     /* else: buffer full, silently ignore */
                 }
@@ -1140,33 +1181,85 @@ static int cmd_env(int argc, char *argv[]) {
 /*  cd / pwd (v0.5)                                                   */
 /* ------------------------------------------------------------------ */
 
+/* Normalize an ABSOLUTE path in place: collapse "//", drop "." and
+ * resolve ".." segments (clamped at the root).  "cd .." from "/Disk/d1"
+ * yields "/Disk", "cd ." stays put.  The result never ends in '/' except
+ * for the root itself.  Writes into out (LINE_BUF_SIZE). */
+static void path_normalize(const char *in, char *out, size_t outsz) {
+    enum { PN_MAX_DEPTH = 24, PN_SEG_MAX = 64 };
+    static char segs[PN_MAX_DEPTH][PN_SEG_MAX];
+    int         n = 0;
+
+    const char *p = in;
+    while (*p) {
+        while (*p == '/')
+            p++;
+        if (!*p)
+            break;
+        const char *start = p;
+        while (*p && *p != '/')
+            p++;
+        int len = (int)(p - start);
+        if (len == 1 && start[0] == '.')
+            continue; /* ".": stay */
+        if (len == 2 && start[0] == '.' && start[1] == '.') {
+            if (n > 0)
+                n--; /* "..": up one level (clamped at root) */
+            continue;
+        }
+        if (n < PN_MAX_DEPTH && len < PN_SEG_MAX) {
+            memcpy(segs[n], start, (size_t)len);
+            segs[n][len] = '\0';
+            n++;
+        }
+    }
+
+    size_t o = 0;
+    if (n == 0) {
+        out[0] = '/';
+        out[1] = '\0';
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        size_t sl = strlen(segs[i]);
+        if (o + sl + 2 > outsz) /* '/' + seg + NUL won't fit: truncate */
+            break;
+        out[o++] = '/';
+        memcpy(out + o, segs[i], sl);
+        o += sl;
+    }
+    out[o] = '\0';
+}
+
 /* Resolve a user-supplied path against s_cwd into a canonical URL.
  *   - "/" or empty  -> s_cwd itself (volume-list view)
- *   - starting with "/" -> absolute, used as-is (normalize //)
+ *   - starting with "/" -> absolute path
  *   - otherwise -> s_cwd + "/" + path (relative)
+ * Every result is normalized (".", "..", "//" resolved) — so "cd ..",
+ * "cd .", "ls ../x", "cd /Disk/d1/.." all behave like a real shell.
  * Writes into out (LINE_BUF_SIZE).  Returns 0 on success. */
 static int shell_resolve_path(const char *path, char *out, size_t outsz) {
+    char raw[LINE_BUF_SIZE];
     if (!path || path[0] == '\0') {
-        strncpy(out, s_cwd, outsz - 1);
-        out[outsz - 1] = '\0';
-        return 0;
-    }
-    if (path[0] == '/') {
-        strncpy(out, path, outsz - 1);
-        out[outsz - 1] = '\0';
-        return 0;
-    }
-    /* Relative: compose s_cwd + "/" + path.  s_cwd "/" -> "/" + path. */
-    int need = (int)strlen(s_cwd) + 1 + (int)strlen(path) + 1;
-    if ((size_t)need > outsz) {
-        shell_printf("path: too long\n");
-        return -1;
-    }
-    if (strcmp(s_cwd, "/") == 0) {
-        snprintf(out, outsz, "/%s", path);
+        strncpy(raw, s_cwd, sizeof(raw) - 1);
+        raw[sizeof(raw) - 1] = '\0';
+    } else if (path[0] == '/') {
+        strncpy(raw, path, sizeof(raw) - 1);
+        raw[sizeof(raw) - 1] = '\0';
     } else {
-        snprintf(out, outsz, "%s/%s", s_cwd, path);
+        /* Relative: compose s_cwd + "/" + path. */
+        int need = (int)strlen(s_cwd) + 1 + (int)strlen(path) + 1;
+        if ((size_t)need > (int)sizeof(raw)) {
+            shell_printf("path: too long\n");
+            return -1;
+        }
+        if (strcmp(s_cwd, "/") == 0) {
+            snprintf(raw, sizeof(raw), "/%s", path);
+        } else {
+            snprintf(raw, sizeof(raw), "%s/%s", s_cwd, path);
+        }
     }
+    path_normalize(raw, out, outsz);
     return 0;
 }
 
@@ -1732,13 +1825,47 @@ static int cmd_pid(int argc, char *argv[]) {
  */
 static int cmd_exec(int argc, char *argv[]) {
     const char *name = (argc > 1) ? argv[1] : "hello";
-    static char blob_buf[262144]; /* must hold the largest demo ELF */
-    int         size = blob_get(name, blob_buf, sizeof(blob_buf));
-    if (size < 0) {
-        shell_printf("exec: blob_get(%s) FAILED (%d)\n", name, size);
-        return 1;
+    static char blob_buf[262144]; /* must hold the largest ELF */
+    int         size;
+
+    if (strchr(name, '/') != NULL || name[0] == '.') {
+        /* Path argument: run an ELF FILE from the VFS (e.g. exec /Disk/
+         * app.elf or exec ./app.elf in the cwd).  Read it in full, then
+         * spawn it like an embedded blob. */
+        char url[LINE_BUF_SIZE];
+        if (shell_resolve_path(name, url, sizeof(url)) < 0)
+            return 1;
+        vfs_handle_t h;
+        int          r = fs_open_item(url, VFS_OPEN_READONLY, VFS_ACCESS_READ, &h);
+        if (r < 0) {
+            shell_printf("exec: open %s FAILED (%d)\n", url, r);
+            return 1;
+        }
+        size = 0;
+        for (;;) {
+            u32 got = 0;
+            r       = fs_read(h, (u64)size, blob_buf + size, (u32)(sizeof(blob_buf) - (u64)size), &got);
+            if (r < 0 || got == 0)
+                break;
+            size += (int)got;
+        }
+        fs_close(h);
+        if (size <= 0) {
+            shell_printf("exec: %s is empty or unreadable\n", url);
+            return 1;
+        }
+        /* Process name = basename of the path. */
+        const char *base = strrchr(url, '/');
+        name             = base ? base + 1 : url;
+        shell_printf("exec: read %s (%d bytes)\n", url, size);
+    } else {
+        size = blob_get(name, blob_buf, sizeof(blob_buf));
+        if (size < 0) {
+            shell_printf("exec: blob_get(%s) FAILED (%d)\n", name, size);
+            return 1;
+        }
+        shell_printf("exec: fetched %s.elf blob from kernel (%d bytes)\n", name, size);
     }
-    shell_printf("exec: fetched %s.elf blob from kernel (%d bytes)\n", name, size);
     int pid = process_create(name, blob_buf, size);
     if (pid < 0) {
         shell_printf("exec: FAILED (%d)\n", pid);

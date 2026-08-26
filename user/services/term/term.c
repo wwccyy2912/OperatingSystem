@@ -627,6 +627,16 @@ static void term_render_box(u32 x, u32 y, u32 w, u32 h, const char *title) {
         term_draw_cell(x + w - 1, y + h - 1, '+', TERM_FG, TERM_BG);
     }
 
+    /* Blank the box interior.  A menu/dialog is redrawn on every key
+     * (tui_menu) and its item lines are shorter than the box width, so
+     * WITHOUT this the residue of a longer previous frame stays visible
+     * inside the box (the fm "字符覆盖" bug).  The caller snapshots the
+     * region first, so restoring after the dialog still brings the old
+     * content back intact. */
+    for (u32 r = 1; r + 1 < h; r++)
+        for (u32 c = 1; c + 1 < w; c++)
+            term_draw_cell(x + c, y + r, ' ', TERM_FG, TERM_BG);
+
     /* Title bar (if provided) */
     if (title && h > 2) {
         u32 tlen = 0;

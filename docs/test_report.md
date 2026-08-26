@@ -423,3 +423,13 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **问题**：init P1 测试5/6 的 Powerbox 查询被测试代码自动 ANSWER，但 UI_SHOW 面板仍会闪现 1-2 秒；用户在面板期间按的 `y` 落入 RX ring/shell 行缓冲 → `opsys:/$ y`，且测试6 的自动 deny 让用户误以为"按 y 无效、权限被禁用" | ✅ |
 | **修复**：perm 服务新增管理面开关 `PERM_OP_SET_QUIET`（门禁 ATOM_SERVICE_MANAGE）：quiet=1 时查询照常创建/应答（QUERY/ANSWER 语义不变），但 do_check 默认拒绝路径与 do_answer 均**不再推送 UI_SHOW**；init 的 `run_p1_perm_tests` 前后 `p1_set_quiet(1/0)` 包裹 | ✅ |
 | 验证：boot 无权限面板、无 splash、`echo hello` 干净回显（无 y 泄漏）；P1 10/10 + 34/34 通过；真实 Powerbox 面板仍正常（tee → -105 → 面板 → y → 重试成功） | ✅ |
+
+### 第十轮补充 3（2026-08-26）：cd .. / fm 残留 / 历史编辑 / exec 磁盘文件
+
+| 项 | 结果 |
+|---|---|
+| **⑦b cd .. / cd .**：`shell_resolve_path` 增加 `path_normalize`（绝对路径规范化：合并 `//`、丢弃 `.`、解析 `..` 并钳制在根）——`cd ..`、`cd .`、`cd ../Users`、`ls ../x` 等相对父目录路径全部可用 | ✅ QEMU 验证 cd /Disk → cd .. → /；cd . 保持；cd ../Users → /Users |
+| **⑧b fm 字符覆盖**：根因 = `term_render_box` 只画边框不清内部，菜单项变短/滚动后旧文本残留 → 改为画完边框后清空内部区域（保存/恢复机制保证原内容完整还原）；`tui_input_line` 渲染补空格到固定行宽（退格后行尾无残留） | ✅ fm 打开/移动/退出无残留 |
+| **⑨ 历史命令编辑**：三重根因——(a) extended Left 键映射 0x08 与 Backspace 冲突（按 Left 变删除）→ 改为 0x10 (DLE)；(b) 行编辑是覆盖语义，光标在行中时输入覆盖后续字符 → 改为插入（尾部右移 + 整行 redraw），Backspace 支持中间删除；(c) Enter 分支 `buf[pos]='\0'` 在光标不在行尾时截断命令 → 改为提交完整 strlen | ✅ Up 取回 → Left 移动 → 插入 → 执行输出完整 |
+| **⑩ 行缓冲残留（输入串扰根因）**：`read_line_impl` 不清空复用缓冲，短命令后残留上一命令尾部（"xyz" 后输入 "w" 得 "wxyz"）——这同时是此前 "pwdcd"/"sadmin"/"ycat" 类串扰的另一根因 → 开头清空 + 每次编辑后保持 NUL 终止 | ✅ "w" 不再变 "wxyz" |
+| **⑪ exec 运行可执行文件**：`exec <path>` 新增 VFS 磁盘文件分支（含相对路径解析）——读取文件内容后 `process_create` 运行，进程名取 basename；`exec <blob>` 保持内嵌 blob 分支 | ✅ `exec /Disk/runme.txt` 读 5 字节；非 ELF 拒绝 (-2)；`exec hello` 创建 PID |

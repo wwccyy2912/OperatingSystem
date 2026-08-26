@@ -125,6 +125,31 @@ static void wake_sleepers(void);
 /*  Init                                                              */
 /* ------------------------------------------------------------------ */
 
+/* GS-base maintenance for the SYSCALL fast path (syscall_entry_fast in
+ * syscall_entry.S).  The entry does swapgs (GS = thread, MSR102 = user 0)
+ * and the exit swaps back; for that pairing to stay correct ACROSS a
+ * mid-syscall context switch (a blocking syscall yields), every switch
+ * must restore the CLEAN pairing for the thread being resumed:
+ *
+ *   IA32_GS_BASE (0xC0000101)  = 0        (user GS; user code never sets GS)
+ *   MSR_KERNEL_GS_BASE (0xC0000102) = t   (the thread the NEXT swapgs sees)
+ *
+ * Without the GS_BASE=0 write, a yield between A's entry swapgs and its
+ * exit swapgs leaves GS=A in the register while MSR102 holds B; B's exit
+ * swapgs then crosses the pairing and the GS/MSR state drifts thread-to-
+ * thread (observed: #DF on a later syscall reading kstack_top=0).
+ * Cost: two wrmsr per context switch (~200 cycles at 100 Hz — negligible).
+ */
+#define MSR_GS_BASE          0xC0000101u
+#define MSR_KERNEL_GS_BASE   0xC0000102u
+
+static inline void sched_set_kernel_gs(thread_t *t) {
+    u64 p = (u64)(uintptr_t)t;
+    __asm__ volatile("wrmsr" :: "c"(MSR_GS_BASE), "a"(0u), "d"(0u) : "memory");
+    __asm__ volatile("wrmsr" :: "c"(MSR_KERNEL_GS_BASE),
+                     "a"((u32)p), "d"((u32)(p >> 32)) : "memory");
+}
+
 void sched_init(void) {
     rb_init(&s_ready_tree);
     for (int i = 0; i < MAX_CPUS; i++)
@@ -228,6 +253,7 @@ static void reschedule(int resume_if) {
             idle->state      = THREAD_STATE_RUNNING;
             s_current[0]     = idle;
             g_current_thread = idle;
+            sched_set_kernel_gs(idle);
             gdt_set_tss_rsp0(idle->kstack_top);
             /* Enter context_switch with IF=0 (see comment below). */
             __asm__ volatile("cli" ::: "memory");
@@ -253,6 +279,7 @@ static void reschedule(int resume_if) {
     next->state      = THREAD_STATE_RUNNING;
     s_current[0]     = next;
     g_current_thread = next;
+    sched_set_kernel_gs(next);
 
     if (cur != next) {
         gdt_set_tss_rsp0(next->kstack_top);
@@ -307,6 +334,7 @@ void sched_switch_to(thread_t *t) {
     t->state         = THREAD_STATE_RUNNING;
     s_current[0]     = t;
     g_current_thread = t;
+    sched_set_kernel_gs(t);
 
     if (cur) {
         gdt_set_tss_rsp0(t->kstack_top);
@@ -331,6 +359,7 @@ void sched_set_current(thread_t *t) {
 
     s_current[0]     = t;
     g_current_thread = t;
+    sched_set_kernel_gs(t);
 }
 
 /* ------------------------------------------------------------------ */

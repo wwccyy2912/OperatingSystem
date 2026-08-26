@@ -44,6 +44,12 @@ typedef struct thread {
     u64 kstack_base;
     u64 kstack_top;
 
+    /* SYSCALL fast-path entry (syscall_entry.S): the CPU does NOT switch
+     * stacks for SYSCALL, so the entry stashes the USER RSP here
+     * (GS-relative, no scratch register) before loading kstack_top.
+     * The frame is then synthesized at kstack_top-40. */
+    u64 syscall_save_rsp;
+
     /* IPC blocked-on info */
     port_t blocked_port;
 

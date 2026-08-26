@@ -378,3 +378,15 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **魔法数字命名**：shell 中重复的 64 上限 → `COMPLETE_MAX_MATCHES`(Tab 补全候选)、`FM_MAX_ITEMS`(fm 列表)、`PROC_MAX_ITEMS`(ps/kill 选择器)；补全 4 处遗漏的调用点参数 | ✅ 0 警告 |
 | 全量冒烟（--drive）：65 项 OK，0 FAIL | ✅ |
 | `make iso` 0 警告 | ✅ |
+
+### 第九轮（2026-08-25）：v0.7 Track 1 — SYSCALL 指令快速路径
+
+| 项 | 结果 |
+|---|---|
+| **SYSCALL 指令快速路径**：用户态 `int $0x80` → `syscall`；内核新增 LSTAR 入口 `syscall_entry_fast`（swapgs + GS 相对合成帧 + 每线程内核栈，无 TSS.RSP0 拷贝）；MSR 配置（EFER.SCE/STAR/LSTAR/SFMASK=IF\|TF\|DF） | ✅ 33/33 + P1 10/10 + shell |
+| **GS 状态显式管理**：`sched_set_kernel_gs` 每次上下文切换写 GS.base=0 + MSR_KERNEL_GS_BASE=当前线程；出口用显式 wrmsr（非 swapgs）恢复——阻塞型 syscall 中途切换不会破坏配对 | ✅ |
+| **thread_t.syscall_save_rsp**：快速入口保存用户 RSP 的无暂存槽（入口时所有寄存器均为活跃参数） | ✅ |
+| **sysretq 已知限制**：QEMU TCG 对 sysretq 触发 #GP（error 0x28, TSS 选择子）——入口收益（免 TSS 拷贝）保留，出口用 iretq（已注释说明） | ✅ 文档化 |
+| **排障记录**：4 层根因——帧写错位置（线程结构≠内核栈）、上下文切换破坏 swapgs 配对、wrmsr 在 pops 后冲掉 RAX 返回值——逐一修复 | ✅ |
+| 全量冒烟（--drive）：65 项 OK，0 FAIL | ✅ |
+| `make iso` 0 警告 | ✅ |

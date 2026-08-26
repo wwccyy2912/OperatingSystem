@@ -71,14 +71,17 @@
  */
 static inline long sys_call(long num, long a1, long a2, long a3, long a4, long a5) {
     long ret;
-    /* The kernel's INT 0x80 ABI reads args 1-3 from RDI/RSI/RDX and
-     * args 4-5 from R10/R8 (kernel/arch/x86_64/syscall_entry.S:14-15,
-     * 171-172).  Plain "r" constraints let GCC pick any register for
-     * a4/a5, so 5-arg syscalls like ipc_call() could deliver garbage
-     * in arg4/arg5.  Pin the tail args to the exact ABI registers. */
+    /* The kernel's syscall ABI reads args 1-3 from RDI/RSI/RDX and
+     * args 4-5 from R10/R8 (kernel/arch/x86_64/syscall_entry.S:16-17).
+     * Plain "r" constraints let GCC pick any register for a4/a5, so
+     * 5-arg syscalls like ipc_call() could deliver garbage in arg4/arg5.
+     * Pin the tail args to the exact ABI registers.  The SYSCALL
+     * instruction (v0.7 fast path) clobbers RCX (user RIP) and R11
+     * (user RFLAGS) — the same registers INT 0x80 trashed, so the
+     * clobber list is unchanged. */
     register long a4_reg __asm__("r10") = a4;
     register long a5_reg __asm__("r8")  = a5;
-    __asm__ volatile("int $0x80"
+    __asm__ volatile("syscall"
                      : "=a"(ret)
                      : "a"(num), "D"(a1), "S"(a2), "d"(a3), "r"(a4_reg), "r"(a5_reg)
                      : "memory", "rcx", "r11");

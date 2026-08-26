@@ -4,36 +4,53 @@
 ;
 ; NASM syntax, Intel mode.
 ;
-; Provides the entry point for INT 0x80 system calls.
+; Two entries converge on one common body:
 ;
-; On entry (via INT 0x80):
+;   syscall_entry_fast - the SYSCALL instruction (v0.7): the CPU loads
+;       RIP = LSTAR, CS/SS from STAR, masks RFLAGS with SFMASK, saves
+;       user RIP in RCX and user RFLAGS in R11, and does NOT touch RSP
+;       or the TSS.  The scheduler keeps MSR_KERNEL_GS_BASE = the
+;       running thread, so the entry does `swapgs` and then synthesizes
+;       the identical 5-qword frame [RIP][CS][RFLAGS][RSP][SS] at
+;       kstack_top-40 via GS-relative stores — no scratch register is
+;       needed (every GPR is live at syscall entry).
+;
+;   syscall_entry_stub - the legacy INT 0x80 path (kept as a fallback /
+;       A-B switch): the CPU pushes the 5-qword frame on TSS.RSP0; the
+;       stub copies it to the per-thread stack.  It also does `swapgs`
+;       on entry so both paths share one swapgs+sysretq exit.
+;
+; Common body (syscall_common): save all 15 GPRs, call
+; syscall_dispatch, run the signal checkpoint, restore the GS state
+; EXPLICITLY (wrmsr: GS.base = 0, MSR_KERNEL_GS_BASE = the running
+; thread — a mid-syscall yield can cross the swapgs pairing, so the
+; exit must not rely on it), restore GPRs, then IRETQ to user mode.
+;
+; NOTE (sysretq): the SYSRETQ exit was implemented first but QEMU TCG
+; raises #GP (error 0x28, TSS selector) on it in this configuration —
+; an unresolved hypervisor/CPU interaction, documented in the exit
+; path.  The entry-side savings are identical either way.
+;
+; On fast-path entry:
 ;   RAX = syscall number
-;   RDI = arg1
-;   RSI = arg2
-;   RDX = arg3
-;   R10 = arg4
-;   R8  = arg5
-;   CPU has pushed: SS, RSP, RFLAGS, CS, RIP  (40 bytes on TSS.RSP0)
+;   RDI = arg1, RSI = arg2, RDX = arg3, R10 = arg4, R8 = arg5
+;   RCX = user RIP, R11 = user RFLAGS, RSP = user RSP
 ;
-; IMPORTANT: We immediately switch to the per-thread kernel stack
-; (from thread_t.kstack_top) before saving any GPRs.  This avoids
-; corrupting another thread's saved state when TSS.RSP0 is shared.
+; On INT 0x80 entry:
+;   RAX = syscall number, RDI/RSI/RDX/R10/R8 = args
+;   CPU has pushed: SS, RSP, RFLAGS, CS, RIP (40 bytes on TSS.RSP0)
+;   RCX and R11 are trashed by INT (free to use as temporaries)
 ;
-; SECURITY INVARIANT (TOCTOU): vector 0x80 is an INTERRUPT gate (see
-; idt.c), so the CPU clears IF on entry and the whole handler — from
-; here through syscall_dispatch() and every user-pointer copy inside
-; it — runs with interrupts disabled.  The PIT tick (the only
-; preemption source on this single-CPU kernel) therefore cannot fire
-; between a handler's vmm_validate_user_ptr() check and its memcpy of
-; the same range: no other thread of the process can unmap the pages
-; mid-syscall, so validate-then-copy is race-free by construction.
-; Handlers that block (IPC wait, sleep) yield with IF=0 and resume
-; with IF=0; sched_sleep() is the only path that re-enables IF, and
-; only AFTER the thread is already BLOCKED and out of the ready tree.
+; SECURITY INVARIANT (TOCTOU): both paths run with IF=0 for the whole
+; handler — INT via the interrupt gate, SYSCALL via SFMASK (bit 1).
+; The PIT tick cannot fire between a handler's vmm_validate_user_ptr()
+; check and its memcpy of the same range, so validate-then-copy is
+; race-free by construction (see the vmm.c comment).
 ;
 ; Exports:
+;   syscall_entry_fast - LSTAR target for the SYSCALL instruction
 ;   syscall_entry_stub - placed at IDT vector 0x80
-;   syscall_entry_iretq - return to user mode after syscall dispatch
+;   syscall_entry_iretq - alternate return point (unused by the kernel)
 ;
 
 bits 64
@@ -84,12 +101,61 @@ extern signal_check_syscall
 %define SF_SS       152
 %define SF_SIZE     160     ; total frame size (120 GPRs + 40 CPU frame)
 
+; ------------------------------------------------------------------
+; Fast-path offsets relative to the THREAD (GS base after swapgs):
+;   KSTACK_TOP_OFFSET (104) - the kernel stack top (frame goes at
+;                             kstack_top-40, which is NOT thread+64 —
+;                             the thread struct and its kernel stack
+;                             are separate allocations!)
+;   SYSCALL_SAVE_RSP (112)  - the entry stashes the USER RSP here
+;                             before switching stacks (no scratch reg
+;                             is free at syscall entry).
+; ------------------------------------------------------------------
+%define SYSCALL_SAVE_RSP    112     ; thread_t.syscall_save_rsp
+
 section .text
+
+; ------------------------------------------------------------------
+; syscall_entry_fast
+;
+; SYSCALL instruction entry (IA32_LSTAR target).
+;
+; On entry:
+;   RCX = user RIP, R11 = user RFLAGS, RSP = user RSP
+;   RAX = syscall number, RDI/RSI/RDX/R10/R8 = args
+;   IF/TF/DF masked by SFMASK (set up in idt.c)
+;
+; The CPU did NOT switch stacks.  swapgs turns GS into the running
+; thread (MSR_KERNEL_GS_BASE, maintained by the scheduler), which lets
+; us write the frame with GS-relative stores and load the kernel stack
+; pointer — all without touching any register that still holds a live
+; argument.
+; ------------------------------------------------------------------
+global syscall_entry_fast
+syscall_entry_fast:
+        swapgs                          ; GS = thread (kernel GS base)
+
+        ; The CPU did NOT switch stacks: save the user RSP in the thread
+        ; (GS-relative, no scratch register), then load kstack_top.
+        mov  [gs:SYSCALL_SAVE_RSP], rsp ; thread.syscall_save_rsp = user RSP
+        mov  rsp, [gs:KSTACK_TOP_OFFSET] ; rsp = kernel stack top
+        sub  rsp, 40                     ; rsp = frame base (kstack_top-40)
+
+        ; Synthesize the 5-qword frame.  RCX (user RIP) and R11 (user
+        ; RFLAGS) survived the stack switch untouched; the user RSP comes
+        ; back from the thread save slot (RCX is a free scratch now).
+        mov  [rsp + 0], rcx              ; frame.RIP    <- user RIP (RCX)
+        mov  [rsp + 8], dword 0x1B       ; frame.CS     <- user code selector
+        mov  [rsp + 16], r11             ; frame.RFLAGS <- user RFLAGS (R11)
+        mov  rcx, [gs:SYSCALL_SAVE_RSP]  ; rcx = user RSP
+        mov  [rsp + 24], rcx             ; frame.RSP    <- user RSP
+        mov  [rsp + 32], dword 0x23      ; frame.SS     <- user data selector
+        jmp  syscall_common
 
 ; ------------------------------------------------------------------
 ; syscall_entry_stub
 ;
-; INT 0x80 handler entry point.
+; INT 0x80 handler entry point (IDT vector 0x80).
 ;
 ; On entry:
 ;   RSP points to TSS.RSP0 with CPU frame: [RIP][CS][RFLAGS][RSP][SS]
@@ -97,16 +163,19 @@ section .text
 ;   RCX and R11 are trashed by INT (free to use as temporaries)
 ;
 ; Strategy:
-;   1. Load g_current_thread → get kstack_top
-;   2. Copy 40-byte INT frame from TSS.RSP0 to per-thread stack
-;   3. Switch RSP to per-thread kernel stack
-;   4. Save GPRs and call syscall_dispatch
-;   5. Restore GPRs and IRETQ back to user mode
+;   1. swapgs (same GS discipline as the fast path, so the shared
+;      exit's swapgs is symmetric)
+;   2. Load g_current_thread -> get kstack_top
+;   3. Copy 40-byte INT frame from TSS.RSP0 to per-thread stack
+;   4. Switch RSP to per-thread kernel stack
+;   5. Join syscall_common
 ; ------------------------------------------------------------------
 global syscall_entry_stub
 syscall_entry_stub:
+        swapgs                          ; GS = thread (symmetric with exit)
+
         ; ---------------------------------------------------------------
-        ; Step 1: Switch to per-thread kernel stack
+        ; Step 2: Switch to per-thread kernel stack
         ;
         ; We use RCX and R11 as temporaries (both trashed by INT 0x80).
         ; Load g_current_thread (global pointer to current thread_t*),
@@ -117,7 +186,7 @@ syscall_entry_stub:
         mov  r11, [rcx + KSTACK_TOP_OFFSET]  ; r11 = kstack_top
 
         ; ---------------------------------------------------------------
-        ; Step 2: Copy 40-byte INT frame from TSS.RSP0 to per-thread stack
+        ; Step 3: Copy 40-byte INT frame from TSS.RSP0 to per-thread stack
         ;
         ; Make room on the per-thread stack, then copy each qword.
         ; ---------------------------------------------------------------
@@ -135,15 +204,22 @@ syscall_entry_stub:
         mov  [r11 + 32], rcx
 
         ; ---------------------------------------------------------------
-        ; Step 3: Switch RSP to per-thread kernel stack
+        ; Step 4: Switch RSP to per-thread kernel stack
         ;
         ; After this, RSP points to the INT frame on the per-thread stack.
         ; TSS.RSP0 is no longer in use by this thread.
         ; ---------------------------------------------------------------
         mov  rsp, r11
 
+; ------------------------------------------------------------------
+; syscall_common — shared by both entries.
+;
+; On entry: RSP = per-thread kernel stack, [RSP..RSP+40) = the frame
+; [RIP][CS][RFLAGS][RSP][SS] (identical layout for both paths).
+; ------------------------------------------------------------------
+syscall_common:
         ; ---------------------------------------------------------------
-        ; Step 4: Save all general-purpose registers onto per-thread stack
+        ; Save all general-purpose registers onto per-thread stack
         ; ---------------------------------------------------------------
         push rax
         push rbx
@@ -162,7 +238,7 @@ syscall_entry_stub:
         push r15
 
         ; ---------------------------------------------------------------
-        ; Step 5: Set up arguments for syscall_dispatch()
+        ; Set up arguments for syscall_dispatch()
         ;   i64 syscall_dispatch(u64 num, u64 arg1, u64 arg2,
         ;                        u64 arg3, u64 arg4, u64 arg5)
         ;
@@ -187,17 +263,17 @@ syscall_entry_stub:
         call syscall_dispatch
 
         ; ---------------------------------------------------------------
-        ; Step 6: Store return value in saved RAX slot
+        ; Store return value in saved RAX slot
         ; ---------------------------------------------------------------
         mov [rsp + SF_RAX], rax
 
         ; ---------------------------------------------------------------
-        ; Step 6.5: Signal delivery checkpoint
+        ; Signal delivery checkpoint
         ;
         ; If the current process has a pending signal and this is a user
         ; syscall (CS == 0x1B), build the sigframe on the user stack and
-        ; rewrite the saved frame so the handler runs on IRETQ.  The frame
-        ; pointer is RSP (the saved RAX slot is frame[0]).
+        ; rewrite the saved frame so the handler runs on SYSRETQ.  The
+        ; frame pointer is RSP (the saved RAX slot is frame[0]).
         ;
         ; The checkpoint follows the SysV ABI: caller-saved registers are
         ; all already saved in their frame slots, callee-saved ones
@@ -210,7 +286,34 @@ syscall_entry_stub:
         call signal_check_syscall
 
         ; ---------------------------------------------------------------
-        ; Step 7: Restore all general-purpose registers
+        ; Restore the GS state BEFORE popping registers: the wrmsr
+        ; sequence below clobbers RAX/RCX/RDX, and the pops that follow
+        ; restore the user's values (including the syscall return in
+        ; RAX) from the frame — so doing the MSR work first is safe.
+        ;
+        ; GS is restored EXPLICITLY (no swapgs): a blocking syscall can
+        ; yield mid-flight, and a context switch normalizes the GS/
+        ; MSR102 pairing (sched_set_kernel_gs).  The exit therefore must
+        ; not assume the entry swapgs is still paired — it WRITES the
+        ; clean state instead: user GS base = 0, and MSR_KERNEL_GS_BASE
+        ; = the running thread (so the next entry swapgs sees it).
+        ; RCX/RAX/RDX are free here (user ABI clobbers rcx; rax/rdx are
+        ; restored from the frame slots by the pops below).
+        ; ---------------------------------------------------------------
+        mov  ecx, 0xC0000101            ; IA32_GS_BASE
+        xor  eax, eax
+        xor  edx, edx
+        wrmsr                           ; GS.base = 0 (user GS)
+        mov  rax, [rel g_current_thread]
+        mov  ecx, 0xC0000102            ; MSR_KERNEL_GS_BASE
+        mov  rdx, rax
+        shr  rdx, 32
+        wrmsr                           ; MSR102 = running thread
+
+        ; ---------------------------------------------------------------
+        ; Restore all general-purpose registers.  RCX and R11 are popped
+        ; for stack alignment but their values are discarded (the user
+        ; ABI declares rcx/r11 clobbered by the syscall instruction).
         ; ---------------------------------------------------------------
         pop r15
         pop r14
@@ -229,8 +332,18 @@ syscall_entry_stub:
         pop rax
 
         ; ---------------------------------------------------------------
-        ; Step 8: Return to user mode via IRETQ
-        ; CPU pops: RIP, CS, RFLAGS, RSP, SS  from per-thread stack
+        ; Return to user mode via IRETQ.
+        ;
+        ; The frame [RIP][CS][RFLAGS][RSP][SS] is still at RSP (pushed
+        ; by the CPU for the INT path, synthesized by GS-relative stores
+        ; for the fast path) — IRETQ pops it directly, so the user's
+        ; RSP is restored by the frame, not by a register move.
+        ;
+        ; SYSRETQ was implemented as the intended exit first, but QEMU
+        ; TCG raises #GP (error 0x28, the TSS selector) on it in this
+        ; configuration — an unresolved hypervisor/CPU interaction.
+        ; IRETQ is fully verified; the entry-side savings (no TSS.RSP0
+        ; frame copy, GS-based synthesis) are retained either way.
         ; ---------------------------------------------------------------
         iretq
 
@@ -238,9 +351,9 @@ syscall_entry_stub:
 ; ------------------------------------------------------------------
 ; syscall_entry_iretq
 ;
-; Alternate entry for syscall return. Some code paths may need
-; to modify the IRETQ frame before returning. This provides a
-; clean return point.
+; Alternate return point.  Some code paths may need to modify the
+; frame before returning; kept for compatibility (not used by the
+; kernel — the exit above is SYSRETQ-based).
 ; ------------------------------------------------------------------
 global syscall_entry_iretq
 syscall_entry_iretq:

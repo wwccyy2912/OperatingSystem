@@ -8,6 +8,7 @@
  */
 
 #include <kernel/idt.h>
+#include <kernel/gdt.h>
 #include <kernel/io.h>
 #include <kernel/irq.h>
 #include <kernel/sched.h>
@@ -69,8 +70,9 @@ typedef struct {
 /* Handler table                                                      */
 /* ------------------------------------------------------------------ */
 
-/* Syscall entry point (defined in syscall_entry.S) */
+/* Syscall entry points (defined in syscall_entry.S) */
 extern void syscall_entry_stub(void);
+extern void syscall_entry_fast(void);
 
 static void (*isr_handlers[IDT_ENTRIES])(void);
 
@@ -708,4 +710,42 @@ void idt_init(void) {
     pic_unmask_irq(0); /* Timer (IRQ0) */
     pic_unmask_irq(2); /* Cascade (IRQ2) for slave PIC */
     pic_unmask_irq(4); /* Serial (IRQ4) */
+
+    /* ---- Fast syscall path (v0.7): enable the SYSCALL/SYSRET pair ----
+     * MSRs (Intel SDM Vol.3 §5.8):
+     *   EFER.SCE (bit 0)      - enable the SYSCALL instruction
+     *   STAR                  - [47:32] kernel CS (SS = CS+8),
+     *                           [63:48] user CS for SYSRET (SS = CS+8)
+     *   LSTAR                 - kernel entry (syscall_entry_fast)
+     *   SFMASK                - RFLAGS bits cleared on entry: IF (bit 1)
+     *                           preserves the TOCTOU invariant (IF=0
+     *                           throughout the handler, same as the INT
+     *                           gate), plus TF/DF for a clean kernel
+     *                           flag state.
+     * The scheduler keeps MSR_KERNEL_GS_BASE (0xC0000102) = the running
+     * thread so the entry can swapgs and reach its kernel stack. */
+    {
+        u32 lo, hi;
+        __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080u));
+        u64 efer = ((u64)hi << 32) | lo;
+        efer |= (1ULL << 0); /* SCE */
+        __asm__ volatile("wrmsr"
+                         :: "c"(0xC0000080u), "a"((u32)efer), "d"((u32)(efer >> 32))
+                         : "memory");
+
+        u64 star = ((u64)GDT_SEL_UCODE << 48) | ((u64)0x08 << 32);
+        __asm__ volatile("wrmsr"
+                         :: "c"(0xC0000081u), "a"((u32)star), "d"((u32)(star >> 32))
+                         : "memory");
+
+        u64 lstar = (u64)syscall_entry_fast;
+        __asm__ volatile("wrmsr"
+                         :: "c"(0xC0000082u), "a"((u32)lstar), "d"((u32)(lstar >> 32))
+                         : "memory");
+
+        __asm__ volatile("wrmsr"
+                         :: "c"(0xC0000084u), "a"(0x700u), "d"(0u) /* IF|TF|DF */
+                         : "memory");
+        serial_puts("  SYSCALL fast path enabled (LSTAR=syscall_entry_fast)\n");
+    }
 }

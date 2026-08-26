@@ -1448,8 +1448,29 @@ static void test_p1_grant_to_subject(void) {
 
 /* ---- P1 runner: live-stack permission engine tests ---- */
 
+/* Quiet the Powerbox UI during the P1 tests: their queries are created
+ * and answered AUTOMATICALLY by the test code, so a permission panel
+ * must not flash at the user (and a stray y/n typed at it would leak
+ * into the shell line).  Queries still exist; only the UI_SHOW push is
+ * suppressed.  Best effort — a failure leaves the engine loud, which
+ * only means a panel flashes, not a test failure. */
+static void p1_set_quiet(int quiet) {
+    int pp = port_get("perm");
+    if (pp < 0)
+        return;
+    perm_req_set_quiet_t q;
+    memset(&q, 0, sizeof(q));
+    q.op    = PERM_OP_SET_QUIET;
+    q.quiet = (u32)quiet;
+    perm_resp_set_quiet_t qr;
+    memset(&qr, 0, sizeof(qr));
+    int rlen = (int)sizeof(qr);
+    (void)ipc_call(pp, &q, (int)sizeof(q), &qr, &rlen);
+}
+
 static void run_p1_perm_tests(void) {
     printf("\n=== P1 Permission Engine (live vfs+perm) ===\n");
+    p1_set_quiet(1);
     test_p1_whoami();
     test_p1_owner_auto_allow();
     test_p1_role_set_hot_reload();
@@ -1460,6 +1481,7 @@ static void run_p1_perm_tests(void) {
     test_p1_role_set_denied();
     test_p1_dump();
     test_p1_grant_to_subject();
+    p1_set_quiet(0);
     printf("=== P1 Permissions: %d/%d passed ===\n", p1_pass, p1_run);
 }
 

@@ -415,3 +415,11 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **⑦ 文件命令默认当前目录**：`ls`/`stat` 无路径参数时注入 `s_cwd`（execute() 路径解析块） | ✅ |
 | **⑧ 磁盘处理工具**：`disk list`（卷+容量/已用，df 风格）、`disk mount/unmount/format/fill <vol> [bytes]`。架构：驱动新增管理控制面 `DRV_OP_CTRL_{MOUNT,UNMOUNT,FORMAT,FILL}`（门禁 ATOM_SERVICE_MANAGE，可在未挂载时运行）；user 服务代理（OWNER/ADMIN 门禁 + 转发驱动）；`format` 需输入 `YES` 确认；`fill` 创建 fill.bin 直到预算或 NOSPC | ✅ |
 | **键盘路由回归修复**：撤销 `kbd_park_target` 焦点回退——焦点持有者(perm UI)不 park 时键回退给 shell 的 park 槽，导致面板 `y`/`n` 永远到不了线程 B（冒烟 powerbox 场景 "ycat" 失败）→ 恢复"仅焦点持有者 park 槽，否则 RX ring" | ✅ |
+
+### 第十轮补充 2（2026-08-26）：启动权限窗口不再弹给用户
+
+| 项 | 结果 |
+|---|---|
+| **问题**：init P1 测试5/6 的 Powerbox 查询被测试代码自动 ANSWER，但 UI_SHOW 面板仍会闪现 1-2 秒；用户在面板期间按的 `y` 落入 RX ring/shell 行缓冲 → `opsys:/$ y`，且测试6 的自动 deny 让用户误以为"按 y 无效、权限被禁用" | ✅ |
+| **修复**：perm 服务新增管理面开关 `PERM_OP_SET_QUIET`（门禁 ATOM_SERVICE_MANAGE）：quiet=1 时查询照常创建/应答（QUERY/ANSWER 语义不变），但 do_check 默认拒绝路径与 do_answer 均**不再推送 UI_SHOW**；init 的 `run_p1_perm_tests` 前后 `p1_set_quiet(1/0)` 包裹 | ✅ |
+| 验证：boot 无权限面板、无 splash、`echo hello` 干净回显（无 y 泄漏）；P1 10/10 + 34/34 通过；真实 Powerbox 面板仍正常（tee → -105 → 面板 → y → 重试成功） | ✅ |

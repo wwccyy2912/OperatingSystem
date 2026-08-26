@@ -83,7 +83,23 @@ enum {
     PERM_OP_POLICY_SAVE = 11, /* P2: P4 预留 — 导出策略二进制快照             */
     PERM_OP_POLICY_LOAD = 12, /* P2: P4 预留 — 导入策略二进制快照             */
     PERM_OP_AUDIT       = 13, /* P2: P3 预留 — 导出审计环形缓冲区               */
+    PERM_OP_SET_QUIET   = 14, /* management: suppress UI_SHOW pushes (tests)  */
 };
+
+/* PERM_OP_SET_QUIET — management-only: when quiet=1 the perm-manager
+ * creates/answers Powerbox queries WITHOUT pushing UI_SHOW to term.
+ * init uses it around its P1 permission tests so their automatic
+ * answers never flash a permission panel at the user (and the user's
+ * stray y/n can never leak into the shell line).  Queries still exist
+ * and ANSWER/QUERY work exactly as before. */
+typedef struct {
+    u32 op;   /* = PERM_OP_SET_QUIET */
+    u32 quiet; /* 1 = suppress UI_SHOW, 0 = normal */
+} perm_req_set_quiet_t;
+
+typedef struct {
+    i32 ret;
+} perm_resp_set_quiet_t;
 
 /* ====================================================================
  * PERM_OP_CHECK — synchronous authorization check (vfs_server)

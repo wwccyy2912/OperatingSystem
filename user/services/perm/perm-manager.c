@@ -130,6 +130,13 @@ static u32          s_query_seq; /* monotonic query-id counter */
 /* Lazily-resolved "perm.ui" port (term registers it at startup). */
 static int s_ui_port = -1;
 
+/* Quiet mode (v0.7.1): while set, Powerbox queries are created and can
+ * be answered, but UI_SHOW is NOT pushed to term — no permission panel
+ * flashes at the user.  init arms it around its P1 permission tests,
+ * whose automatic answers would otherwise pop a panel the user cannot
+ * act on (and a stray y/n would leak into the shell line). */
+static int s_quiet;
+
 /* ====================================================================
  * Grant table helpers
  * ==================================================================== */
@@ -803,7 +810,8 @@ static void do_check(int token, int msg_len, u64 caller_subject) {
     resp->query_id = q->query_id;
     audit_append(subject, atom, PERM_VERDICT_DENY, &req->resource);
 
-    notify_ui(q);
+    if (!s_quiet)
+        notify_ui(q);
 
 out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
@@ -856,7 +864,8 @@ static void do_answer(int token, int msg_len, u64 caller_subject) {
         resp->ret = 0;
     }
 
-    notify_ui(q);
+    if (!s_quiet)
+        notify_ui(q);
 
 out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
@@ -1193,6 +1202,29 @@ out:
 /* AUDIT (P3 预留): 导出审计环形缓冲区（最旧在前）。
  * GATED: the audit log records who accessed what — management plane
  * only (an app must not learn other subjects' access history). */
+/* SET_QUIET: management-only switch that suppresses UI_SHOW pushes
+ * (init's P1 permission tests).  GATED like do_grant/do_role_set:
+ * the caller must hold ATOM_SERVICE_MANAGE. */
+static void do_set_quiet(int token, int msg_len, u64 caller_subject) {
+    perm_resp_set_quiet_t *resp = (perm_resp_set_quiet_t *)s_resp;
+    memset(resp, 0, sizeof(*resp));
+    resp->ret = ERR_INVAL;
+    if (msg_len < (int)sizeof(perm_req_set_quiet_t))
+        goto out;
+    perm_req_set_quiet_t *req = (perm_req_set_quiet_t *)s_req;
+
+    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+        resp->ret = ERR_DENIED; /* management plane only */
+        goto out;
+    }
+
+    s_quiet   = (req->quiet != 0);
+    resp->ret = 0;
+    printf("perm: UI_SHOW %s\n", s_quiet ? "suppressed (quiet)" : "enabled");
+out:
+    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+}
+
 static void do_audit(int token, int msg_len, u64 caller_subject) {
     perm_resp_audit_t *resp = (perm_resp_audit_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
@@ -1250,6 +1282,9 @@ static void perm_handle_request(int token, u32 op, int msg_len, u64 caller_subje
         break;
     case PERM_OP_AUDIT:
         do_audit(token, msg_len, caller_subject);
+        break;
+    case PERM_OP_SET_QUIET:
+        do_set_quiet(token, msg_len, caller_subject);
         break;
     default: {
         i32 *resp = (i32 *)s_resp;

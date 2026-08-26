@@ -241,10 +241,16 @@ static u32 kbd_rx_read(u8 *dst, u32 max) {
  */
 static kbd_park_t *kbd_park_target(void) {
     if (s_focus_owner != 0) {
+        /* Only the focus owner's parked entry is served while focus is
+         * held.  If the focus holder is NOT parked (the perm UI reads
+         * the RX ring non-blockingly), keys fall through to the RX
+         * ring — that is exactly how 'y'/'n' reach the panel.  No
+         * fallback to other parked readers: the shell parks in
+         * READ_BLOCK and would swallow the panel's keys. */
         for (u32 i = 0; i < KBD_PARK_MAX; i++)
             if (s_park[i].token >= 0 && s_park[i].owner == s_focus_owner)
                 return &s_park[i];
-        return NULL; /* focus holder has nothing parked */
+        return NULL;
     }
     for (u32 i = 0; i < KBD_PARK_MAX; i++)
         if (s_park[i].token >= 0)

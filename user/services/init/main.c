@@ -1315,6 +1315,29 @@ static void test_p1_revoke(void) {
     vfs_resp_create_bookmark_t cr;
     P1_ASSERT(p1_create_bookmark(vfs_port, VFS_ACCESS_EXEC, &cr) == VFS_ERR_ACCESS,
               "EXEC still granted after REVOKE");
+
+    /* Hygiene: the denied EXEC check raised a Powerbox prompt (default
+     * deny).  Answer it (deny) so the term UI closes its panel and the
+     * perm-UI input thread releases the keyboard focus — an unanswered
+     * prompt would leave a stale panel on screen forever and starve the
+     * shell's input. */
+    {
+        perm_req_query_t q;
+        memset(&q, 0, sizeof(q));
+        q.op = PERM_OP_QUERY;
+        perm_resp_query_t qr;
+        int               rlen = (int)sizeof(qr);
+        if (ipc_call(perm_port, &q, (int)sizeof(q), &qr, &rlen) == 0 && qr.ret == 0) {
+            perm_req_answer_t a;
+            memset(&a, 0, sizeof(a));
+            a.op       = PERM_OP_ANSWER;
+            a.query_id = qr.query_id;
+            a.allow    = 0;
+            perm_resp_answer_t ar;
+            rlen = (int)sizeof(ar);
+            (void)ipc_call(perm_port, &a, (int)sizeof(a), &ar, &rlen);
+        }
+    }
     P1_PASS();
 }
 

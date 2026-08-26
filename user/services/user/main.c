@@ -223,6 +223,16 @@ static void do_login(int token, int msg_len, uint64_t caller) {
         resp->ret = r;
         goto out;
     }
+
+    /* Admin/owner login: grant the shutdown/reboot capability to the
+     * caller's subject so `shutdown` / `reboot` actually work.  The
+     * user service holds ATOM_SERVICE_MANAGE (blob-seeded), so the
+     * kernel accepts its grant.  Revoked on logout. */
+    if (a->role == PERM_ROLE_OWNER || a->role == PERM_ROLE_ADMIN) {
+        (void)cap_grant_to_subject(caller, ATOM_SYS_SHUTDOWN, RIGHT_ALL, 0, 0);
+    } else {
+        (void)cap_revoke_by_atom(caller, ATOM_SYS_SHUTDOWN, 0);
+    }
     resp->role = a->role;
     strncpy(resp->name, a->name, sizeof(resp->name) - 1);
     resp->name[sizeof(resp->name) - 1] = '\0';
@@ -251,8 +261,9 @@ static void do_logout(int token, int msg_len, uint64_t caller) {
             break;
         }
     }
-    /* Fall back to the default role. */
+    /* Fall back to the default role and drop the shutdown capability. */
     (void)perm_role_set(caller, PERM_ROLE_DEFAULT);
+    (void)cap_revoke_by_atom(caller, ATOM_SYS_SHUTDOWN, 0);
     resp->ret = 0;
 out:
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
@@ -769,6 +780,81 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
+/*  Disk management proxy (v0.7.1)                                     */
+/*                                                                     */
+/*  USER_OP_DISK_*: mount/unmount/format/fill the "Disk" block volume. */
+/*  The shell cannot hold ATOM_SERVICE_MANAGE, and the driver's         */
+/*  management control plane requires it, so the user service (which    */
+/*  holds the atom via blob seeding) forwards the request after         */
+/*  re-checking the caller is OWNER/ADMIN — same pattern as KILL.       */
+/* ------------------------------------------------------------------ */
+
+static void do_disk(int token, int msg_len, uint64_t caller) {
+    user_resp_disk_t *resp = (user_resp_disk_t *)s_resp;
+    memset(resp, 0, sizeof(*resp));
+    resp->ret = ERR_INVAL;
+    if (msg_len < (int)sizeof(user_req_disk_t))
+        goto out;
+    user_req_disk_t *req = (user_req_disk_t *)s_req;
+    req->volume[sizeof(req->volume) - 1] = '\0';
+
+    user_acct_t *me = acct_of_subject(caller);
+    if (!acct_is_admin(me)) {
+        resp->ret = ERR_DENIED; /* OWNER/ADMIN only */
+        snprintf(resp->detail, sizeof(resp->detail), "requires OWNER/ADMIN");
+        goto out;
+    }
+    /* Only the known block volume is manageable. */
+    if (strcmp(req->volume, "Disk") != 0) {
+        resp->ret = ERR_NOENT;
+        snprintf(resp->detail, sizeof(resp->detail), "unknown volume '%s'", req->volume);
+        goto out;
+    }
+
+    int dp = port_get("vfs.fs.virtio_blk");
+    if (dp < 0) {
+        resp->ret = ERR_NOENT;
+        snprintf(resp->detail, sizeof(resp->detail), "block driver not running");
+        goto out;
+    }
+
+    static drv_req_t dr; /* ~4 KB: keep off the small service stack */
+    memset(&dr, 0, sizeof(dr));
+    dr.volume = 0;
+    switch (req->op) {
+    case USER_OP_DISK_MOUNT:
+        dr.op = DRV_OP_CTRL_MOUNT;
+        break;
+    case USER_OP_DISK_UNMOUNT:
+        dr.op = DRV_OP_CTRL_UNMOUNT;
+        break;
+    case USER_OP_DISK_FORMAT:
+        dr.op = DRV_OP_CTRL_FORMAT;
+        break;
+    case USER_OP_DISK_FILL:
+        dr.op  = DRV_OP_CTRL_FILL;
+        dr.len = req->size;
+        break;
+    default:
+        goto out;
+    }
+    static drv_resp_t drr; /* ~4 KB: keep off the small service stack */
+    memset(&drr, 0, sizeof(drr));
+    int rlen = (int)sizeof(drr);
+    int r    = ipc_call(dp, &dr, (int)sizeof(dr), &drr, &rlen);
+    if (r < 0) {
+        resp->ret = r;
+        goto out;
+    }
+    resp->ret   = drr.ret;
+    resp->bytes = drr.u.ctrl.bytes;
+    if (drr.ret < 0)
+        snprintf(resp->detail, sizeof(resp->detail), "driver error %d", drr.ret);
+out:
+    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+}
+
+/* ------------------------------------------------------------------ */
 /*  Dispatch                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -815,6 +901,12 @@ static void user_handle(int token, u32 op, int msg_len, uint64_t caller) {
         break;
     case USER_OP_KILL:
         do_kill(token, msg_len, caller);
+        break;
+    case USER_OP_DISK_MOUNT:
+    case USER_OP_DISK_UNMOUNT:
+    case USER_OP_DISK_FORMAT:
+    case USER_OP_DISK_FILL:
+        do_disk(token, msg_len, caller);
         break;
     default: {
         i32 *resp = (i32 *)s_resp;

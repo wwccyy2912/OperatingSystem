@@ -401,3 +401,17 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **排障**：canary 自检 3 层修正——process_wait 需先注册等待(0.5s 延迟)、越界 64B 写穿 1 页栈(改 24B 只覆盖 canary 槽)、process_wait 返回 PID 非 0(断言修正);P3 假失败为无磁盘测试环境(manager 等 virtio-blk 端口)非回归 | ✅ |
 | 全量冒烟（--drive）：66 项 OK，0 FAIL | ✅ |
 | `make iso` 0 警告 | ✅ |
+
+### 第十轮（2026-08-26）：v0.7.1 — 启动交互修复 + 磁盘工具 + cwd 默认
+
+| 项 | 结果 |
+|---|---|
+| **① splash 不消失**：双重修复——(a) splash 绘制移到 `port_register("term")` 之前（注册前无客户端可写，消除"并发首写消费清除标志后 splash 再画上去"竞态）；(b) perm-UI 面板快照引入屏幕代际计数 `s_clear_gen`，`term_clear` 递增、快照记录代际、restore 时代际不匹配则清空面板矩形（不再复活清屏前的 splash 行）——根因是 init P1 测试5 在 shell 首次清屏**前**快照了含 splash 的区域，verdict 后 restore 把 splash 写回 | ✅ 连续 3 次启动无 splash/面板残留 |
+| **② 按键卡顿/被吃**：根因 = init P1 测试6(REVOKE) 重新触发 EXEC Powerbox 查询但从不回答 → 面板永久停留 + perm-UI 线程 B 永久持有键盘焦点。修复：(a) init 测试6 断言后主动 QUERY+ANSWER(deny) 清理；(b) 线程 A 决议分支清 `s_ui_await`；(c) 线程 B 改为轮询（非阻塞 READ + s_ui_await）不再阻塞持有焦点 | ✅ 首命令即刻回显 |
+| **③ login 密码覆盖**：`tui_input_line(5,31)` 绝对坐标覆盖 shell 输出 → 改为当前光标处 `read_line`/`read_line_masked`（掩码回显 `*`），`Password:` 提示与登录输出不再交叠 | ✅ QEMU 验证 `*****` 掩码 + `login: ok - 'admin' (OWNER)` |
+| **④ users 卡死**：`cmd_users` 改为先 `TERM_OP_CLEAR` 清屏再弹账户 TUI 弹窗（Enter/q 关闭） | ✅ |
+| **⑤ TUI 未清屏**：同④，弹窗前全屏清除 | ✅ |
+| **⑥ shutdown 系统调用失败**：shell 从未被授予 `ATOM_SYS_SHUTDOWN` → user 服务在 OWNER/ADMIN 登录时 `cap_grant_to_subject(caller, ATOM_SYS_SHUTDOWN, ...)`，登出撤销；`shutdown` 后串口 `OpSys: shutdown requested` + QEMU 断电 | ✅ |
+| **⑦ 文件命令默认当前目录**：`ls`/`stat` 无路径参数时注入 `s_cwd`（execute() 路径解析块） | ✅ |
+| **⑧ 磁盘处理工具**：`disk list`（卷+容量/已用，df 风格）、`disk mount/unmount/format/fill <vol> [bytes]`。架构：驱动新增管理控制面 `DRV_OP_CTRL_{MOUNT,UNMOUNT,FORMAT,FILL}`（门禁 ATOM_SERVICE_MANAGE，可在未挂载时运行）；user 服务代理（OWNER/ADMIN 门禁 + 转发驱动）；`format` 需输入 `YES` 确认；`fill` 创建 fill.bin 直到预算或 NOSPC | ✅ |
+| **键盘路由回归修复**：撤销 `kbd_park_target` 焦点回退——焦点持有者(perm UI)不 park 时键回退给 shell 的 park 槽，导致面板 `y`/`n` 永远到不了线程 B（冒烟 powerbox 场景 "ycat" 失败）→ 恢复"仅焦点持有者 park 槽，否则 RX ring" | ✅ |

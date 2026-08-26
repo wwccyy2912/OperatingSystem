@@ -775,12 +775,143 @@ static int vbdk_mount(int vfs_port) {
 }
 
 /* ====================================================================
+ * Management control plane (v0.7.1)
+ *
+ * An admin proxy (the user service, which holds ATOM_SERVICE_MANAGE)
+ * asks the DRIVER — not the vfs_server — to mount/unmount/format/fill
+ * the volume.  The driver performs the VFS handshake itself, so the A1
+ * owner-subject binding stays with the driver: an arbitrary client can
+ * neither tear the volume down nor bypass the server's mount-table
+ * validation.  These ops may run while the volume is unmounted.
+ * ==================================================================== */
+
+static int s_vfs_port = -1; /* vfs_server port (resolved at boot) */
+
+/* Deregister the volume from the vfs_server (VFS_OP_UNMOUNT). */
+static i32 vbdk_ctrl_unmount(void) {
+    if (!s_vol.mounted)
+        return ERR_NOENT;
+    vfs_req_unmount_t req;
+    memset(&req, 0, sizeof(req));
+    req.op = VFS_OP_UNMOUNT;
+    strncpy(req.driver_name, "virtio_blk", sizeof(req.driver_name) - 1);
+    strncpy(req.mount_name, "Disk", sizeof(req.mount_name) - 1);
+    vfs_resp_unmount_t resp;
+    int                rlen = (int)sizeof(resp);
+    int                r    = ipc_call(s_vfs_port, &req, (int)sizeof(req), &resp, &rlen);
+    if (r < 0)
+        return r;
+    if (resp.ret < 0)
+        return resp.ret;
+    s_vol.mounted = 0;
+    printf("fs_virtio_blk: Disk volume unmounted\n");
+    return 0;
+}
+
+/* Re-register the volume (VFS_OP_MOUNT). */
+static i32 vbdk_ctrl_mount(void) {
+    if (s_vol.mounted)
+        return ERR_BUSY;
+    i32 r = vbdk_mount(s_vfs_port);
+    if (r < 0)
+        return r;
+    s_vol.mounted = 1;
+    printf("fs_virtio_blk: Disk volume mounted (RW)\n");
+    return 0;
+}
+
+/* Wipe + re-format + re-mount.  The UUID changes, so the old volume
+ * entry must be dropped first (a stale UUID would break bookmarks). */
+static i32 vbdk_ctrl_format(void) {
+    if (s_vol.mounted) {
+        i32 r = vbdk_ctrl_unmount();
+        if (r < 0)
+            return r;
+    }
+    i32 r = vbdk_format();
+    if (r < 0)
+        return r;
+    r = vbdk_mount(s_vfs_port);
+    if (r < 0)
+        return r;
+    s_vol.mounted = 1;
+    printf("fs_virtio_blk: Disk volume formatted + remounted\n");
+    return 0;
+}
+
+/* Fill: create/replace "fill.bin" and write pattern bytes until the
+ * requested budget or the volume is full (exercises the ENOSPC path).
+ * budget==0 → fill until NOSPC.  Reports bytes written via *out_bytes. */
+static i32 vbdk_ctrl_fill(u32 budget, u64 *out_bytes) {
+    static u8 pattern[DRV_MAX_PAYLOAD]; /* not s_req/s_resp */
+    for (u32 i = 0; i < sizeof(pattern); i++)
+        pattern[i] = (u8)(i * 31u + 7u);
+
+    vfs_item_id_t old = 0;
+    if (vbdk_lookup(1, "fill.bin", &old) == 0) {
+        i32 r = vbdk_delete(old, 1);
+        if (r < 0)
+            return r;
+    }
+    vfs_item_id_t id;
+    i32 r = vbdk_create(1, "fill.bin", VFS_ITEM_FILE, &id);
+    if (r < 0)
+        return r;
+
+    u64 off = 0;
+    for (;;) {
+        u32 chunk = sizeof(pattern);
+        if (budget > 0 && (u64)chunk > (u64)budget - off)
+            chunk = (u32)((u64)budget - off);
+        if (chunk == 0)
+            break;
+        r = vbdk_write(id, off, chunk, pattern);
+        if (r == VFS_ERR_NOSPC || r == ERR_NOMEM)
+            break; /* volume full: this is the fill point */
+        if (r < 0)
+            return r;
+        off += (u32)r;
+        if (budget > 0 && off >= (u64)budget)
+            break;
+    }
+    *out_bytes = off;
+    return 0;
+}
+
+/* ====================================================================
  * Driver protocol handlers
  * ==================================================================== */
 
-static void drv_handle(int token, drv_req_t *req) {
+static void drv_handle(int token, drv_req_t *req, u64 caller) {
     drv_resp_t *resp = (drv_resp_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
+
+    /* Management control plane: gated on ATOM_SERVICE_MANAGE (the user
+     * service proxies admin commands).  Runs even while unmounted. */
+    if (req->op >= DRV_OP_CTRL_MOUNT && req->op <= DRV_OP_CTRL_FILL) {
+        if (cap_has_atom(caller, ATOM_SERVICE_MANAGE) != 1) {
+            resp->ret = ERR_DENIED;
+            goto out;
+        }
+        switch (req->op) {
+        case DRV_OP_CTRL_MOUNT:
+            resp->ret = vbdk_ctrl_mount();
+            break;
+        case DRV_OP_CTRL_UNMOUNT:
+            resp->ret = vbdk_ctrl_unmount();
+            break;
+        case DRV_OP_CTRL_FORMAT:
+            resp->ret = vbdk_ctrl_format();
+            break;
+        case DRV_OP_CTRL_FILL:
+            resp->ret = vbdk_ctrl_fill(req->len, &resp->u.ctrl.bytes);
+            break;
+        default:
+            resp->ret = ERR_INVAL;
+            break;
+        }
+        goto out;
+    }
 
     /* Degraded state (e.g. MOUNT was rejected): reject everything so
      * the process stays alive without corrupting the namespace. */
@@ -933,8 +1064,9 @@ int main(void) {
         thread_exit(1);
     }
     printf("fs_virtio_blk: vfs_server port %d resolved\n", vfs_port);
+    s_vfs_port = vfs_port;
 
-    ret = vbdk_mount(vfs_port);
+    ret = vbdk_mount(s_vfs_port);
     if (ret < 0) {
         printf("fs_virtio_blk: MOUNT Disk failed (%d) - degraded, "
                "serving ERR_INVAL\n",
@@ -948,7 +1080,8 @@ int main(void) {
     for (;;) {
         int msg_len = (int)sizeof(s_req);
         int token   = 0;
-        ret         = ipc_recv(port, s_req, &msg_len, &token);
+        u64 sender  = 0;
+        ret         = ipc_recv_from(port, s_req, &msg_len, &token, &sender);
         if (ret < 0) {
             printf("fs_virtio_blk: ipc_recv failed (%d)\n", ret);
             thread_exit(1);
@@ -959,6 +1092,6 @@ int main(void) {
             (void)ipc_reply(token, resp, (int)sizeof(*resp));
             continue;
         }
-        drv_handle(token, (drv_req_t *)s_req);
+        drv_handle(token, (drv_req_t *)s_req, sender);
     }
 }

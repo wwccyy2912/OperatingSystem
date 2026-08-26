@@ -144,6 +144,7 @@ static int user_call(const void *req, int req_len, void *resp, int resp_len);
 static int cmd_cd(int argc, char *argv[]);
 static int cmd_pwd(int argc, char *argv[]);
 static int cmd_scroll(int argc, char *argv[]);
+static int cmd_disk(int argc, char *argv[]);
 static int cmd_shutdown(int argc, char *argv[]);
 static int cmd_bm(int argc, char *argv[]);
 static int cmd_perm(int argc, char *argv[]);
@@ -707,7 +708,19 @@ static int shell_complete(char *buf, int *pos, int maxlen) {
  * backspace and basic editing.  Returns the number of characters read
  * (excluding null terminator), or -1 on error.
  */
+static int read_line_impl(char *buf, int maxlen, int mask);
+
 static int read_line(char *buf, int maxlen) {
+    return read_line_impl(buf, maxlen, 0);
+}
+
+/* Password entry: echo '*' instead of the typed characters. */
+static int read_line_masked(char *buf, int maxlen) {
+    return read_line_impl(buf, maxlen, 1);
+}
+
+/* Shared line reader: mask=1 echoes '*' (password entry). */
+static int read_line_impl(char *buf, int maxlen, int mask) {
     int pos = 0;
     u32 req[2 + 1];  /* { op; len }        */
     u32 resp[1 + 8]; /* { ret; data[32] }  */
@@ -865,7 +878,9 @@ static int read_line(char *buf, int maxlen) {
                 if (ch >= ' ' && ch < 0x7F) {
                     if (pos < maxlen - 1) {
                         buf[pos++] = (char)ch;
-                        shell_putc((char)ch);
+                        /* The function name is the mask flag: echo '*'
+                         * for passwords, the char itself otherwise. */
+                        shell_putc(mask ? '*' : (char)ch);
                     }
                     /* else: buffer full, silently ignore */
                 }
@@ -963,6 +978,14 @@ static int execute(char *line) {
                         n++;
                     }
                 }
+            }
+        } else if (strcmp(argv[0], "ls") == 0) {
+            /* v0.7.1: with no path argument, list the CURRENT
+             * directory instead of demanding a path.  (stat keeps its
+             * existing no-arg default: both configured volumes.) */
+            if (argc == 1) {
+                argv[1] = s_cwd;
+                argc    = 2;
             }
         }
     }
@@ -1227,6 +1250,128 @@ static int cmd_scroll(int argc, char *argv[]) {
         shell_write("scroll: term op failed\n");
         return -1;
     }
+    return 0;
+}
+
+/* ====================================================================
+ * disk — block-device management (v0.7.1)
+ *
+ *   disk list                     volumes + capacity/used (df-like)
+ *   disk mount <vol>              mount the volume
+ *   disk unmount <vol>            unmount it
+ *   disk format <vol>             wipe + re-format (DESTRUCTIVE, asks)
+ *   disk fill <vol> [bytes]       write fill.bin until NOSPC or budget
+ *
+ * mount/unmount/format/fill go through the user service (admin proxy):
+ * it holds ATOM_SERVICE_MANAGE (the driver's control plane requires
+ * it) and re-checks the caller is OWNER/ADMIN — the shell never talks
+ * to the driver directly.
+ * ==================================================================== */
+static int cmd_disk(int argc, char *argv[]) {
+    if (argc < 2) {
+        shell_write("Usage: disk list | mount <vol> | unmount <vol> | "
+                    "format <vol> | fill <vol> [bytes]\n");
+        return -1;
+    }
+
+    if (strcmp(argv[1], "list") == 0) {
+        static vfs_vol_info_t vols[VFS_MAX_VOLS];
+        u32                   count = 0;
+        int                   r     = fs_list_volumes(vols, &count);
+        if (r < 0) {
+            shell_printf("disk: list FAILED (%d)\n", r);
+            return -1;
+        }
+        if (count == 0) {
+            shell_write("disk: no volumes mounted\n");
+            return 0;
+        }
+        for (u32 i = 0; i < count; i++) {
+            char url[80];
+            snprintf(url, sizeof(url), "/%s", vols[i].mount_name);
+            u64 total = 0, used = 0;
+            u32 ro   = 0;
+            int  sr  = fs_stat_volume(url, &total, &used, &ro);
+            shell_write(vols[i].mount_name);
+            shell_write("  ");
+            if (sr == 0)
+                shell_printf("%d KiB used / %d KiB total%s\n", (int)(used / 1024u),
+                             (int)(total / 1024u), ro ? " (ro)" : "");
+            else
+                shell_write("(stat unavailable)\n");
+        }
+        shell_printf("disk: %d volume(s)\n", (int)count);
+        return 0;
+    }
+
+    if (argc < 3) {
+        shell_write("Usage: disk list | mount <vol> | unmount <vol> | "
+                    "format <vol> | fill <vol> [bytes]\n");
+        return -1;
+    }
+    if (strlen(argv[2]) >= 64) {
+        shell_printf("disk: volume name too long\n");
+        return -1;
+    }
+
+    user_req_disk_t req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.volume, argv[2], sizeof(req.volume) - 1);
+    req.volume[sizeof(req.volume) - 1] = '\0';
+
+    if (strcmp(argv[1], "mount") == 0) {
+        req.op = USER_OP_DISK_MOUNT;
+    } else if (strcmp(argv[1], "unmount") == 0) {
+        req.op = USER_OP_DISK_UNMOUNT;
+    } else if (strcmp(argv[1], "format") == 0) {
+        req.op = USER_OP_DISK_FORMAT;
+    } else if (strcmp(argv[1], "fill") == 0) {
+        req.op = USER_OP_DISK_FILL;
+        if (argc >= 4) {
+            u32 v = 0;
+            for (const char *p = argv[3]; *p >= '0' && *p <= '9'; p++)
+                v = v * 10u + (u32)(*p - '0');
+            req.size = v; /* 0 (explicit) = fill until NOSPC */
+        } else {
+            req.size = 0; /* fill until NOSPC */
+        }
+    } else {
+        shell_printf("disk: unknown subcommand '%s'\n", argv[1]);
+        return -1;
+    }
+
+    /* Format is destructive: require an explicit confirmation word. */
+    if (req.op == USER_OP_DISK_FORMAT) {
+        shell_printf("disk: formatting '%s' destroys ALL data on it.\n", req.volume);
+        shell_write("Type YES to continue: ");
+        char conf[8];
+        if (read_line(conf, sizeof(conf)) < 0)
+            return -1;
+        if (strcmp(conf, "YES") != 0) {
+            shell_write("disk: format cancelled\n");
+            return 0;
+        }
+    }
+
+    user_resp_disk_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int r = user_call(&req, (int)sizeof(req), &resp, (int)sizeof(resp));
+    if (r < 0) {
+        shell_printf("disk: ipc FAILED (%d)\n", r);
+        return -1;
+    }
+    if (resp.ret < 0) {
+        shell_printf("disk: %s '%s' FAILED (%d)", argv[1], req.volume, resp.ret);
+        if (resp.detail[0])
+            shell_printf(" - %s", resp.detail);
+        shell_write("\n");
+        return -1;
+    }
+    if (req.op == USER_OP_DISK_FILL)
+        shell_printf("disk: %d KiB written to %s/fill.bin\n", (int)(resp.bytes / 1024u),
+                     req.volume);
+    else
+        shell_printf("disk: %s '%s' ok\n", argv[1], req.volume);
     return 0;
 }
 
@@ -2716,6 +2861,9 @@ static void shell_main(void *arg) {
     shell_register_command("scroll",
                            "Page through terminal scrollback: scroll [lines] | scroll end",
                            cmd_scroll);
+    shell_register_command("disk",
+                           "Disk mgmt: disk list|mount|unmount|format|fill <vol> [bytes]",
+                           cmd_disk);
     shell_register_command("fm", "TUI file manager (j/k Enter v d q)", cmd_fm);
 
     /* v0.5: load the command policy filter (rescue list on failure). */
@@ -2783,14 +2931,19 @@ static int cmd_login(int argc, char *argv[]) {
         strncpy(name, argv[1], sizeof(name) - 1);
         name[sizeof(name) - 1] = '\0';
     } else {
-        if (tui_input_line(5, 30, "User: ", name, sizeof(name), 0) < 0)
+        /* Prompt at the CURRENT cursor (no absolute-coordinate overlay):
+         * the line editor echoes as usual. */
+        shell_write("User: ");
+        if (read_line(name, sizeof(name)) < 0)
             return -1;
     }
     if (argc >= 3) {
         strncpy(pw, argv[2], sizeof(pw) - 1);
         pw[sizeof(pw) - 1] = '\0';
     } else {
-        if (tui_input_line(5, 31, "Password: ", pw, sizeof(pw), 1) < 0)
+        /* Masked entry: echo '*' (password). */
+        shell_write("Password: ");
+        if (read_line_masked(pw, sizeof(pw)) < 0)
             return -1;
     }
 
@@ -3048,7 +3201,18 @@ static int cmd_users(int argc, char *argv[]) {
         shown++;
         p = semi + 1;
     }
-    (void)tui_menu(40, 8, 36, shown + 2, "Accounts (Enter/q)", ptrs, shown, NULL);
+    /* Clear first: the popup must not overlay leftover shell output
+     * (that made the TUI look broken/stuck).  The shell loop reprints
+     * the prompt after the menu is dismissed. */
+    if (s_term_port >= 0) {
+        u32 req[2];
+        u32 resp[1];
+        req[0]       = TERM_OP_CLEAR;
+        req[1]       = 0;
+        int resp_len = (int)sizeof(resp);
+        ipc_call(s_term_port, (const void *)req, 8, (void *)resp, &resp_len);
+    }
+    (void)tui_menu(38, 6, 40, shown + 2, "Accounts (Enter/q)", ptrs, shown, NULL);
     return 0;
 }
 

@@ -261,12 +261,14 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
         return (i64)ERR_NOMEM;
 
     /* ---- Blob identity seeding (docs/ops_format.md §6): the manager,
-     * perm, pkg, term, vfs and fs_mem_driver services are the only
-     * subjects allowed to sign / answer atom caps
+     * perm, pkg, term, vfs, the fs drivers and user/policy services
+     * are the only subjects allowed to sign / answer atom caps
      * (sys_cap_grant_to_subject / perm decision_encode / pkg manifest
      * issue / Powerbox ANSWER — the term UI agent answers user
-     * verdicts — and SYS_SHM_CREATE/MAP, which vfs_server uses to
-     * export zero-copy file pages from the driver's pool).  Identity
+     * verdicts — SYS_SHM_CREATE/MAP, which vfs_server uses to
+     * export zero-copy file pages from the driver's pool — and
+     * sys_cap_has_atom, which fs_virtio_blk_driver uses to gate its
+     * mount/unmount/format/fill control plane).  Identity
      * is established by CONTENT: the caller's blob must be
      * byte-identical (blob_size + memcmp) to the kernel-embedded
      * service ELF — a name like "perm" alone is NOT trusted (an app
@@ -284,7 +286,7 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
             CAP_NULL) {
         static const char *const s_svc_blobs[] = {
             "manager", "perm", "pkg", "term", "vfs", "fs_mem_driver", "user",
-            "policy"};
+            "policy", "fs_virtio_blk_driver"};
         for (u64 bi = 0; bi < sizeof(s_svc_blobs) / sizeof(s_svc_blobs[0]); bi++) {
             const void *blob_data = NULL;
             u64         blob_sz   = 0;

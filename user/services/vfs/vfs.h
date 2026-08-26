@@ -485,6 +485,15 @@ enum {
     DRV_OP_MOVE       = 10, /* Phase 2: move/rename, itemID stays stable */
     DRV_OP_PHYS_RANGE = 11, /* Phase 3: file → backing pool (phys, size);
                              *   ERR_NOENT = not pool-backed */
+    /* Management control plane (v0.7.1): the DRIVER performs the VFS
+     * MOUNT/UNMOUNT handshake on behalf of an admin proxy (the user
+     * service).  Gated on ATOM_SERVICE_MANAGE inside the driver; these
+     * are the only DRV ops that may run while the volume is unmounted.
+     * `len` carries the FILL byte budget (0 = fill until NOSPC). */
+    DRV_OP_CTRL_MOUNT   = 12, /* re-register the volume (MOUNT handshake) */
+    DRV_OP_CTRL_UNMOUNT = 13, /* deregister the volume (UNMOUNT handshake) */
+    DRV_OP_CTRL_FORMAT  = 14, /* wipe + re-format + re-mount (new UUID) */
+    DRV_OP_CTRL_FILL    = 15, /* create fill.bin until NOSPC or budget   */
 };
 
 typedef struct {
@@ -520,6 +529,9 @@ typedef struct {
             u64 phys_base; /* PHYS_RANGE: backing pool physical base */
             u32 size;      /* PHYS_RANGE: file size in bytes */
         } pr;                     /* PHYS_RANGE */
+        struct {
+            u64 bytes; /* CTRL_FILL: bytes written to fill.bin */
+        } ctrl;                   /* CTRL_* */
         u8 data[DRV_MAX_PAYLOAD]; /* READ payload */
     } u;
 } drv_resp_t;

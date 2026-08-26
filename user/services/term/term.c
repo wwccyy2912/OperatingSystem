@@ -173,6 +173,8 @@ static u8  s_sb[SCROLLBACK_ROWS][TERM_MAX_COLS];
 static u32 s_sb_next;   /* next ring slot to write */
 static u32 s_sb_count;  /* rows accumulated so far */
 static u32 s_sb_view;   /* look-back depth (0 = live) */
+static u8 s_splash_clear;  /* clear the boot splash on the first write */
+static volatile u32 s_clear_gen; /* bumped by every term_clear; invalidates perm-UI snapshots */
 
 /* ====================================================================
  * Color helpers (mirror of kernel rgb_to_vga_attr)
@@ -446,7 +448,17 @@ static void term_show_scrollback(u32 view) {
     }
 }
 
+static void term_clear(void); /* forward decl: term_write resets the splash */
+
 static i32 term_write(const u8 *data, u32 len) {
+    if (s_splash_clear) {
+        /* First write after the boot splash: clear it entirely so it
+         * never lingers under/around later output. */
+        s_splash_clear = 0;
+        term_clear();
+        s_cursor_x = 0;
+        s_cursor_y = 0;
+    }
     if (s_sb_view != 0) {
         /* Any write while paging through history returns to live. */
         s_sb_view = 0;
@@ -506,6 +518,7 @@ static void term_clear(void) {
     s_cursor_x = 0;
     s_cursor_y = 0;
     term_draw_cursor();
+    s_clear_gen++; /* invalidate any perm-UI panel snapshot */
 
     if (s_render_lock >= 0)
         (void)mutex_unlock(s_render_lock);
@@ -966,6 +979,7 @@ static void term_server_loop(int port) {
 
 /* Keyboard protocol ops (mirror of keyboard.c — keyboard.h is not
  * shared with the term service). */
+#define PERM_UI_KBD_READ           1
 #define PERM_UI_KBD_READ_BLOCK    2
 #define PERM_UI_KBD_TAKE_FOCUS    3
 #define PERM_UI_KBD_RELEASE_FOCUS 4
@@ -982,6 +996,7 @@ static void term_server_loop(int port) {
  * A arms them, B clears s_ui_await after answering. */
 static u8           s_ui_snapshot[TERM_MAX_ROWS][TERM_MAX_COLS];
 static int          s_ui_active;         /* 1 = panel on screen (A only) */
+static volatile u32 s_ui_snapshot_gen;   /* s_clear_gen at snapshot time  */
 static volatile u32 s_ui_await;          /* 1 = input thread should run  */
 static volatile u32 s_ui_query_id;       /* query being answered (u32)   */
 static int          s_ui_perm_port = -1; /* lazy port_get("perm")        */
@@ -1058,7 +1073,8 @@ static void perm_ui_render_panel(const perm_req_ui_t *req, int fresh) {
             if (s_cols < TERM_MAX_COLS)
                 memset(s_ui_snapshot[r] + s_cols, ' ', TERM_MAX_COLS - s_cols);
         }
-        s_ui_active = 1;
+        s_ui_snapshot_gen = s_clear_gen;
+        s_ui_active       = 1;
     }
 
     /* Interior clear (no stale glyphs) */
@@ -1169,6 +1185,24 @@ static void perm_ui_restore(void) {
 
     if (s_render_lock >= 0)
         (void)mutex_lock(s_render_lock);
+    if (s_ui_snapshot_gen != s_clear_gen) {
+        /* The screen was cleared after this snapshot was taken (e.g.
+         * the boot-splash clear on the shell's first write, or an
+         * explicit TERM_OP_CLEAR): restoring the snapshot would
+         * resurrect pre-clear content (the splash rows).  Blank the
+         * panel rectangle instead — it may hold a verdict render made
+         * after the clear. */
+        for (u32 r = py; r < py + h; r++)
+            for (u32 c = px; c < px + w; c++) {
+                s_cells[r][c] = ' ';
+                term_draw_cell(c, r, ' ', TERM_FG, TERM_BG);
+            }
+        term_draw_cursor();
+        s_ui_active = 0;
+        if (s_render_lock >= 0)
+            (void)mutex_unlock(s_render_lock);
+        return;
+    }
     for (u32 r = py; r < py + h; r++) {
         memcpy(s_cells[r] + px, s_ui_snapshot[r] + px, w);
         for (u32 c = px; c < px + w; c++)
@@ -1226,20 +1260,6 @@ static int perm_ui_kbd_focus(int take) {
     return ret;
 }
 
-/* Block until y/n arrives; 1 = allow, 0 = deny (fail-closed on error). */
-static int perm_ui_read_verdict(void) {
-    i32 ret = 0;
-    u8  key = 0;
-    for (;;) {
-        if (perm_ui_kbd_req(PERM_UI_KBD_READ_BLOCK, 1, &ret, &key, 1) < 0)
-            return 0;
-        if (key == 'y' || key == 'Y')
-            return 1;
-        if (key == 'n' || key == 'N')
-            return 0;
-    }
-}
-
 /* Send the user's verdict for the current query.  ipc_send only: the
  * perm-manager answers with a UI_SHOW result push synchronously inside
  * do_answer, so ipc_call here would deadlock. */
@@ -1277,8 +1297,30 @@ static void perm_ui_input_main(void *arg) {
             s_ui_await = 0;
             continue;
         }
-        int allow = perm_ui_read_verdict();
+        /* Poll for y/n instead of blocking forever: a verdict resolved
+         * by a non-UI path (perm_answer) clears s_ui_await from thread A,
+         * so this loop exits and the focus is released.  A real panel
+         * keeps waiting as long as s_ui_await stays set. */
+        int allow = -1;
+        while (allow < 0 && s_ui_await) {
+            u8 key = 0;
+            i32 ret = 0;
+            if (perm_ui_kbd_req(PERM_UI_KBD_READ, 1, &ret, &key, 1) < 0)
+                break;
+            if (ret > 0) {
+                if (key == 'y' || key == 'Y')
+                    allow = 1;
+                else if (key == 'n' || key == 'N')
+                    allow = 0;
+            }
+            (void)sleep(1);
+        }
         (void)perm_ui_kbd_focus(0);
+        if (allow < 0) {
+            /* Resolved elsewhere or an error: nothing to answer. */
+            s_ui_await = 0;
+            continue;
+        }
         perm_ui_send_answer(allow);
         s_ui_await = 0;
     }
@@ -1335,11 +1377,16 @@ static void perm_ui_main(void *arg) {
                     }
                 } else if (s_ui_active && req->query_id == s_ui_query_id) {
                     /* Verdict for the panel on screen: redraw, ack first (so the
-                     * perm-manager unblocks), hold, then restore. */
+                     * perm-manager unblocks), hold, then restore.  The query was
+                     * resolved WITHOUT the UI's y/n (e.g. init's perm_answer or a
+                     * script) — clear s_ui_await so thread B stops waiting and
+                     * RELEASES the keyboard focus; otherwise it would hold the
+                     * focus forever and starve the shell's input. */
                     perm_ui_render_panel(req, 0);
                     (void)ipc_reply(token, s_ui_resp, (int)sizeof(perm_resp_ui_t));
                     (void)sleep(PERM_UI_RESULT_HOLD_TICKS);
                     perm_ui_restore();
+                    s_ui_await = 0;
                     continue;
                 }
             }
@@ -1425,33 +1472,18 @@ static void term_service_main(void *arg) {
         printf("term: ipc_port_create failed (%d)\n", port);
         thread_exit(1);
     }
-    ret = port_register("term", port);
-    if (ret < 0) {
-        printf("term: port_register('term') failed (%d)\n", ret);
-        thread_exit(1);
-    }
-    printf("term: port %d registered as 'term'\n", port);
 
-    /* 5. Render lock (term loop ⇄ perm.ui thread) + Powerbox UI agent. */
-    s_render_lock = mutex_create();
-    if (s_render_lock < 0) {
-        printf("term: mutex_create failed (%d)\n", s_render_lock);
-        thread_exit(1);
-    }
-    int ui_tid = thread_create(perm_ui_main, NULL, 10);
-    if (ui_tid < 0)
-        printf("term: thread_create(perm.ui) failed (%d)\n", ui_tid);
-    int ui_in_tid = thread_create(perm_ui_input_main, NULL, 10);
-    if (ui_in_tid < 0)
-        printf("term: thread_create(perm.ui input) failed (%d)\n", ui_in_tid);
-
-    /* 6. Blank the screen and show the cursor. */
+    /* 4b. Boot splash: rendered BEFORE the "term" port is registered so
+     * no client can write while it is being drawn.  The clear flag is
+     * armed only after the splash is complete; the FIRST client write
+     * then clears the whole screen (s_splash_clear) and the shell
+     * banner replaces the splash entirely — including the centered
+     * rows, which a top-anchored banner would otherwise leave on
+     * screen forever.  (This ordering also removes the startup race
+     * where a concurrent first write could consume the clear flag and
+     * then have the splash drawn over it.) */
     term_clear();
-
-    /* 6b. Boot splash: rendered once during service startup so the
-     * user sees progress instead of a blank screen.  The cursor is
-     * then reset to (0,0), so the shell banner (written when the
-     * shell connects) overwrites the splash. */
+    s_splash_clear = 1;
     {
         static const char *const splash[] = {
             "OpSys Microkernel",
@@ -1476,6 +1508,27 @@ static void term_service_main(void *arg) {
         s_cursor_y = 0;
         term_draw_cursor();
     }
+
+    ret = port_register("term", port);
+    if (ret < 0) {
+        printf("term: port_register('term') failed (%d)\n", ret);
+        thread_exit(1);
+    }
+    printf("term: port %d registered as 'term'\n", port);
+
+    /* 5. Render lock (term loop ⇄ perm.ui thread) + Powerbox UI agent. */
+    s_render_lock = mutex_create();
+    if (s_render_lock < 0) {
+        printf("term: mutex_create failed (%d)\n", s_render_lock);
+        thread_exit(1);
+    }
+    int ui_tid = thread_create(perm_ui_main, NULL, 10);
+    if (ui_tid < 0)
+        printf("term: thread_create(perm.ui) failed (%d)\n", ui_tid);
+    int ui_in_tid = thread_create(perm_ui_input_main, NULL, 10);
+    if (ui_in_tid < 0)
+        printf("term: thread_create(perm.ui input) failed (%d)\n", ui_in_tid);
+
 
     /* 7. Serve clients. */
     printf("term: serving on port %d\n", port);

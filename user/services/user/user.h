@@ -46,6 +46,10 @@ enum {
     USER_OP_POLICY_SET = 12, /* admin proxy: hot-update command policy */
     USER_OP_POLICY_DUMP = 13, /* admin proxy: dump command policy table */
     USER_OP_KILL      = 14, /* admin proxy: kill a process by PID */
+    USER_OP_DISK_MOUNT = 15, /* admin proxy: mount the Disk volume   */
+    USER_OP_DISK_UNMOUNT = 16, /* admin proxy: unmount the Disk volume */
+    USER_OP_DISK_FORMAT = 17, /* admin proxy: wipe + re-format Disk   */
+    USER_OP_DISK_FILL  = 18, /* admin proxy: fill Disk until NOSPC/budget */
 };
 
 /* Account lockout policy: failed logins before auto-lock. */
@@ -117,6 +121,23 @@ typedef struct {
     int32_t ret;
     char    detail[64];
 } user_resp_kill_t;
+
+/* DISK_*: admin proxy for the block-device filesystem driver
+ * (fs_virtio_blk_driver).  The shell must not talk to the driver
+ * directly — the driver gates its management control plane on
+ * ATOM_SERVICE_MANAGE, which the user service holds; the user service
+ * re-checks the caller is OWNER/ADMIN, exactly like KILL/POLICY_SET. */
+typedef struct {
+    uint32_t op;      /* USER_OP_DISK_* */
+    char     volume[64]; /* mount name ("Disk") */
+    uint32_t size;    /* FILL: byte budget (0 = fill until NOSPC) */
+} user_req_disk_t;
+
+typedef struct {
+    int32_t ret;
+    uint64_t bytes;   /* FILL: bytes written to fill.bin */
+    char     detail[64];
+} user_resp_disk_t;
 
 /* Compile-time guard: every message fits the 4096-byte IPC limit. */
 #define USER_IPC_MAX 4096

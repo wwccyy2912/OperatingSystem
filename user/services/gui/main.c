@@ -231,10 +231,67 @@ static void gui_composite(void) {
             if (!rect_intersect(d, wrect, &clip))
                 continue;
 
-            /* Border frame + title bar (small, drawn whole). */
-            gui_rect(&s_fb, w->x, w->y, w->w + 2 * GUI_BORDER,
-                     w->h + 2 * GUI_BORDER + GUI_TITLE_H, GUI_BORDER_COLOR);
-            draw_titlebar(w);
+            /* Border frame: every edge is CLIPPED to the dirty rect.
+             * Drawing the whole frame would repaint pixels that an
+             * overlapping higher window already owns — its content
+             * would show the lower window's border through it (the
+             * "two windows visible at once" bug). */
+            {
+                int ww = w->w + 2 * GUI_BORDER;
+                int wh = w->h + 2 * GUI_BORDER + GUI_TITLE_H;
+                /* top edge */
+                if (d.y <= w->y && w->y < d.y + d.h) {
+                    int x0 = (w->x > d.x) ? w->x : d.x;
+                    int x1 = (w->x + ww < d.x + d.w) ? w->x + ww : d.x + d.w;
+                    if (x1 > x0)
+                        gui_hline(&s_fb, x0, w->y, x1 - x0, GUI_BORDER_COLOR);
+                }
+                /* bottom edge */
+                {
+                    int by = w->y + wh - 1;
+                    if (d.y <= by && by < d.y + d.h) {
+                        int x0 = (w->x > d.x) ? w->x : d.x;
+                        int x1 = (w->x + ww < d.x + d.w) ? w->x + ww : d.x + d.w;
+                        if (x1 > x0)
+                            gui_hline(&s_fb, x0, by, x1 - x0, GUI_BORDER_COLOR);
+                    }
+                }
+                /* left edge */
+                if (d.x <= w->x && w->x < d.x + d.w) {
+                    int y0 = (w->y > d.y) ? w->y : d.y;
+                    int y1 = (w->y + wh < d.y + d.h) ? w->y + wh : d.y + d.h;
+                    if (y1 > y0)
+                        gui_vline(&s_fb, w->x, y0, y1 - y0, GUI_BORDER_COLOR);
+                }
+                /* right edge */
+                {
+                    int rx = w->x + ww - 1;
+                    if (d.x <= rx && rx < d.x + d.w) {
+                        int y0 = (w->y > d.y) ? w->y : d.y;
+                        int y1 = (w->y + wh < d.y + d.h) ? w->y + wh : d.y + d.h;
+                        if (y1 > y0)
+                            gui_vline(&s_fb, rx, y0, y1 - y0, GUI_BORDER_COLOR);
+                    }
+                }
+            }
+
+            /* Title bar: fill clipped to the dirty rect, text only when
+             * the dirty rect touches the bar. */
+            {
+                gui_rect_t trect;
+                trect.x = w->x + GUI_BORDER;
+                trect.y = w->y + GUI_BORDER;
+                trect.w = w->w;
+                trect.h = GUI_TITLE_H;
+                gui_rect_t tclip;
+                if (rect_intersect(d, trect, &tclip)) {
+                    gui_fill(&s_fb, tclip.x, tclip.y, tclip.w, tclip.h,
+                             (w->id == s_focus_id) ? GUI_TITLE_BG
+                                                    : GUI_TITLE_BG_IDLE);
+                    draw_titlebar(w); /* whole 16px line: harmless, it is
+                                       * the bar's own pixels */
+                }
+            }
 
             /* Content blit: only the part of the window that changed. */
             int cx0 = w->x + GUI_BORDER;

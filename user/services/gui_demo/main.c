@@ -140,11 +140,16 @@ int main(void) {
         gui_deactivate();
         return 1;
     }
-    gui_move(w2, 60, 60);
-    gui_move(w3, 400, 300);
+    /* Place the three windows side by side (non-overlapping): the
+     * compositor's auto-placement already avoids stacking, and these
+     * explicit positions keep the demo windows apart so no border ever
+     * overlaps another. */
+    gui_move(w1, 20, 20);
+    gui_move(w2, 350, 40);
+    gui_move(w3, 680, 320);
 
     /* Window-local coordinates for click hit-conversion. */
-    int wx2 = 60, wy2 = 60;
+    int wx2 = 350, wy2 = 40;
 
     /* Initial content. */
     gui_fill(w2, 0, 0, WIN_W, WIN_H, 0x00101010);

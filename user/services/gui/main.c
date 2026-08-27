@@ -67,6 +67,13 @@ static i32 s_ptr_x;
 static i32 s_ptr_y;
 static u8  s_ptr_buttons;
 
+/* Title-bar dragging state (input thread).  While a window is being
+ * dragged, pointer motion moves the window instead of the hit test;
+ * releasing the button ends the drag. */
+static int s_drag_id;    /* window being dragged (0 = none) */
+static int s_drag_offx;  /* pointer offset within the window border */
+static int s_drag_offy;
+
 static gui_event_t s_events[GUI_MAX_EVENTS];
 static u32         s_ev_head;
 static u32         s_ev_count;
@@ -313,9 +320,42 @@ static void do_create(int token, int msg_len, u64 caller) {
     slot->title[sizeof(slot->title) - 1] = '\0';
     slot->w = c->w;
     slot->h = c->h;
-    /* Cascade placement. */
-    slot->x = 24 + (slot->id % 6) * 32;
-    slot->y = 24 + (slot->id % 6) * 24;
+    /* Auto-placement: walk a cascade grid and pick the first slot that
+     * does NOT overlap an existing window — new windows never stack
+     * their borders over an existing one by default.  (Clients may
+     * still MOVE a window anywhere, including on top, and drag the
+     * title bar to rearrange.) */
+    {
+        int ww = c->w + 2 * GUI_BORDER;
+        int wh = c->h + 2 * GUI_BORDER + GUI_TITLE_H;
+        int px = 20, py = 20;
+        for (int attempt = 0; attempt < 400; attempt++) {
+            int free = 1;
+            for (int j = 0; j < GUI_MAX_WINDOWS; j++) {
+                if (!s_wins[j].in_use)
+                    continue;
+                int ox = s_wins[j].x, oy = s_wins[j].y;
+                int ow = s_wins[j].w + 2 * GUI_BORDER;
+                int oh = s_wins[j].h + 2 * GUI_BORDER + GUI_TITLE_H;
+                if (px < ox + ow && ox < px + ww && py < oy + oh && oy < py + wh) {
+                    free = 0;
+                    break;
+                }
+            }
+            if (free)
+                break;
+            px += 24;
+            py += 18;
+            if (px + ww + 20 > (int)s_fb.w) {
+                px = 20;
+                py += 130;
+            }
+            if (py + wh > (int)s_fb.h)
+                py = 20; /* wrapped: accept overlap rather than fail */
+        }
+        slot->x = px;
+        slot->y = py;
+    }
     slot->buf.w     = (u32)c->w;
     slot->buf.h     = (u32)c->h;
     slot->buf.pitch = (u32)c->w * 4;
@@ -722,6 +762,36 @@ static void gui_input_main(void *arg) {
                     if (s_ptr_y >= (i32)s_fb.h)
                         s_ptr_y = (i32)s_fb.h - 1;
                     ev_push(GUI_EV_MOUSEMOVE, 0, s_ptr_x, s_ptr_y);
+                    /* Dragging: move the window under the pointer. */
+                    if (s_drag_id != 0) {
+                        gui_win_t *dw = win_find(s_drag_id);
+                        if (dw) {
+                            int nx = s_ptr_x - s_drag_offx;
+                            int ny = s_ptr_y - s_drag_offy;
+                            if (nx + dw->w + 2 * GUI_BORDER > (i32)s_fb.w)
+                                nx = (i32)s_fb.w - dw->w - 2 * GUI_BORDER;
+                            if (ny + dw->h + 2 * GUI_BORDER + GUI_TITLE_H >
+                                (i32)s_fb.h)
+                                ny = (i32)s_fb.h - dw->h - 2 * GUI_BORDER -
+                                     GUI_TITLE_H;
+                            if (nx < 0)
+                                nx = 0;
+                            if (ny < 0)
+                                ny = 0;
+                            if (nx != dw->x || ny != dw->y) {
+                                gui_dirty_add(dw->x, dw->y,
+                                              dw->w + 2 * GUI_BORDER,
+                                              dw->h + 2 * GUI_BORDER +
+                                                  GUI_TITLE_H);
+                                dw->x = nx;
+                                dw->y = ny;
+                                gui_dirty_add(dw->x, dw->y,
+                                              dw->w + 2 * GUI_BORDER,
+                                              dw->h + 2 * GUI_BORDER +
+                                                  GUI_TITLE_H);
+                            }
+                        }
+                    }
                     if (s_lock >= 0)
                         (void)mutex_unlock(s_lock);
                     /* Redraw only the old + new pointer squares. */
@@ -729,7 +799,8 @@ static void gui_input_main(void *arg) {
                     gui_dirty_add(s_ptr_x - 1, s_ptr_y - 1, 7, 7);
                     changed = 1;
                 }
-                /* Button transitions: press focuses the hit window. */
+                /* Button transitions: press focuses the hit window and
+                 * starts a title-bar drag; release ends it. */
                 if (bt != s_ptr_buttons) {
                     int focus_changed = 0;
                     int fx = 0, fy = 0, fw = 0, fh = 0;
@@ -740,31 +811,43 @@ static void gui_input_main(void *arg) {
                     s_ptr_buttons = bt;
                     if (pressed) {
                         int hit = hit_test(s_ptr_x, s_ptr_y);
-                        if (hit != 0 && hit != s_focus_id) {
-                            /* Title-bar highlight moves: redraw both. */
-                            gui_win_t *old = win_find(s_focus_id);
-                            gui_win_t *neu = win_find(hit);
-                            if (old) {
-                                fx = old->x;
-                                fy = old->y;
-                                fw = old->w + 2 * GUI_BORDER;
-                                fh = old->h + 2 * GUI_BORDER + GUI_TITLE_H;
+                        if (hit != 0) {
+                            /* Dragging starts when the press lands on
+                             * the window's border/title-bar strip. */
+                            gui_win_t *hw = win_find(hit);
+                            if (hw && s_ptr_y >= hw->y &&
+                                s_ptr_y < hw->y + GUI_BORDER + GUI_TITLE_H) {
+                                s_drag_id  = hit;
+                                s_drag_offx = s_ptr_x - hw->x;
+                                s_drag_offy = s_ptr_y - hw->y;
                             }
-                            if (neu) {
-                                gui_dirty_add(neu->x, neu->y,
-                                              neu->w + 2 * GUI_BORDER,
-                                              neu->h + 2 * GUI_BORDER +
-                                                  GUI_TITLE_H);
+                            if (hit != s_focus_id) {
+                                gui_win_t *old = win_find(s_focus_id);
+                                gui_win_t *neu = win_find(hit);
+                                if (old) {
+                                    fx = old->x;
+                                    fy = old->y;
+                                    fw = old->w + 2 * GUI_BORDER;
+                                    fh = old->h + 2 * GUI_BORDER + GUI_TITLE_H;
+                                }
+                                if (neu) {
+                                    gui_dirty_add(neu->x, neu->y,
+                                                  neu->w + 2 * GUI_BORDER,
+                                                  neu->h + 2 * GUI_BORDER +
+                                                      GUI_TITLE_H);
+                                }
+                                focus_changed = 1;
+                                s_focus_id    = hit;
+                            } else {
+                                s_focus_id = hit;
                             }
-                            focus_changed = 1;
-                            s_focus_id    = hit;
-                        } else if (hit != 0) {
-                            s_focus_id = hit;
                         }
                         ev_push(GUI_EV_BUTTON, 1, s_ptr_x, s_ptr_y);
                     }
-                    if (released)
+                    if (released) {
+                        s_drag_id = 0; /* end the drag */
                         ev_push(GUI_EV_BUTTON, 0, s_ptr_x, s_ptr_y);
+                    }
                     if (s_lock >= 0)
                         (void)mutex_unlock(s_lock);
                     if (focus_changed && fw > 0)

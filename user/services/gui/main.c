@@ -92,8 +92,83 @@ static void ev_push(u32 type, u32 code, i32 x, i32 y) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Compositing                                                         */
+/* Dirty-rectangle compositing                                         */
+/*                                                                     */
+/* Instead of repainting the whole 1024x768 framebuffer on every       */
+/* event, every mutation records the rect it changed; gui_composite()  */
+/* repaints ONLY that rect (background + the clipped parts of every    */
+/* window intersecting it + the pointer).  Mouse movement therefore    */
+/* redraws just a small square, which both cuts framebuffer writes and */
+/* shrinks the VNC dirty region — the visible refresh-rate win.        */
 /* ------------------------------------------------------------------ */
+
+typedef struct {
+    int x, y, w, h;
+} gui_rect_t;
+
+static gui_rect_t s_dirty;
+static int        s_dirty_valid;
+
+static void gui_dirty_add(int x, int y, int w, int h) {
+    if (s_lock >= 0)
+        (void)mutex_lock(s_lock);
+    if (w <= 0 || h <= 0)
+        goto out;
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x >= (int)s_fb.w || y >= (int)s_fb.h || w <= 0 || h <= 0)
+        goto out;
+    if (x + w > (int)s_fb.w)
+        w = (int)s_fb.w - x;
+    if (y + h > (int)s_fb.h)
+        h = (int)s_fb.h - y;
+    if (!s_dirty_valid) {
+        s_dirty.x = x;
+        s_dirty.y = y;
+        s_dirty.w = w;
+        s_dirty.h = h;
+        s_dirty_valid = 1;
+        goto out;
+    }
+    /* Union into the pending rect. */
+    {
+        int x1 = s_dirty.x + s_dirty.w;
+        int y1 = s_dirty.y + s_dirty.h;
+        if (x < s_dirty.x)
+            s_dirty.x = x;
+        if (y < s_dirty.y)
+            s_dirty.y = y;
+        if (x + w > x1)
+            x1 = x + w;
+        if (y + h > y1)
+            y1 = y + h;
+        s_dirty.w = x1 - s_dirty.x;
+        s_dirty.h = y1 - s_dirty.y;
+    }
+out:
+    if (s_lock >= 0)
+        (void)mutex_unlock(s_lock);
+}
+
+static int rect_intersect(gui_rect_t a, gui_rect_t b, gui_rect_t *out) {
+    int x1 = (a.x + a.w < b.x + b.w) ? a.x + a.w : b.x + b.w;
+    int y1 = (a.y + a.h < b.y + b.h) ? a.y + a.h : b.y + b.h;
+    int x0 = (a.x > b.x) ? a.x : b.x;
+    int y0 = (a.y > b.y) ? a.y : b.y;
+    if (x1 <= x0 || y1 <= y0)
+        return 0;
+    out->x = x0;
+    out->y = y0;
+    out->w = x1 - x0;
+    out->h = y1 - y0;
+    return 1;
+}
 
 static void draw_titlebar(gui_win_t *w) {
     int tx = w->x + GUI_BORDER;
@@ -114,15 +189,21 @@ static void draw_titlebar(gui_win_t *w) {
 }
 
 static void gui_composite(void) {
-    if (!s_active)
+    if (!s_active || !s_dirty_valid)
         return;
     if (s_lock >= 0)
         (void)mutex_lock(s_lock);
 
-    /* Desktop background. */
-    gui_fill(&s_fb, 0, 0, (int)s_fb.w, (int)s_fb.h, GUI_BG_COLOR);
+    gui_rect_t d = s_dirty;
+    s_dirty_valid = 0;
 
-    /* Windows in creation order (later = on top; focus drawn last). */
+    /* Desktop background inside the dirty rect. */
+    gui_fill(&s_fb, d.x, d.y, d.w, d.h, GUI_BG_COLOR);
+
+    /* Windows in creation order (later = on top; focus drawn last).
+     * Each window repaints only its intersection with the dirty rect
+     * (border + title bar are cheap whole-window draws; the content
+     * blit is clipped). */
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
             gui_win_t *w = &s_wins[i];
@@ -132,19 +213,40 @@ static void gui_composite(void) {
                 continue; /* focused window goes in the top pass */
             if (pass == 1 && w->id != s_focus_id)
                 continue;
-            /* Border frame. */
+
+            gui_rect_t wrect;
+            wrect.x = w->x;
+            wrect.y = w->y;
+            wrect.w = w->w + 2 * GUI_BORDER;
+            wrect.h = w->h + 2 * GUI_BORDER + GUI_TITLE_H;
+            gui_rect_t clip;
+            if (!rect_intersect(d, wrect, &clip))
+                continue;
+
+            /* Border frame + title bar (small, drawn whole). */
             gui_rect(&s_fb, w->x, w->y, w->w + 2 * GUI_BORDER,
                      w->h + 2 * GUI_BORDER + GUI_TITLE_H, GUI_BORDER_COLOR);
             draw_titlebar(w);
-            /* Content blit. */
-            gui_blit(&s_fb, w->x + GUI_BORDER, w->y + GUI_BORDER + GUI_TITLE_H,
-                     &w->buf, 0, 0, w->w, w->h);
+
+            /* Content blit: only the part of the window that changed. */
+            int cx0 = w->x + GUI_BORDER;
+            int cy0 = w->y + GUI_BORDER + GUI_TITLE_H;
+            gui_rect_t cclip;
+            gui_rect_t crect = {cx0, cy0, w->w, w->h};
+            if (rect_intersect(d, crect, &cclip)) {
+                gui_blit(&s_fb, cclip.x, cclip.y, &w->buf,
+                         cclip.x - cx0, cclip.y - cy0, cclip.w, cclip.h);
+            }
         }
     }
 
-    /* Pointer: a small filled square. */
-    if (s_ptr_x >= 0 && s_ptr_y >= 0)
-        gui_fill(&s_fb, s_ptr_x, s_ptr_y, 5, 5, GUI_PTR_COLOR);
+    /* Pointer: a small filled square (drawn last, on top). */
+    if (s_ptr_x >= 0 && s_ptr_y >= 0) {
+        gui_rect_t prect = {s_ptr_x, s_ptr_y, 5, 5};
+        gui_rect_t pclip;
+        if (rect_intersect(d, prect, &pclip))
+            gui_fill(&s_fb, s_ptr_x, s_ptr_y, 5, 5, GUI_PTR_COLOR);
+    }
 
     if (s_lock >= 0)
         (void)mutex_unlock(s_lock);
@@ -225,6 +327,8 @@ static void do_create(int token, int msg_len, u64 caller) {
         (void)mutex_unlock(s_lock);
 
     resp->ret = slot->id;
+    gui_dirty_add(slot->x, slot->y, slot->w + 2 * GUI_BORDER,
+                  slot->h + 2 * GUI_BORDER + GUI_TITLE_H);
     gui_composite();
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
@@ -249,6 +353,11 @@ static void do_destroy(int token, int msg_len, u64 caller) {
         (void)ipc_reply(token, resp, (int)sizeof(*resp));
         return;
     }
+    /* Capture the geometry BEFORE freeing the slot (needed for the
+     * dirty rect, which must be recorded outside the lock). */
+    int dx = w->x, dy = w->y;
+    int dw = w->w + 2 * GUI_BORDER;
+    int dh = w->h + 2 * GUI_BORDER + GUI_TITLE_H;
     free(w->buf.buf);
     memset(w, 0, sizeof(*w));
     if (s_focus_id == id)
@@ -257,6 +366,7 @@ static void do_destroy(int token, int msg_len, u64 caller) {
         (void)mutex_unlock(s_lock);
 
     resp->ret = 0;
+    gui_dirty_add(dx, dy, dw, dh);
     gui_composite();
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
@@ -280,12 +390,17 @@ static void do_move(int token, int msg_len, u64 caller) {
         (void)ipc_reply(token, resp, (int)sizeof(*resp));
         return;
     }
+    int ox = w->x, oy = w->y;
+    int ow = w->w + 2 * GUI_BORDER;
+    int oh = w->h + 2 * GUI_BORDER + GUI_TITLE_H;
     w->x = a[1];
     w->y = a[2];
     if (s_lock >= 0)
         (void)mutex_unlock(s_lock);
 
     resp->ret = 0;
+    gui_dirty_add(ox, oy, ow, oh); /* old spot */
+    gui_dirty_add(w->x, w->y, ow, oh); /* new spot */
     gui_composite();
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
@@ -309,11 +424,32 @@ static void do_focus(int token, int msg_len, u64 caller) {
         (void)ipc_reply(token, resp, (int)sizeof(*resp));
         return;
     }
-    s_focus_id = id;
+    int old_focus = s_focus_id;
+    s_focus_id    = id;
     if (s_lock >= 0)
         (void)mutex_unlock(s_lock);
 
     resp->ret = 0;
+    /* Title-bar highlight changed on the old and the new focused
+     * window — redraw both whole windows. */
+    if (old_focus != id) {
+        int ox = 0, oy = 0, ow = 0, oh = 0;
+        if (s_lock >= 0)
+            (void)mutex_lock(s_lock);
+        gui_win_t *old = win_find(old_focus);
+        if (old) {
+            ox = old->x;
+            oy = old->y;
+            ow = old->w + 2 * GUI_BORDER;
+            oh = old->h + 2 * GUI_BORDER + GUI_TITLE_H;
+        }
+        if (s_lock >= 0)
+            (void)mutex_unlock(s_lock);
+        if (ow > 0)
+            gui_dirty_add(ox, oy, ow, oh);
+        gui_dirty_add(w->x, w->y, w->w + 2 * GUI_BORDER,
+                      w->h + 2 * GUI_BORDER + GUI_TITLE_H);
+    }
     gui_composite();
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
@@ -342,6 +478,8 @@ static void do_fill(int token, int msg_len, u64 caller) {
         (void)mutex_unlock(s_lock);
 
     resp->ret = 0;
+    gui_dirty_add(w->x + GUI_BORDER + f->x, w->y + GUI_BORDER + GUI_TITLE_H + f->y,
+                  f->w, f->h);
     gui_composite();
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
@@ -371,6 +509,8 @@ static void do_text(int token, int msg_len, u64 caller) {
         (void)mutex_unlock(s_lock);
 
     resp->ret = 0;
+    gui_dirty_add(w->x + GUI_BORDER + t->x, w->y + GUI_BORDER + GUI_TITLE_H + t->y,
+                  (int)strlen(t->text) * 8, 16);
     gui_composite();
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
@@ -431,6 +571,7 @@ static void do_activate(int token, u64 caller) {
     }
 
     resp->ret = 0;
+    gui_dirty_add(0, 0, (int)s_fb.w, (int)s_fb.h);
     gui_composite();
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
@@ -449,6 +590,7 @@ static void do_deactivate(int token) {
     if (s_lock >= 0)
         (void)mutex_lock(s_lock);
     s_active = 0;
+    s_dirty_valid = 0; /* drop any pending rect: the screen is handed back */
     if (s_lock >= 0)
         (void)mutex_unlock(s_lock);
 
@@ -564,8 +706,11 @@ static void gui_input_main(void *arg) {
                 i32 dy = ((i32 *)(resp + 4))[1];
                 u8  bt = (u8)((i32 *)(resp + 4))[2];
                 if (dx != 0 || dy != 0) {
+                    int ox, oy;
                     if (s_lock >= 0)
                         (void)mutex_lock(s_lock);
+                    ox = s_ptr_x;
+                    oy = s_ptr_y;
                     s_ptr_x += dx;
                     s_ptr_y -= dy; /* PS/2 Y is up-positive */
                     if (s_ptr_x < 0)
@@ -579,10 +724,15 @@ static void gui_input_main(void *arg) {
                     ev_push(GUI_EV_MOUSEMOVE, 0, s_ptr_x, s_ptr_y);
                     if (s_lock >= 0)
                         (void)mutex_unlock(s_lock);
+                    /* Redraw only the old + new pointer squares. */
+                    gui_dirty_add(ox - 1, oy - 1, 7, 7);
+                    gui_dirty_add(s_ptr_x - 1, s_ptr_y - 1, 7, 7);
                     changed = 1;
                 }
                 /* Button transitions: press focuses the hit window. */
                 if (bt != s_ptr_buttons) {
+                    int focus_changed = 0;
+                    int fx = 0, fy = 0, fw = 0, fh = 0;
                     if (s_lock >= 0)
                         (void)mutex_lock(s_lock);
                     u8 pressed = bt & ~s_ptr_buttons;
@@ -590,14 +740,35 @@ static void gui_input_main(void *arg) {
                     s_ptr_buttons = bt;
                     if (pressed) {
                         int hit = hit_test(s_ptr_x, s_ptr_y);
-                        if (hit != 0)
+                        if (hit != 0 && hit != s_focus_id) {
+                            /* Title-bar highlight moves: redraw both. */
+                            gui_win_t *old = win_find(s_focus_id);
+                            gui_win_t *neu = win_find(hit);
+                            if (old) {
+                                fx = old->x;
+                                fy = old->y;
+                                fw = old->w + 2 * GUI_BORDER;
+                                fh = old->h + 2 * GUI_BORDER + GUI_TITLE_H;
+                            }
+                            if (neu) {
+                                gui_dirty_add(neu->x, neu->y,
+                                              neu->w + 2 * GUI_BORDER,
+                                              neu->h + 2 * GUI_BORDER +
+                                                  GUI_TITLE_H);
+                            }
+                            focus_changed = 1;
+                            s_focus_id    = hit;
+                        } else if (hit != 0) {
                             s_focus_id = hit;
+                        }
                         ev_push(GUI_EV_BUTTON, 1, s_ptr_x, s_ptr_y);
                     }
                     if (released)
                         ev_push(GUI_EV_BUTTON, 0, s_ptr_x, s_ptr_y);
                     if (s_lock >= 0)
                         (void)mutex_unlock(s_lock);
+                    if (focus_changed && fw > 0)
+                        gui_dirty_add(fx, fy, fw, fh);
                     changed = 1;
                 }
             }

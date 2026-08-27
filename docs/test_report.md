@@ -444,3 +444,11 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **P4 gui_demo + shell `gui` 命令**：ACTIVATE 桌面 → 3 窗口（Keys 键盘回显 / Canvas 点击画板 / Info 指针）→ q 退出 → DEACTIVATE + term 重绘恢复 shell；manager 启动 gui 服务 | ✅ QEMU 验证：键盘事件到达（KEY code=97/98）、点击画方块（颜色变化）、q 退出干净恢复 |
 | **字节序排障**：QEMU VGA 32bpp 为 xRGB（byte1=R）——颜色按 0x00RRGGBB 直观定义，写入时 `gui_xrgb` 转换；vga_decode 只识别 term 文本屏，GUI 验证用 PPM 像素采样 | ✅ |
 | 全量冒烟（--drive）回归 | ✅ 待确认 |
+
+### 第十一轮补充 1（2026-08-27）：GUI 刷新率优化 — 脏区合成
+
+| 项 | 结果 |
+|---|---|
+| **问题**：每次事件（鼠标移动/绘制/按键）都全屏重合成——1024x768 背景 fill + 所有窗口整窗 blit（~3MB fb 写入/帧），VNC 每帧全屏 dirty → 刷新率过低 | ✅ |
+| **修复**：脏矩形合成——每次 mutation 记录变化矩形（`gui_dirty_add`，带锁合并包围盒）；`gui_composite` 只重绘 dirty 矩形：背景 fill 裁剪、窗口按 z-order 画与 dirty 的交集（边框+标题整窗小开销、内容 blit 裁剪）、指针裁剪。各 op 的 dirty：CREATE/DESTROY=窗口区域；MOVE=旧∪新区域；FOCUS=新旧标题栏；FILL/TEXT=精确矩形；鼠标移动=旧∪新指针 7x7 方框；ACTIVATE=全屏 | ✅ |
+| **验证**：鼠标跨窗口移动后内容完好（脏区重绘正确）；点击画板/键盘回显/q 退出恢复全部正常 | ✅ |

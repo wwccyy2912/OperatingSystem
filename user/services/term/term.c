@@ -83,6 +83,10 @@ typedef int32_t  i32;
 #define TERM_OP_SNAPSHOT    8 /* save a cell region: {x,y,w,h} -> cells[] */
 #define TERM_OP_RESTORE     9 /* redraw a saved cell region: {x,y,w,h,cells} */
 #define TERM_OP_SCROLLVIEW  10 /* {i32 delta}: page through scrollback */
+#define TERM_OP_REDRAW      11 /* repaint the whole screen from s_cells
+                                * (the GUI compositor restores the text
+                                * screen with this after it releases the
+                                * framebuffer) */
 
 #define TERM_MAX_DATA 256 /* max payload bytes per request */
 
@@ -923,6 +927,19 @@ static void term_handle_request(int token, int msg_len) {
                 s_sb_view = s_sb_count;
             term_show_scrollback(s_sb_view);
         }
+        if (s_render_lock >= 0)
+            (void)mutex_unlock(s_render_lock);
+        term_reply(token, 0);
+    } else if (req->op == TERM_OP_REDRAW) {
+        /* REDRAW: repaint the whole screen from s_cells.  The GUI
+         * compositor calls this after releasing the framebuffer so the
+         * text screen reappears exactly as the shell left it. */
+        if (s_render_lock >= 0)
+            (void)mutex_lock(s_render_lock);
+        for (u32 r = 0; r < s_rows; r++)
+            for (u32 c = 0; c < s_cols; c++)
+                term_draw_cell(c, r, s_cells[r][c], TERM_FG, TERM_BG);
+        term_draw_cursor();
         if (s_render_lock >= 0)
             (void)mutex_unlock(s_render_lock);
         term_reply(token, 0);

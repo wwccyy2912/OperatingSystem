@@ -102,6 +102,7 @@ static service_t s_services[] = {
     {"user", -1, 0, 1}, /* user account service (login/passwd/stop guard) */
     {"wm", -1, 0, 1},   /* window manager (v0.4 desktop: registry+compositor) */
     {"policy", -1, 0, 1}, /* command policy service (v0.5, before shell)    */
+    {"gui", -1, 0, 1},  /* pixel compositor (idle until GUI_OP_ACTIVATE)  */
 };
 
 /* Restartable services (production hardening): crash → auto-restart up
@@ -125,6 +126,7 @@ static service_t s_services[] = {
 #define SVC_USER          11
 #define SVC_WM            12
 #define SVC_POLICY        13
+#define SVC_GUI           14
 
 /* ====================================================================
  * Serial service output (mirrors shell.c)
@@ -482,6 +484,14 @@ int main(void) {
     if (spawn_service(&s_services[SVC_KEYBOARD], 0) < 0)
         for (;;)
             thread_yield();
+
+    /* ---- 3b. GUI compositor ----
+     * Pixel window compositor: maps the framebuffer (blob-identity
+     * seeded with ATOM_SERVICE_MANAGE), idles until a client calls
+     * GUI_OP_ACTIVATE.  Started with the display group so the "gui"
+     * port exists before the shell offers the `gui` command. */
+    if (spawn_service(&s_services[SVC_GUI], 0) < 0)
+        manager_printf("manager: gui spawn failed\n");
 
     /* ---- 4. Flaky demo service ----
      * Only flaky is started here: it is IPC-silent (sleep + exit), so

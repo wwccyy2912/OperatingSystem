@@ -433,3 +433,14 @@ R2.9（runtime_demo/tui_demo 专项补测）此前因 demo 未接线 Makefile �
 | **⑨ 历史命令编辑**：三重根因——(a) extended Left 键映射 0x08 与 Backspace 冲突（按 Left 变删除）→ 改为 0x10 (DLE)；(b) 行编辑是覆盖语义，光标在行中时输入覆盖后续字符 → 改为插入（尾部右移 + 整行 redraw），Backspace 支持中间删除；(c) Enter 分支 `buf[pos]='\0'` 在光标不在行尾时截断命令 → 改为提交完整 strlen | ✅ Up 取回 → Left 移动 → 插入 → 执行输出完整 |
 | **⑩ 行缓冲残留（输入串扰根因）**：`read_line_impl` 不清空复用缓冲，短命令后残留上一命令尾部（"xyz" 后输入 "w" 得 "wxyz"）——这同时是此前 "pwdcd"/"sadmin"/"ycat" 类串扰的另一根因 → 开头清空 + 每次编辑后保持 NUL 终止 | ✅ "w" 不再变 "wxyz" |
 | **⑪ exec 运行可执行文件**：`exec <path>` 新增 VFS 磁盘文件分支（含相对路径解析）——读取文件内容后 `process_create` 运行，进程名取 basename；`exec <blob>` 保持内嵌 blob 分支 | ✅ `exec /Disk/runme.txt` 读 5 字节；非 ELF 拒绝 (-2)；`exec hello` 创建 PID |
+
+### 第十一轮（2026-08-27）：像素级 GUI（libgui + 鼠标 + 合成器 + demo）
+
+| 项 | 结果 |
+|---|---|
+| **P1 libgui 像素库**：`gui_fb_open`（fb_get_info+fb_map 封装，ATOM_SERVICE_MANAGE 门禁）；`gui_pixel/fill/hline/vline/rect`（32bpp xRGB 与 24bpp BGR 双格式、裁剪）；`gui_text`（8x16 VGA 字体，透明/不透明背景）；`gui_blit`（同 bpp 区域拷贝） | ✅ 编译 0 警告 |
+| **P2 PS/2 鼠标**（并入 keyboard 服务，同一控制器）：IRQ12 + 辅助口初始化（0xA8/命令字节 bit1+bit5/0xD4+0xF6/0xD4+0xF4），`bind_irq` 自动解 PIC 屏蔽；`kbd_rx_drain` 按状态寄存器 bit5 区分键盘/鼠标；3 字节包解析（9 位补码增量 + 3 按钮，ACK 不进状态机修复相位错位）；`KBD_OP_MOUSE_READ` 增量读取；shell `mouse` 命令 | ✅ QEMU mouse_move 20 10 → dx=20 dy=-10 |
+| **P3 gui 合成器**（新服务，blob 种子含 ATOM_SERVICE_MANAGE）：窗口表（创建/销毁/移动/聚焦，owner subject 门禁）+ 离屏 32bpp 窗口缓冲 + z-order 合成（聚焦窗口置顶 + 高亮标题栏 + 边框）+ 桌面背景 + 指针；键盘/鼠标输入线程（KBD_OP_READ/MOUSE_READ 轮询）→ 命中测试聚焦 → 事件环形队列（GUI_OP_POLL）；`TERM_OP_REDRAW`（11）供 DEACTIVATE 恢复文本屏幕 | ✅ 像素采样验证窗口/标题/内容全部渲染 |
+| **P4 gui_demo + shell `gui` 命令**：ACTIVATE 桌面 → 3 窗口（Keys 键盘回显 / Canvas 点击画板 / Info 指针）→ q 退出 → DEACTIVATE + term 重绘恢复 shell；manager 启动 gui 服务 | ✅ QEMU 验证：键盘事件到达（KEY code=97/98）、点击画方块（颜色变化）、q 退出干净恢复 |
+| **字节序排障**：QEMU VGA 32bpp 为 xRGB（byte1=R）——颜色按 0x00RRGGBB 直观定义，写入时 `gui_xrgb` 转换；vga_decode 只识别 term 文本屏，GUI 验证用 PPM 像素采样 | ✅ |
+| 全量冒烟（--drive）回归 | ✅ 待确认 |

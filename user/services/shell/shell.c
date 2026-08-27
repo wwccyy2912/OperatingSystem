@@ -100,6 +100,7 @@ static int cmd_free(int argc, char *argv[]);
 static int cmd_clear(int argc, char *argv[]);
 static int cmd_cap(int argc, char *argv[]);
 static int cmd_mouse(int argc, char *argv[]);
+static int cmd_gui(int argc, char *argv[]);
 static int cmd_ports(int argc, char *argv[]);
 static int cmd_sleep(int argc, char *argv[]);
 static int cmd_threads(int argc, char *argv[]);
@@ -1940,6 +1941,34 @@ static int cmd_mouse(int argc, char *argv[]) {
     return 0;
 }
 
+/* gui — enter the pixel desktop: spawn gui_demo (it activates the
+ * compositor and takes the keyboard focus), wait for it to exit, then
+ * return to the text shell. */
+static int cmd_gui(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    static char blob_buf[262144];
+    int         size = blob_get("gui_demo", blob_buf, sizeof(blob_buf));
+    if (size < 0) {
+        shell_printf("gui: gui_demo blob unavailable (%d)\n", size);
+        return 1;
+    }
+    int pid = process_create("gui_demo", blob_buf, size);
+    if (pid < 0) {
+        shell_printf("gui: spawn FAILED (%d)\n", pid);
+        return 1;
+    }
+    shell_printf("gui: desktop up (PID %d) - press q inside to quit\n", pid);
+    int exit_code = 0;
+    int r         = process_wait(pid, &exit_code);
+    if (r != pid) {
+        shell_printf("gui: wait FAILED (%d)\n", r);
+        return 1;
+    }
+    shell_printf("gui: desktop closed (exit %d)\n", exit_code);
+    return 0;
+}
+
 static int cmd_ports(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
@@ -2956,6 +2985,7 @@ static void shell_main(void *arg) {
     shell_register_command("clear", "Clear the terminal", cmd_clear);
     shell_register_command("cap", "Create a capability (test)", cmd_cap);
     shell_register_command("mouse", "Read the PS/2 mouse state (dx dy buttons)", cmd_mouse);
+    shell_register_command("gui", "Enter the pixel desktop (gui_demo)", cmd_gui);
     shell_register_command("ports", "List registered IPC ports", cmd_ports);
     shell_register_command("sleep", "Sleep for N ticks: sleep <ticks>", cmd_sleep);
     shell_register_command("threads", "Spawn a test worker thread", cmd_threads);

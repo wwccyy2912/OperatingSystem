@@ -52,6 +52,17 @@ void gui_fb_close(gui_canvas_t *c) {
 
 /* ---- Drawing ---- */
 
+/* Convert a 0x00RRGGBB color to the framebuffer's 32bpp xRGB word:
+ * the QEMU VGA 32bpp layout is [unused, R, G, B] in memory (little
+ * endian byte1 = R), so a color's red byte must land at bit 8.  Window
+ * buffers use the SAME xRGB words, so blits copy verbatim. */
+static u32 gui_xrgb(u32 color) {
+    u8 r  = (u8)(color >> 16);
+    u8 g  = (u8)(color >> 8);
+    u8 b  = (u8)(color);
+    return ((u32)b << 24) | ((u32)g << 16) | ((u32)r << 8);
+}
+
 void gui_pixel(gui_canvas_t *c, int x, int y, u32 color) {
     if (!c || !c->buf)
         return;
@@ -59,7 +70,7 @@ void gui_pixel(gui_canvas_t *c, int x, int y, u32 color) {
         return;
 
     if (c->bpp == 32) {
-        *(volatile u32 *)(c->buf + (u64)y * c->pitch + (u64)x * 4) = color;
+        *(volatile u32 *)(c->buf + (u64)y * c->pitch + (u64)x * 4) = gui_xrgb(color);
     } else if (c->bpp == 24) {
         volatile u8 *p = c->buf + (u64)y * c->pitch + (u64)x * 3;
         p[0]           = (u8)(color);
@@ -89,10 +100,11 @@ void gui_fill(gui_canvas_t *c, int x, int y, int w, int h, u32 color) {
         return;
 
     if (c->bpp == 32) {
+        u32 px = gui_xrgb(color);
         for (int row = 0; row < h; row++) {
             volatile u32 *line = (volatile u32 *)(c->buf + (u64)(y + row) * c->pitch);
             for (int col = 0; col < w; col++)
-                line[x + col] = color;
+                line[x + col] = px;
         }
     } else if (c->bpp == 24) {
         u8 b = (u8)(color);

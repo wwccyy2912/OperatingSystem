@@ -133,6 +133,7 @@ USER_C := \
     user/services/wm_demo/main.c \
     user/services/policy/main.c \
     user/lib/libtui/tui.c \
+    user/lib/libgui/gui.c \
     user/lib/libwm/wm.c \
     user/lib/libfs/fs.c \
     user/lib/libpkg/pkg.c

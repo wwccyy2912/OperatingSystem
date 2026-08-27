@@ -99,6 +99,7 @@ static int cmd_pid(int argc, char *argv[]);
 static int cmd_free(int argc, char *argv[]);
 static int cmd_clear(int argc, char *argv[]);
 static int cmd_cap(int argc, char *argv[]);
+static int cmd_mouse(int argc, char *argv[]);
 static int cmd_ports(int argc, char *argv[]);
 static int cmd_sleep(int argc, char *argv[]);
 static int cmd_threads(int argc, char *argv[]);
@@ -1915,6 +1916,30 @@ static int cmd_cap(int argc, char *argv[]) {
     return 0;
 }
 
+/* mouse — read the PS/2 mouse state once ({dx, dy, buttons} deltas
+ * since the last read; buttons bit0=left bit1=right bit2=middle). */
+static int cmd_mouse(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    if (s_kbd_port < 0) {
+        shell_write("mouse: keyboard service unavailable\n");
+        return -1;
+    }
+    u32 req[2];
+    u8  resp[16];
+    req[0] = 5; /* KBD_OP_MOUSE_READ */
+    req[1] = 12;
+    int resp_len = (int)sizeof(resp);
+    int r        = ipc_call(s_kbd_port, req, 8, resp, &resp_len);
+    if (r < 0 || resp_len < 4 + 12) {
+        shell_printf("mouse: FAILED (%d)\n", r);
+        return -1;
+    }
+    i32 *d = (i32 *)(resp + 4);
+    shell_printf("mouse: dx=%d dy=%d buttons=%d\n", d[0], d[1], d[2]);
+    return 0;
+}
+
 static int cmd_ports(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
@@ -2930,6 +2955,7 @@ static void shell_main(void *arg) {
     shell_register_command("free", "Show free physical memory", cmd_free);
     shell_register_command("clear", "Clear the terminal", cmd_clear);
     shell_register_command("cap", "Create a capability (test)", cmd_cap);
+    shell_register_command("mouse", "Read the PS/2 mouse state (dx dy buttons)", cmd_mouse);
     shell_register_command("ports", "List registered IPC ports", cmd_ports);
     shell_register_command("sleep", "Sleep for N ticks: sleep <ticks>", cmd_sleep);
     shell_register_command("threads", "Spawn a test worker thread", cmd_threads);

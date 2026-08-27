@@ -1,0 +1,232 @@
+/*
+ * gui.c - Pixel graphics library implementation (see gui.h)
+ * Copyright (c) 2026 OpSys Project
+ */
+
+#include "gui.h"
+
+#include <libos/syscalls.h>
+#include <stddef.h>
+
+/* ---- Framebuffer ---- */
+
+int gui_fb_open(gui_canvas_t *c) {
+    if (!c)
+        return -2; /* ERR_INVAL */
+
+    fb_user_info_t info;
+    int            ret = fb_get_info(&info);
+    if (ret < 0)
+        return ret;
+
+    u64 fb_size;
+    if (info.vga_text) {
+        /* VGA text mode: the term service owns the text buffer; a pixel
+         * GUI cannot render into it.  Refuse so the compositor fails
+         * loudly instead of drawing into nothing. */
+        return -2; /* ERR_INVAL */
+    }
+    fb_size = (u64)info.pitch * info.height;
+
+    /* Pick a page-aligned user address below the 4 GiB mark (the same
+     * convention term uses) and map the framebuffer. */
+    u64 virt = 0x60000000ULL;
+    void *mapped = fb_map((void *)virt, fb_size);
+    if (mapped == NULL || (uintptr_t)mapped == 0)
+        return -1; /* ERR_NOMEM / gated */
+
+    c->w     = info.width;
+    c->h     = info.height;
+    c->pitch = info.pitch;
+    c->bpp   = info.bpp;
+    c->buf   = (u8 *)mapped;
+    return 0;
+}
+
+void gui_fb_close(gui_canvas_t *c) {
+    /* No unmap syscall is exposed today; the mapping lives for the
+     * process lifetime.  Zero the descriptor so it cannot be reused. */
+    if (c)
+        c->buf = NULL;
+}
+
+/* ---- Drawing ---- */
+
+void gui_pixel(gui_canvas_t *c, int x, int y, u32 color) {
+    if (!c || !c->buf)
+        return;
+    if (x < 0 || y < 0 || (u32)x >= c->w || (u32)y >= c->h)
+        return;
+
+    if (c->bpp == 32) {
+        *(volatile u32 *)(c->buf + (u64)y * c->pitch + (u64)x * 4) = color;
+    } else if (c->bpp == 24) {
+        volatile u8 *p = c->buf + (u64)y * c->pitch + (u64)x * 3;
+        p[0]           = (u8)(color);
+        p[1]           = (u8)(color >> 8);
+        p[2]           = (u8)(color >> 16);
+    }
+}
+
+void gui_fill(gui_canvas_t *c, int x, int y, int w, int h, u32 color) {
+    if (!c || !c->buf || w <= 0 || h <= 0)
+        return;
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x >= (int)c->w || y >= (int)c->h)
+        return;
+    if (x + w > (int)c->w)
+        w = (int)c->w - x;
+    if (y + h > (int)c->h)
+        h = (int)c->h - y;
+    if (w <= 0 || h <= 0)
+        return;
+
+    if (c->bpp == 32) {
+        for (int row = 0; row < h; row++) {
+            volatile u32 *line = (volatile u32 *)(c->buf + (u64)(y + row) * c->pitch);
+            for (int col = 0; col < w; col++)
+                line[x + col] = color;
+        }
+    } else if (c->bpp == 24) {
+        u8 b = (u8)(color);
+        u8 g = (u8)(color >> 8);
+        u8 r = (u8)(color >> 16);
+        for (int row = 0; row < h; row++) {
+            volatile u8 *line = c->buf + (u64)(y + row) * c->pitch;
+            for (int col = 0; col < w; col++) {
+                u32 off   = (u32)(x + col) * 3;
+                line[off] = b;
+                line[off + 1] = g;
+                line[off + 2] = r;
+            }
+        }
+    }
+}
+
+void gui_hline(gui_canvas_t *c, int x, int y, int len, u32 color) {
+    if (len < 0) {
+        x += len;
+        len = -len;
+    }
+    gui_fill(c, x, y, len, 1, color);
+}
+
+void gui_vline(gui_canvas_t *c, int x, int y, int len, u32 color) {
+    if (len < 0) {
+        y += len;
+        len = -len;
+    }
+    gui_fill(c, x, y, 1, len, color);
+}
+
+void gui_rect(gui_canvas_t *c, int x, int y, int w, int h, u32 color) {
+    if (w <= 0 || h <= 0)
+        return;
+    gui_hline(c, x, y, w, color);
+    gui_hline(c, x, y + h - 1, w, color);
+    gui_vline(c, x, y, h, color);
+    gui_vline(c, x + w - 1, y, h, color);
+}
+
+/* ---- Text (8x16 VGA font, 95 printable ASCII glyphs) ---- */
+
+#include "font.h"
+
+void gui_text(gui_canvas_t *c, int x, int y, const char *s, u32 fg, u32 bg) {
+    if (!c || !c->buf || !s)
+        return;
+
+    int px = x;
+    for (const char *p = s; *p; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch < 0x20 || ch > 0x7E) {
+            px += 8; /* unsupported glyph: advance */
+            continue;
+        }
+        const u8 *glyph = gui_font[ch - 0x20];
+        for (int row = 0; row < 16; row++) {
+            u8 bits = glyph[row];
+            for (int col = 0; col < 8; col++) {
+                if (bits & (0x80 >> col)) {
+                    gui_pixel(c, px + col, y + row, fg);
+                } else if (bg != 0) {
+                    gui_pixel(c, px + col, y + row, bg);
+                }
+            }
+        }
+        px += 8;
+    }
+}
+
+/* ---- Blit (same-bpp region copy) ---- */
+
+void gui_blit(gui_canvas_t *dst, int dx, int dy,
+              const gui_canvas_t *src, int sx, int sy, int w, int h) {
+    if (!dst || !dst->buf || !src || !src->buf)
+        return;
+    if (dst->bpp != src->bpp || w <= 0 || h <= 0)
+        return;
+    if (sx < 0) {
+        w += sx;
+        dx -= sx;
+        sx = 0;
+    }
+    if (sy < 0) {
+        h += sy;
+        dy -= sy;
+        sy = 0;
+    }
+    if (dx < 0) {
+        w += dx;
+        sx -= dx;
+        dx = 0;
+    }
+    if (dy < 0) {
+        h += dy;
+        sy -= dy;
+        dy = 0;
+    }
+    if (w <= 0 || h <= 0)
+        return;
+    if (sx >= (int)src->w || sy >= (int)src->h || dx >= (int)dst->w || dy >= (int)dst->h)
+        return;
+    if (sx + w > (int)src->w)
+        w = (int)src->w - sx;
+    if (sy + h > (int)src->h)
+        h = (int)src->h - sy;
+    if (dx + w > (int)dst->w)
+        w = (int)dst->w - dx;
+    if (dy + h > (int)dst->h)
+        h = (int)dst->h - dy;
+    if (w <= 0 || h <= 0)
+        return;
+
+    if (src->bpp == 32) {
+        for (int row = 0; row < h; row++) {
+            const volatile u32 *sline =
+                (const volatile u32 *)(src->buf + (u64)(sy + row) * src->pitch);
+            volatile u32 *dline = (volatile u32 *)(dst->buf + (u64)(dy + row) * dst->pitch);
+            for (int col = 0; col < w; col++)
+                dline[dx + col] = sline[sx + col];
+        }
+    } else if (src->bpp == 24) {
+        for (int row = 0; row < h; row++) {
+            const volatile u8 *sline = src->buf + (u64)(sy + row) * src->pitch;
+            volatile u8 *dline       = dst->buf + (u64)(dy + row) * dst->pitch;
+            for (int col = 0; col < w; col++) {
+                u32 so = (u32)(sx + col) * 3;
+                u32 do_ = (u32)(dx + col) * 3;
+                dline[do_]     = sline[so];
+                dline[do_ + 1] = sline[so + 1];
+                dline[do_ + 2] = sline[so + 2];
+            }
+        }
+    }
+}

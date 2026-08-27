@@ -84,14 +84,27 @@ typedef uint64_t u64;
 #define KBD_IRQ      1
 #define KBD_IRQ_MASK 1u
 
+/* IRQ12 = PS/2 mouse (PIC slave line 4).  The mouse shares the 0x60/0x64
+ * I/O ports with the keyboard (one PS/2 controller), so the same driver
+ * owns both; the status register's bit 5 tells which device a byte came
+ * from. */
+#define MOUSE_IRQ      12
+#define MOUSE_IRQ_MASK (1u << 12)
+
 /* Protocol ops */
 #define KBD_OP_READ          1
 #define KBD_OP_READ_BLOCK    2
 #define KBD_OP_TAKE_FOCUS    3
 #define KBD_OP_RELEASE_FOCUS 4
+#define KBD_OP_MOUSE_READ    5 /* mouse: -> { i32 dx; i32 dy; i32 buttons } */
 #define KBD_MAX_DATA         256 /* max payload bytes per request */
 #define KBD_RX_RING_SIZE     256 /* ring buffer (holds 255 bytes) */
 #define KBD_PARK_MAX         4   /* park-table slots for READ_BLOCK */
+
+/* Mouse button bits (standard PS/2 packet byte 0) */
+#define MOUSE_BTN_LEFT  0x01
+#define MOUSE_BTN_RIGHT 0x02
+#define MOUSE_BTN_MID   0x04
 
 /* Scancode set-1: make codes for modifier keys */
 #define SC_LSHIFT_MAKE  0x2A
@@ -154,6 +167,21 @@ static kbd_park_t s_park[KBD_PARK_MAX] = {
     {0, -1, 0, 0, {0}},
     {0, -1, 0, 0, {0}},
 };
+
+/* Mouse state — the IRQ thread accumulates deltas, the server thread
+ * drains them on KBD_OP_MOUSE_READ (single writer per field via the
+ * pending flag; i32/u8 word writes are atomic enough here). */
+static volatile i32 s_mouse_dx;      /* accumulated X delta since last read */
+static volatile i32 s_mouse_dy;      /* accumulated Y delta since last read */
+static volatile u8  s_mouse_buttons; /* current button state */
+static volatile u8  s_mouse_pending; /* 1 = unread mouse data exists */
+
+/* Mouse packet assembler — IRQ thread only.  Standard 3-byte packet:
+ *   byte0: yovf xovf ysig xsig mid right left (bit3 always 1)
+ *   byte1: X delta (low 8 bits; bit4 of byte0 is the sign)
+ *   byte2: Y delta (low 8 bits; bit5 of byte0 is the sign) */
+static u8 s_mouse_phase; /* 0..2 */
+static u8 s_mouse_pkt[3];
 
 /* Scancode decode state — touched ONLY by the IRQ thread */
 static u8 s_extended; /* last byte was the 0xE0 prefix */
@@ -349,6 +377,29 @@ static void kbd_decode_byte(u8 sc) {
  * Reads status port 0x64; while bit 0 (output buffer full) is set,
  * read one byte from data port 0x60 and decode it.  Never blocks.
  */
+/* Assemble one 3-byte PS/2 mouse packet from the byte stream. */
+static void mouse_parse(u8 b) {
+    s_mouse_pkt[s_mouse_phase++] = b;
+    if (s_mouse_phase < 3)
+        return;
+    s_mouse_phase = 0;
+
+    u8 flags = s_mouse_pkt[0];
+    if (!(flags & 0x08))
+        return; /* bit3 must be 1: lost sync, drop the packet */
+
+    /* 9-bit two's-complement deltas: the sign bit lives in byte 0. */
+    i32 dx = (flags & 0x10) ? (i32)(s_mouse_pkt[1] - 256)
+                            : (i32)((signed char)s_mouse_pkt[1]);
+    i32 dy = (flags & 0x20) ? (i32)(s_mouse_pkt[2] - 256)
+                            : (i32)((signed char)s_mouse_pkt[2]);
+
+    s_mouse_dx += dx;
+    s_mouse_dy += dy;
+    s_mouse_buttons = flags & 0x07;
+    s_mouse_pending = 1;
+}
+
 static void kbd_rx_drain(void) {
     for (;;) {
         int st = io_read8(KBD_STATUS_PORT);
@@ -359,7 +410,10 @@ static void kbd_rx_drain(void) {
         int c = io_read8(KBD_DATA_PORT);
         if (c < 0)
             break;
-        kbd_decode_byte((u8)c);
+        if (st & 0x20)
+            mouse_parse((u8)c); /* status bit 5: byte came from the mouse */
+        else
+            kbd_decode_byte((u8)c); /* keyboard scancode */
     }
 }
 
@@ -442,6 +496,18 @@ static void kbd_handle_request(int token, u64 caller_subject) {
          * parked read. */
         s_focus_owner = caller_subject;
         kbd_reply(token, 0, NULL, 0);
+    } else if (req->op == KBD_OP_MOUSE_READ) {
+        /* Non-blocking mouse poll: drain the accumulated deltas and
+         * report { dx, dy, buttons } (3 x i32).  An idle mouse yields
+         * all zeros — the caller treats that as "no movement". */
+        static i32 m[3];
+        m[0] = (i32)s_mouse_dx;
+        m[1] = (i32)s_mouse_dy;
+        m[2] = (i32)s_mouse_buttons;
+        s_mouse_dx = 0;
+        s_mouse_dy = 0;
+        s_mouse_pending = 0;
+        kbd_reply(token, 12, (const u8 *)m, 12);
     } else if (req->op == KBD_OP_RELEASE_FOCUS) {
         /* Only the focus holder may release (the kernel-filled caller
          * subject is never 0, so focus free also means no holder). */
@@ -480,6 +546,80 @@ static void kbd_server_loop(int port) {
  * IRQ thread (spawned by kbd_service_main)
  * ==================================================================== */
 
+/* Wait for the PS/2 controller input buffer to drain (bit 1 of 0x64
+ * clear), so a command byte written to 0x64 is not clobbered. */
+static void mouse_wait_input_ready(void) {
+    for (int i = 0; i < 100000; i++) {
+        int st = io_read8(KBD_STATUS_PORT);
+        if (st < 0)
+            return;
+        if (!(st & 0x02))
+            return;
+    }
+}
+
+/* Wait for the PS/2 output buffer to fill (bit 0 of 0x64 set) and read
+ * one byte (an ACK 0xFA or device response).  Used only during device
+ * programming: the byte is DISCARDED, never fed to the packet state
+ * machine — an ACK would otherwise shift the 3-byte phase and corrupt
+ * every subsequent mouse packet. */
+static int mouse_wait_output(void) {
+    for (int i = 0; i < 100000; i++) {
+        int st = io_read8(KBD_STATUS_PORT);
+        if (st < 0)
+            return -1;
+        if (st & KBD_STATUS_OBF) {
+            int c = io_read8(KBD_DATA_PORT);
+            if (c < 0)
+                return -1;
+            return c;
+        }
+    }
+    return -1;
+}
+
+/* Programme the PS/2 controller + mouse (standard sequence):
+ *   1. 0xA8          enable the auxiliary (mouse) interface
+ *   2. read cmd byte, set bit1 (aux IRQ) + bit5 (aux clock), write back
+ *   3. 0xD4, 0xF6    send "defaults" to the mouse (it ACKs)
+ *   4. 0xD4, 0xF4    enable streaming mode (it ACKs) */
+static void mouse_init(void) {
+    mouse_wait_input_ready();
+    io_write8(KBD_STATUS_PORT, 0xA8);
+    mouse_wait_input_ready();
+
+    /* Controller command byte: enable aux IRQ + clock. */
+    io_write8(KBD_STATUS_PORT, 0x20);
+    mouse_wait_output(); /* read the current command byte */
+    int cmd = io_read8(KBD_DATA_PORT);
+    if (cmd < 0)
+        return;
+    mouse_wait_input_ready();
+    io_write8(KBD_STATUS_PORT, 0x60);
+    mouse_wait_input_ready();
+    io_write8(KBD_DATA_PORT, (u8)(cmd | 0x02 | 0x20));
+
+    /* Device defaults, then streaming on.  Each command is prefixed
+     * with 0xD4 (write next byte to the aux device). */
+    mouse_wait_input_ready();
+    io_write8(KBD_STATUS_PORT, 0xD4);
+    mouse_wait_input_ready();
+    io_write8(KBD_DATA_PORT, 0xF6);
+    (void)mouse_wait_output(); /* ACK 0xFA */
+
+    mouse_wait_input_ready();
+    io_write8(KBD_STATUS_PORT, 0xD4);
+    mouse_wait_input_ready();
+    io_write8(KBD_DATA_PORT, 0xF4);
+    (void)mouse_wait_output(); /* ACK 0xFA */
+
+    /* Reset the packet assembler: the ACKs above were consumed raw, so
+     * the next bytes on IRQ12 are a fresh packet starting at byte 0. */
+    s_mouse_phase = 0;
+
+    printf("keyboard: PS/2 mouse enabled (IRQ12)\n");
+}
+
 static void kbd_irq_main(void *arg) {
     (void)arg;
 
@@ -498,8 +638,22 @@ static void kbd_irq_main(void *arg) {
     }
     printf("keyboard: IRQ1 bound, PS/2 drain active\n");
 
+    /* Bind the mouse IRQ12 as well — the drain now routes bytes by the
+     * status register's device bit.  A failure is non-fatal (no mouse
+     * attached): the keyboard still works. */
+    int mouse_cap = cap_create_obj(CAP_TYPE_IRQ, RIGHT_READ, MOUSE_IRQ);
+    if (mouse_cap < 0) {
+        printf("keyboard: mouse cap_create failed (%d)\n", mouse_cap);
+    } else {
+        ret = bind_irq(mouse_cap, MOUSE_IRQ, MOUSE_IRQ_MASK);
+        if (ret < 0)
+            printf("keyboard: bind_irq(%d) failed (%d)\n", MOUSE_IRQ, ret);
+        else
+            printf("keyboard: IRQ12 bound, mouse drain active\n");
+    }
+
     for (;;) {
-        wait_notification(KBD_IRQ_MASK);
+        wait_notification(KBD_IRQ_MASK | MOUSE_IRQ_MASK);
         kbd_rx_drain();
 
         /* Complete a parked blocking READ if the drain routed keys into
@@ -540,6 +694,11 @@ static void kbd_service_main(void *arg) {
     /* 2. Flush any scancodes the BIOS left in the PS/2 output buffer,
      *    so stale data never masquerades as a fresh keypress. */
     kbd_rx_drain();
+
+    /* 2b. Programme the PS/2 mouse (aux interface on the same
+     *     controller).  Best effort: no mouse -> the IRQ12 path simply
+     *     never fires and KBD_OP_MOUSE_READ returns zeros. */
+    mouse_init();
 
     /* 3. IPC port, registered under the well-known name "keyboard". */
     int port = ipc_port_create();

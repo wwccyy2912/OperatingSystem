@@ -87,7 +87,7 @@ static int s_term_port = -1;
 /* Events                                                             */
 /* ------------------------------------------------------------------ */
 
-static void ev_push(u32 type, u32 code, i32 x, i32 y) {
+static void ev_push(u32 type, u32 code, i32 x, i32 y, i32 win) {
     if (s_ev_count >= GUI_MAX_EVENTS)
         return; /* ring full: drop the oldest-free slot semantics */
     u32 idx          = (s_ev_head + s_ev_count) % GUI_MAX_EVENTS;
@@ -95,6 +95,7 @@ static void ev_push(u32 type, u32 code, i32 x, i32 y) {
     s_events[idx].code = code;
     s_events[idx].x    = x;
     s_events[idx].y    = y;
+    s_events[idx].win  = win;
     s_ev_count++;
 }
 
@@ -729,7 +730,7 @@ static void gui_input_main(void *arg) {
                 for (i32 i = 0; i < n; i++) {
                     if (s_lock >= 0)
                         (void)mutex_lock(s_lock);
-                    ev_push(GUI_EV_KEY, (u8)resp[4 + i], s_ptr_x, s_ptr_y);
+                    ev_push(GUI_EV_KEY, (u8)resp[4 + i], s_ptr_x, s_ptr_y, s_focus_id);
                     if (s_lock >= 0)
                         (void)mutex_unlock(s_lock);
                 }
@@ -761,7 +762,7 @@ static void gui_input_main(void *arg) {
                         s_ptr_x = (i32)s_fb.w - 1;
                     if (s_ptr_y >= (i32)s_fb.h)
                         s_ptr_y = (i32)s_fb.h - 1;
-                    ev_push(GUI_EV_MOUSEMOVE, 0, s_ptr_x, s_ptr_y);
+                    ev_push(GUI_EV_MOUSEMOVE, 0, s_ptr_x, s_ptr_y, hit_test(s_ptr_x, s_ptr_y));
                     /* Dragging: move the window under the pointer. */
                     if (s_drag_id != 0) {
                         gui_win_t *dw = win_find(s_drag_id);
@@ -842,11 +843,11 @@ static void gui_input_main(void *arg) {
                                 s_focus_id = hit;
                             }
                         }
-                        ev_push(GUI_EV_BUTTON, 1, s_ptr_x, s_ptr_y);
+                        ev_push(GUI_EV_BUTTON, 1, s_ptr_x, s_ptr_y, hit);
                     }
                     if (released) {
                         s_drag_id = 0; /* end the drag */
-                        ev_push(GUI_EV_BUTTON, 0, s_ptr_x, s_ptr_y);
+                        ev_push(GUI_EV_BUTTON, 0, s_ptr_x, s_ptr_y, hit_test(s_ptr_x, s_ptr_y));
                     }
                     if (s_lock >= 0)
                         (void)mutex_unlock(s_lock);

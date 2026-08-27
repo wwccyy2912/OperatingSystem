@@ -170,9 +170,17 @@ int main(void) {
         for (int i = 0; i < n; i++) {
             gui_event_t *e = &ev.events[i];
             if (e->type == GUI_EV_KEY) {
+                /* 'q' quits the desktop from ANY focus state. */
                 u8 ch = (u8)e->code;
                 if (ch == 'q' || ch == 'Q' || ch == 27)
-                    goto done; /* quit */
+                    goto done;
+                /* Other keys follow the FOCUSED window: only echo here
+                 * when the Keys window itself holds focus (the
+                 * compositor stamps each KEY event with the focus id).
+                 * Clicking another window moves focus, and keys stop
+                 * reaching this window. */
+                if (e->win != w1)
+                    continue;
                 if (ch == '\r' || ch == '\n') {
                     lrow += 20;
                     lpos = 0;

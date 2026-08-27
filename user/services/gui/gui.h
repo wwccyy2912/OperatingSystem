@@ -83,15 +83,20 @@ typedef struct {
 
 /* ---- events (drained by GUI_OP_POLL) ---- */
 
-#define GUI_EV_KEY       1 /* code = scancode-derived char/control */
-#define GUI_EV_MOUSEMOVE 2 /* x,y = pointer position, code = 0     */
-#define GUI_EV_BUTTON    3 /* code = 1 left, 2 right, 3 middle; x,y */
+#define GUI_EV_KEY       1 /* code = scancode-derived char/control;
+                            * win  = the FOCUSED window id — keyboard
+                            * input follows the click-focused window */
+#define GUI_EV_MOUSEMOVE 2 /* x,y = pointer position, code = 0;
+                            * win  = window under the pointer (0 = none) */
+#define GUI_EV_BUTTON    3 /* code = 1 left, 2 right, 3 middle; x,y;
+                            * win  = window under the pointer (0 = none) */
 
 typedef struct {
     u32 type;
     u32 code;
     i32 x;
     i32 y;
+    i32 win; /* target window id (focus for KEY, hit for mouse) */
 } gui_event_t;
 
 typedef struct {

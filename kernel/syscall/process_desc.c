@@ -286,7 +286,7 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
             CAP_NULL) {
         static const char *const s_svc_blobs[] = {
             "manager", "perm", "pkg", "term", "vfs", "fs_mem_driver", "user",
-            "policy", "fs_virtio_blk_driver", "gui"};
+            "policy", "fs_virtio_blk_driver", "gui", "net"};
         for (u64 bi = 0; bi < sizeof(s_svc_blobs) / sizeof(s_svc_blobs[0]); bi++) {
             const void *blob_data = NULL;
             u64         blob_sz   = 0;

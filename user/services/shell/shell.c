@@ -34,6 +34,7 @@
 #include "../lib/libos/syscalls.h"
 #include "../perm/perm.h" /* Powerbox protocol (perm_answer/perm_revoke) */
 #include "../user/user.h" /* user account protocol */
+#include "../net/net.h"  /* PCnet NIC protocol (net command) */
 #include "../policy/policy.h" /* command policy service (v0.5) */
 #include "../lib/libtui/tui.h" /* interactive TUI components */
 #include <malloc.h>       /* malloc, free */
@@ -101,6 +102,7 @@ static int cmd_clear(int argc, char *argv[]);
 static int cmd_cap(int argc, char *argv[]);
 static int cmd_mouse(int argc, char *argv[]);
 static int cmd_gui(int argc, char *argv[]);
+static int cmd_net(int argc, char *argv[]);
 static int cmd_ports(int argc, char *argv[]);
 static int cmd_sleep(int argc, char *argv[]);
 static int cmd_threads(int argc, char *argv[]);
@@ -1969,6 +1971,132 @@ static int cmd_gui(int argc, char *argv[]) {
     return 0;
 }
 
+/* net — talk to the PCnet driver: mac | arp | recv | stats.
+ * `net arp` sends an ARP who-has to the slirp gateway (10.0.2.2) and
+ * prints the reply it receives — an end-to-end Tx+Rx proof. */
+static int cmd_net(int argc, char *argv[]) {
+    if (argc < 2) {
+        shell_write("Usage: net mac | arp | recv | stats\n");
+        return -1;
+    }
+    int port = port_get("net");
+    if (port < 0) {
+        shell_printf("net: 'net' port unavailable (%d)\n", port);
+        return -1;
+    }
+    if (strcmp(argv[1], "mac") == 0) {
+        net_req_t req;
+        memset(&req, 0, sizeof(req));
+        req.op = 1; /* NET_OP_GET_MAC */
+        net_resp_t resp;
+        memset(&resp, 0, sizeof(resp));
+        int rl = (int)sizeof(resp);
+        if (ipc_call(port, &req, 8, &resp, &rl) < 0 || resp.ret < 0) {
+            shell_printf("net: GET_MAC FAILED (%d)\n", resp.ret);
+            return -1;
+        }
+        shell_printf("net: MAC %x:%x:%x:%x:%x:%x\n",
+                     resp.data[0], resp.data[1], resp.data[2],
+                     resp.data[3], resp.data[4], resp.data[5]);
+        return 0;
+    }
+    if (strcmp(argv[1], "arp") == 0) {
+        /* Fetch our MAC, then build an ARP who-has 10.0.2.2. */
+        net_req_t req;
+        memset(&req, 0, sizeof(req));
+        req.op = 1;
+        net_resp_t resp;
+        memset(&resp, 0, sizeof(resp));
+        int rl = (int)sizeof(resp);
+        if (ipc_call(port, &req, 8, &resp, &rl) < 0 || resp.ret < 0) {
+            shell_printf("net: GET_MAC FAILED (%d)\n", resp.ret);
+            return -1;
+        }
+        u8 mac[6];
+        memcpy(mac, resp.data, 6);
+
+        /* Ethernet frame: dst bcast, src mac, type ARP. */
+        u8 frame[42];
+        memset(frame, 0xFF, 6); /* dst broadcast */
+        memcpy(frame + 6, mac, 6);
+        frame[12] = 0x08;
+        frame[13] = 0x06; /* ARP */
+        /* ARP header */
+        frame[14] = 0x00; frame[15] = 0x01; /* hw ether */
+        frame[16] = 0x08; frame[17] = 0x00; /* proto IP */
+        frame[18] = 6; frame[19] = 4;       /* hlen plen */
+        frame[20] = 0x00; frame[21] = 0x01; /* op request */
+        memcpy(frame + 22, mac, 6);          /* sender MAC */
+        frame[28] = 10; frame[29] = 0; frame[30] = 2; frame[31] = 15; /* spa 10.0.2.15 */
+        memset(frame + 32, 0, 6);            /* target MAC 0 */
+        frame[38] = 10; frame[39] = 0; frame[40] = 2; frame[41] = 2;  /* tpa 10.0.2.2 */
+
+        memset(&req, 0, sizeof(req));
+        req.op  = 2; /* NET_OP_SEND */
+        req.len = 42;
+        memcpy(req.data, frame, 42);
+        if (ipc_call(port, &req, 8 + 42, &resp, &rl) < 0 || resp.ret < 0) {
+            shell_printf("net: ARP send FAILED (%d)\n", resp.ret);
+            return -1;
+        }
+        shell_write("net: ARP who-has 10.0.2.2 sent, waiting reply...\n");
+        /* Poll RECV for a reply (up to ~3s). */
+        for (int i = 0; i < 300; i++) {
+            memset(&req, 0, sizeof(req));
+            req.op = 3; /* NET_OP_RECV */
+            memset(&resp, 0, sizeof(resp));
+            if (ipc_call(port, &req, 8, &resp, &rl) == 0 && resp.ret == 0 && resp.len >= 42) {
+                u8 *f = resp.data;
+                shell_printf("net: RX %d bytes dst %x:%x:%x:%x:%x:%x type %x%x\n",
+                             resp.len, f[0], f[1], f[2], f[3], f[4], f[5], f[12], f[13]);
+                if (f[12] == 0x08 && f[13] == 0x06)
+                    shell_printf("net: ARP reply! op=%x%x sender=%x:%x:%x:%x:%x:%x\n",
+                                 f[20], f[21], f[22], f[23], f[24], f[25], f[26], f[27]);
+                return 0;
+            }
+            (void)sleep(1); /* 10 ms */
+        }
+        shell_write("net: no reply within timeout\n");
+        return -1;
+    }
+    if (strcmp(argv[1], "recv") == 0) {
+        net_req_t req;
+        memset(&req, 0, sizeof(req));
+        req.op = 3;
+        net_resp_t resp;
+        memset(&resp, 0, sizeof(resp));
+        int rl = (int)sizeof(resp);
+        if (ipc_call(port, &req, 8, &resp, &rl) == 0 && resp.ret == 0) {
+            shell_printf("net: RX %d bytes\n", resp.len);
+            for (u32 i = 0; i < resp.len && i < 64; i++) {
+                shell_printf("%02x ", resp.data[i]);
+                if ((i & 15) == 15)
+                    shell_write("\n");
+            }
+            shell_write("\n");
+            return 0;
+        }
+        shell_write("net: no packet pending\n");
+        return -1;
+    }
+    if (strcmp(argv[1], "stats") == 0) {
+        net_req_t req;
+        memset(&req, 0, sizeof(req));
+        req.op = 4;
+        net_resp_t resp;
+        memset(&resp, 0, sizeof(resp));
+        int rl = (int)sizeof(resp);
+        if (ipc_call(port, &req, 8, &resp, &rl) == 0 && resp.ret == 0) {
+            u32 *st = (u32 *)resp.data;
+            shell_printf("net: rx=%d tx=%d err=%d\n", st[0], st[1], st[2]);
+            return 0;
+        }
+        return -1;
+    }
+    shell_write("Usage: net mac | arp | recv | stats\n");
+    return -1;
+}
+
 static int cmd_ports(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
@@ -2986,6 +3114,7 @@ static void shell_main(void *arg) {
     shell_register_command("cap", "Create a capability (test)", cmd_cap);
     shell_register_command("mouse", "Read the PS/2 mouse state (dx dy buttons)", cmd_mouse);
     shell_register_command("gui", "Enter the pixel desktop (gui_demo)", cmd_gui);
+    shell_register_command("net", "PCnet NIC: net mac|arp|recv|stats", cmd_net);
     shell_register_command("ports", "List registered IPC ports", cmd_ports);
     shell_register_command("sleep", "Sleep for N ticks: sleep <ticks>", cmd_sleep);
     shell_register_command("threads", "Spawn a test worker thread", cmd_threads);

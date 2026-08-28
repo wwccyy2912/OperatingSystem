@@ -1222,6 +1222,23 @@ static i64 sys_io_write8(u64 port, u64 val) {
 }
 
 /*
+ * I/O: read/write a 16-bit word (PCnet RDP/RAP registers, etc.).
+ * Same capability gate as the byte variants.
+ */
+static i64 sys_io_read16(u64 port) {
+    if (!proc_has_io_port_cap(RIGHT_READ, (u16)port))
+        return (i64)ERR_NOCAP;
+    return (i64)io_inw((u16)port);
+}
+
+static i64 sys_io_write16(u64 port, u64 val) {
+    if (!proc_has_io_port_cap(RIGHT_WRITE, (u16)port))
+        return (i64)ERR_NOCAP;
+    io_outw((u16)port, (u16)val);
+    return 0;
+}
+
+/*
  * Mutex: create a new mutex owned by no thread.
  */
 static i64 sys_mutex_create(void) {
@@ -1561,6 +1578,8 @@ SYSCALL3(sys_bind_irq)
 SYSCALL2(sys_unbind_irq)
 SYSCALL1(sys_io_read8)
 SYSCALL2(sys_io_write8)
+SYSCALL1(sys_io_read16)
+SYSCALL2(sys_io_write16)
 SYSCALL0(sys_mutex_create)
 SYSCALL1(sys_mutex_lock)
 SYSCALL1(sys_mutex_unlock)
@@ -1609,6 +1628,8 @@ static const syscall_fn_t s_syscall_table[SYS_COUNT] = {
     [SYS_IPC_REPLY]            = sc_sys_ipc_reply,
     [SYS_IO_READ8]             = sc_sys_io_read8,
     [SYS_IO_WRITE8]            = sc_sys_io_write8,
+    [SYS_IO_READ16]            = sc_sys_io_read16,
+    [SYS_IO_WRITE16]           = sc_sys_io_write16,
     [SYS_REBOOT]               = sc_sys_reboot,
     [SYS_SHUTDOWN]             = sc_sys_shutdown,
     [SYS_SET_TIME]             = sc_sys_set_time,
@@ -1628,6 +1649,8 @@ static const syscall_fn_t s_syscall_table[SYS_COUNT] = {
     [SYS_FB_MAP]               = sc_sys_fb_map,
     [SYS_PCI_GET_COUNT]        = sc_sys_pci_get_count,
     [SYS_PCI_GET_DEVICE]       = sc_sys_pci_get_device,
+    [SYS_PCI_CFG_READ]         = sc_sys_pci_cfg_read,
+    [SYS_PCI_CFG_WRITE]        = sc_sys_pci_cfg_write,
     [SYS_SIGNAL]               = sc_sys_signal,
     [SYS_KILL]                 = sc_sys_kill,
     [SYS_SIGRETURN]            = sc_sys_sigreturn,

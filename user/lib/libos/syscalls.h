@@ -159,6 +159,8 @@ int unbind_irq(int cap, int irq);
 /* --- I/O port access --- */
 int io_read8(unsigned short port);
 int io_write8(unsigned short port, unsigned char val);
+int io_read16(unsigned short port);
+int io_write16(unsigned short port, unsigned short val);
 
 /* --- System power --- */
 int sys_reboot(void);
@@ -280,9 +282,15 @@ int thread_set_ctx(int tid, const void *ctx, unsigned long ctx_size);
  * --- PCI enumeration ---
  * pci_get_count(): number of PCI devices found at boot.
  * pci_get_device(index, out): fill pci_device_info_t for device `index`.
- * Both return non-negative values or negative errors. */
+ * pci_cfg_read32(index, offset) / pci_cfg_write32(index, offset, val):
+ *   raw 32-bit config-space access (device drivers use this to enable
+ *   PCI bus mastering via the command register at 0x04, among others).
+ *   Gated on CAP_TYPE_PCI_DEV (RIGHT_READ|RIGHT_WRITE) for `index`.
+ * All return non-negative values or negative errors. */
 int pci_get_count(void);
 int pci_get_device(int index, pci_device_info_t *out);
+int pci_cfg_read32(int index, unsigned offset);
+int pci_cfg_write32(int index, unsigned offset, unsigned val);
 
 /*
  * --- Block device (Phase 1: legacy virtio-blk) ---

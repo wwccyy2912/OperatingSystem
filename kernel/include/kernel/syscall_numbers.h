@@ -58,6 +58,11 @@
 #define SYS_IPC_REPLY 34
 #define SYS_IO_READ8  35
 #define SYS_IO_WRITE8 36
+/* NOTE: 16-bit I/O must NOT use 48/49 — those were already taken by
+ * SYS_SIGNAL / SYS_KILL (below), which would shadow them in the
+ * dispatch table.  They live at the end instead. */
+#define SYS_IO_READ16  69
+#define SYS_IO_WRITE16 70
 
 /* ---- System power ---- */
 #define SYS_REBOOT 37
@@ -163,5 +168,11 @@
  *   space (gated on ATOM_SERVICE_MANAGE + pool-table verification). */
 #define SYS_SHM_CREATE 67 /* (count, virt) -> phys_base */
 #define SYS_SHM_MAP    68 /* (phys_base, count, subject, virt) -> OK */
+
+/* ---- PCI config-space access (device drivers: enable bus master,
+ * read/write BARs, IRQ line, etc.).  Gated on CAP_TYPE_PCI_DEV with
+ * obj_id = cached PCI table index (same gate as SYS_BLK_*). ---- */
+#define SYS_PCI_CFG_READ  71 /* (idx, offset) -> u32 dword */
+#define SYS_PCI_CFG_WRITE 72 /* (idx, offset, val) -> OK */
 
 #endif /* KERNEL_SYSCALL_NUMBERS_H */

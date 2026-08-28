@@ -31,9 +31,11 @@
  * empty bus must still return 0 cleanly.
  */
 
+#include <kernel/cap.h>
 #include <kernel/io.h>
 #include <kernel/pci.h>
 #include <kernel/process.h>
+#include <kernel/sched.h>
 #include <kernel/string.h>
 #include <kernel/syscall_handlers.h>
 #include <kernel/types.h>
@@ -202,6 +204,76 @@ i64 sc_sys_pci_get_device(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
         return (i64)ERR_FAULT;
 
     memcpy(USER_PTR(a2), &s_devices[index], sizeof(pci_device_info_t));
+    return 0;
+}
+
+/*
+ * Gate: the calling process must hold a CAP_TYPE_PCI_DEV capability
+ * naming PCI table index `obj_id` with both RIGHT_READ and RIGHT_WRITE
+ * (mirror of the io-port gate in syscall.c / virtio_blk.c).
+ */
+static bool proc_has_pci_dev_cap(u64 obj_id) {
+    process_t *proc = process_current();
+    if (!proc || !proc->cap_table)
+        return false;
+
+    for (u32 i = 0; i < MAX_CAPS; i++) {
+        cap_entry_t *e = &proc->cap_table->entries[i];
+        if (e->type == CAP_TYPE_NONE)
+            continue;
+        if (e->expiry_ticks != 0 && e->expiry_ticks <= sched_get_ticks())
+            continue;
+        if (e->type == CAP_TYPE_PCI_DEV && e->obj_id == obj_id &&
+            (e->rights & (RIGHT_READ | RIGHT_WRITE)) == (RIGHT_READ | RIGHT_WRITE))
+            return true;
+    }
+    return false;
+}
+
+/*
+ * SYS_PCI_CFG_READ: read a 32-bit dword from the config space of the
+ * cached device at index `a1` at dword-aligned offset `a2`.
+ *   ERR_NOCAP — caller holds no CAP_TYPE_PCI_DEV cap for this device
+ *   ERR_INVAL — index out of range / unaligned or oversized offset
+ */
+i64 sc_sys_pci_cfg_read(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    if (!proc_has_pci_dev_cap(a1))
+        return (i64)ERR_NOCAP;
+    if (a1 >= s_device_count)
+        return (i64)ERR_INVAL;
+    if ((a2 & 3) || a2 > 0xFC)
+        return (i64)ERR_INVAL;
+
+    pci_device_info_t *d = &s_devices[a1];
+    return (i64)pci_config_read(d->bus, d->dev, d->func, (u32)a2);
+}
+
+/*
+ * SYS_PCI_CFG_WRITE: write a 32-bit dword to the config space of the
+ * cached device at index `a1` at dword-aligned offset `a2`.
+ * Same capability gate as the read variant.
+ */
+i64 sc_sys_pci_cfg_write(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
+    (void)a4;
+    (void)a5;
+
+    if (!proc_has_pci_dev_cap(a1))
+        return (i64)ERR_NOCAP;
+    if (a1 >= s_device_count)
+        return (i64)ERR_INVAL;
+    if ((a2 & 3) || a2 > 0xFC)
+        return (i64)ERR_INVAL;
+
+    pci_device_info_t *d = &s_devices[a1];
+    u32 addr = PCI_CONFIG_ENABLE | ((d->bus & 0xFF) << 16) |
+               ((d->dev & 0x1F) << 11) | ((d->func & 0x07) << 8) |
+               ((u32)a2 & 0xFC);
+    io_outl(PCI_CONFIG_ADDR, addr);
+    io_outl(PCI_CONFIG_DATA, (u32)a3);
     return 0;
 }
 

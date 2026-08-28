@@ -107,6 +107,14 @@ int pci_get_device(int index, pci_device_info_t *out) {
     return (int)sys_call(SYS_PCI_GET_DEVICE, index, (long)out, 0, 0, 0);
 }
 
+int pci_cfg_read32(int index, unsigned offset) {
+    return (int)sys_call(SYS_PCI_CFG_READ, index, (long)offset, 0, 0, 0);
+}
+
+int pci_cfg_write32(int index, unsigned offset, unsigned val) {
+    return (int)sys_call(SYS_PCI_CFG_WRITE, index, (long)offset, (long)val, 0, 0);
+}
+
 /* ---- Block device (Phase 1: legacy virtio-blk) ---- */
 
 int64_t sys_blk_read(uint64_t disk, uint64_t lba, uint64_t count, void *buf) {
@@ -189,6 +197,14 @@ int io_read8(unsigned short port) {
 
 int io_write8(unsigned short port, unsigned char val) {
     return (int)sys_call(SYS_IO_WRITE8, (long)port, (long)val, 0, 0, 0);
+}
+
+int io_read16(unsigned short port) {
+    return (int)sys_call(SYS_IO_READ16, (long)port, 0, 0, 0, 0);
+}
+
+int io_write16(unsigned short port, unsigned short val) {
+    return (int)sys_call(SYS_IO_WRITE16, (long)port, (long)val, 0, 0, 0);
 }
 
 /* ---- System power ---- */

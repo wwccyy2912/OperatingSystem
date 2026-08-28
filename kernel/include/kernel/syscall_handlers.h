@@ -18,9 +18,12 @@ i64 sc_sys_vspace_alloc(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
 /* kernel/sched/thread_ctx.c — SYS_THREAD_SET_CTX (arg1=tid, arg2=ctx, arg3=size) */
 i64 sc_sys_thread_set_ctx(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
 
-/* kernel/syscall/pci.c — SYS_PCI_GET_COUNT / SYS_PCI_GET_DEVICE */
+/* kernel/syscall/pci.c — SYS_PCI_GET_COUNT / SYS_PCI_GET_DEVICE /
+ * SYS_PCI_CFG_READ / SYS_PCI_CFG_WRITE */
 i64 sc_sys_pci_get_count(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
 i64 sc_sys_pci_get_device(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
+i64 sc_sys_pci_cfg_read(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
+i64 sc_sys_pci_cfg_write(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
 
 /* kernel/syscall/process_desc.c — SYS_PROCESS_CREATE (descriptor-based image) */
 i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);

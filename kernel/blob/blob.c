@@ -46,6 +46,7 @@ extern char wm_demo_elf_start[], wm_demo_elf_end[], wm_demo_elf_size[];
 extern char policy_elf_start[], policy_elf_end[], policy_elf_size[];
 extern char gui_elf_start[], gui_elf_end[], gui_elf_size[];
 extern char gui_demo_elf_start[], gui_demo_elf_end[], gui_demo_elf_size[];
+extern char net_elf_start[], net_elf_end[], net_elf_size[];
 
 static blob_entry_t s_blobs[BLOB_MAX_ENTRIES];
 static int          s_blob_count = 0;
@@ -87,6 +88,7 @@ void blob_init(void) {
     BLOB_REG("policy", policy_elf_start, (u64)policy_elf_size);
     BLOB_REG("gui", gui_elf_start, (u64)gui_elf_size);
     BLOB_REG("gui_demo", gui_demo_elf_start, (u64)gui_demo_elf_size);
+    BLOB_REG("net", net_elf_start, (u64)net_elf_size);
     /* Alias: the same sandbox ELF installed WITHOUT permissions
      * (docs/ops_format.md §8.5: pkg install sbox_demo_noperm).  The
      * blob payload is identical — only the manifest atoms differ. */

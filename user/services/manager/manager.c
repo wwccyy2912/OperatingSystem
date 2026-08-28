@@ -103,6 +103,7 @@ static service_t s_services[] = {
     {"wm", -1, 0, 1},   /* window manager (v0.4 desktop: registry+compositor) */
     {"policy", -1, 0, 1}, /* command policy service (v0.5, before shell)    */
     {"gui", -1, 0, 1},  /* pixel compositor (idle until GUI_OP_ACTIVATE)  */
+    {"net", -1, 0, 0},  /* PCnet-Fast III Ethernet driver (own PCI device) */
 };
 
 /* Restartable services (production hardening): crash → auto-restart up
@@ -127,6 +128,7 @@ static service_t s_services[] = {
 #define SVC_WM            12
 #define SVC_POLICY        13
 #define SVC_GUI           14
+#define SVC_NET           15
 
 /* ====================================================================
  * Serial service output (mirrors shell.c)
@@ -492,6 +494,8 @@ int main(void) {
      * port exists before the shell offers the `gui` command. */
     if (spawn_service(&s_services[SVC_GUI], 0) < 0)
         manager_printf("manager: gui spawn failed\n");
+    if (spawn_service(&s_services[SVC_NET], 0) < 0)
+        manager_printf("manager: net spawn failed\n");
 
     /* ---- 4. Flaky demo service ----
      * Only flaky is started here: it is IPC-silent (sleep + exit), so

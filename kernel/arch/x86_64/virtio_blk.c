@@ -39,6 +39,7 @@
 #include <kernel/pmm.h>
 #include <kernel/process.h>
 #include <kernel/sched.h>
+#include <kernel/idt.h> /* irq_disable */
 #include <kernel/serial.h>
 #include <kernel/spinlock.h>
 #include <kernel/string.h>
@@ -216,6 +217,23 @@ static int blk_scan_device(u16 *out_io_base) {
                     if ((bar0 & 1u) == 0)
                         return -2;
                     *out_io_base = (u16)(bar0 & ~0x3u);
+                    /* The driver polls completion (no IRQ binding), but
+                     * QEMU still asserts the device's INTx line when a
+                     * request completes.  If that line is shared with
+                     * another device (e.g. a PCnet NIC), the stale
+                     * assert would storm the PIC once the other device
+                     * unbinds its IRQ.  Mask our own line: polling never
+                     * needs it. */
+                    {
+                        u32 il = blk_pci_config_read(bus, dev, func, 0x3C);
+                        u8  irq = (u8)(il & 0xFF);
+                        if (irq < 16)
+                            irq_disable(irq); /* PIC mask */
+                        serial_puts("blk: masking virtio INTx irq=");
+                        serial_putchar('0' + irq / 10);
+                        serial_putchar('0' + irq % 10);
+                        serial_puts("\n");
+                    }
                     return index;
                 }
                 index++;

@@ -28,6 +28,7 @@
 #include <libc/stdio.h>
 #include <libc/string.h>
 #include <libgui/gui.h>
+#include <libgui/font.h> /* gui_font: 8x16 glyphs for the title text */
 #include <libos/syscalls.h>
 #include <malloc.h> /* malloc / free for window buffers */
 
@@ -178,11 +179,15 @@ static int rect_intersect(gui_rect_t a, gui_rect_t b, gui_rect_t *out) {
     return 1;
 }
 
-static void draw_titlebar(gui_win_t *w) {
-    int tx = w->x + GUI_BORDER;
+/* Title-bar TEXT only (the caller fills the bar, clipped).  Each glyph
+ * is drawn ROW BY ROW and only where it intersects the dirty rect:
+ * drawing a whole 16px glyph would paint the lower window's title
+ * rows that an overlapping higher window's clipped blit does not
+ * cover (the "lower title shows through" artifact).  d may be NULL
+ * for a full repaint. */
+static void draw_titlebar(gui_win_t *w, const gui_rect_t *d) {
+    int tx = w->x + GUI_BORDER + 3;
     int ty = w->y + GUI_BORDER;
-    gui_fill(&s_fb, tx, ty, w->w, GUI_TITLE_H,
-             (w->id == s_focus_id) ? GUI_TITLE_BG : GUI_TITLE_BG_IDLE);
     /* Title text (skip background: the bar is already filled). */
     char t[GUI_MAX_TITLE + 2];
     int  n = (int)strlen(w->title);
@@ -192,8 +197,40 @@ static void draw_titlebar(gui_win_t *w) {
     t[n++] = ' ';
     t[n++] = '*'; /* focus marker on the focused window */
     t[n]   = '\0';
-    /* Center vertically in the 16px bar: font is 16px, so row 0. */
-    gui_text(&s_fb, tx + 3, ty, t, GUI_TITLE_FG, 0);
+    int y0 = ty, y1 = ty + 16;
+    if (d) {
+        if (y1 <= d->y || y0 >= d->y + d->h)
+            return; /* bar fully outside the dirty rect vertically */
+        if (y0 < d->y)
+            y0 = d->y;
+        if (y1 > d->y + d->h)
+            y1 = d->y + d->h;
+    }
+    for (int i = 0; i < n; i++) {
+        int gx = tx + i * 8;
+        if (d && (gx + 8 <= d->x || gx >= d->x + d->w))
+            continue; /* glyph fully outside the dirty rect */
+        unsigned char ch = (unsigned char)t[i];
+        if (ch < 0x20 || ch > 0x7E)
+            continue;
+        const u8 *glyph = gui_font[ch - 0x20];
+        /* X clip: only paint glyph columns inside the dirty rect — a
+         * partially-covered glyph painted in full would leave its tail
+         * on the overlapping window above. */
+        int cx0 = 0, cx1 = 8;
+        if (d) {
+            if (gx < d->x)
+                cx0 = d->x - gx;
+            if (gx + 8 > d->x + d->w)
+                cx1 = d->x + d->w - gx;
+        }
+        for (int row = y0; row < y1; row++) {
+            u8 bits = glyph[row - ty];
+            for (int col = cx0; col < cx1; col++)
+                if (bits & (0x80 >> col))
+                    gui_pixel(&s_fb, gx + col, row, GUI_TITLE_FG);
+        }
+    }
 }
 
 static void gui_composite(void) {
@@ -288,8 +325,10 @@ static void gui_composite(void) {
                     gui_fill(&s_fb, tclip.x, tclip.y, tclip.w, tclip.h,
                              (w->id == s_focus_id) ? GUI_TITLE_BG
                                                     : GUI_TITLE_BG_IDLE);
-                    draw_titlebar(w); /* whole 16px line: harmless, it is
-                                       * the bar's own pixels */
+                    /* Text clipped glyph-by-glyph to the dirty rect —
+                     * never repaint a lower window's title onto an
+                     * overlapping window's pixels. */
+                    draw_titlebar(w, &d);
                 }
             }
 

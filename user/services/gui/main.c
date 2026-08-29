@@ -44,7 +44,15 @@
 #define GUI_TITLE_BG      0x00204080 /* focused */
 #define GUI_TITLE_BG_IDLE 0x00404040 /* unfocused */
 #define GUI_FRAME_FG      0x00C0C0C0
-#define GUI_PTR_COLOR     0x00FF0000
+#define GUI_PTR_COLOR     0x000000FF /* xRGB word: red byte at bit 8 (see gui_xrgb) */
+
+/* Taskbar: a 22px strip at the bottom of the screen holding one button
+ * per MINIMIZED window (click to restore).  Maximised windows leave
+ * this strip visible so a minimized window can always be recovered. */
+#define GUI_TASKBAR_H     22
+#define GUI_TASKBAR_BG    0x00202028
+#define GUI_TASKBAR_BTN   0x003C3C4C
+#define GUI_TASKBAR_MAX_W 200 /* widest taskbar button */
 
 /* IPC buffers (single server thread — same pattern as term/perm). */
 static u8 s_req[GUI_IPC_MAX];
@@ -59,6 +67,7 @@ typedef struct {
     i32          w, h; /* content size (excludes border+title bar) */
     gui_canvas_t buf;  /* off-screen content buffer (32bpp) */
     int          maxed; /* maximised (restore rect in rx/ry/rw/rh) */
+    int          hidden; /* minimized: drawn as a taskbar button only */
     i32          rx, ry, rw, rh;
 } gui_win_t;
 
@@ -100,6 +109,7 @@ static int s_term_port = -1;
 /* ------------------------------------------------------------------ */
 
 static gui_win_t *win_find(int id); /* fwd: used by ev_push */
+static void gui_shutdown(void);     /* fwd: used by do_destroy / input thread */
 
 /* Resolve the owner subject of a window id (0 = none). */
 static u64 win_owner(int id) {
@@ -377,8 +387,8 @@ static void gui_composite(void) {
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
             gui_win_t *w = &s_wins[i];
-            if (!w->in_use)
-                continue;
+            if (!w->in_use || w->hidden)
+                continue; /* minimized windows live on the taskbar only */
             if (pass == 0 && w->id == s_focus_id)
                 continue; /* focused window goes in the top pass */
             if (pass == 1 && w->id != s_focus_id)
@@ -469,6 +479,56 @@ static void gui_composite(void) {
         }
     }
 
+    /* Taskbar: a strip at the bottom with one button per minimized
+     * window (click to restore).  Drawn above every window so a
+     * maximised window can never hide it. */
+    {
+        gui_rect_t trect = {0, (i32)s_fb.h - GUI_TASKBAR_H, (i32)s_fb.w,
+                            GUI_TASKBAR_H};
+        gui_rect_t tclip;
+        if (rect_intersect(d, trect, &tclip)) {
+            gui_fill(&s_fb, tclip.x, tclip.y, tclip.w, tclip.h,
+                     GUI_TASKBAR_BG);
+            int bx = 4;
+            for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+                gui_win_t *w = &s_wins[i];
+                if (!w->in_use || !w->hidden)
+                    continue;
+                int tw = gui_text_width(w->title);
+                int bw = 12 + tw;
+                if (bw > GUI_TASKBAR_MAX_W)
+                    bw = GUI_TASKBAR_MAX_W;
+                int by = (i32)s_fb.h - GUI_TASKBAR_H + 5;
+                gui_fill(&s_fb, bx, by, bw, GUI_TASKBAR_H - 10,
+                         GUI_TASKBAR_BTN);
+                /* Button label: truncate the title by display width. */
+                char lbl[GUI_MAX_TITLE];
+                int  llen = 0, lpx = 0;
+                const char *p = w->title;
+                while (*p && lpx + 8 < bw - 10 && llen < (int)sizeof(lbl) - 1) {
+                    u32 cp;
+                    int n = utf8_decode(p, &cp);
+                    if (n <= 0) {
+                        cp = (u32)(u8)*p;
+                        n  = 1;
+                    }
+                    int gw = (cp > 0x7F && font_cjk_lookup(cp)) ? 16 : 8;
+                    if (lpx + gw >= bw - 10)
+                        break;
+                    memcpy(lbl + llen, p, (size_t)n);
+                    llen += n;
+                    lpx += gw;
+                    p += n;
+                }
+                lbl[llen] = '\0';
+                gui_text(&s_fb, bx + 5, by + 3, lbl, 0x00E0E0E0, GUI_TASKBAR_BTN);
+                bx += bw + 4;
+                if (bx >= (int)s_fb.w)
+                    break;
+            }
+        }
+    }
+
     /* Pointer: a small filled square (drawn last, on top). */
     if (s_ptr_x >= 0 && s_ptr_y >= 0) {
         gui_rect_t prect = {s_ptr_x, s_ptr_y, 5, 5};
@@ -490,6 +550,76 @@ static gui_win_t *win_find(int id) {
         if (s_wins[i].in_use && s_wins[i].id == id)
             return &s_wins[i];
     return NULL;
+}
+
+/* Reallocate the content buffer to (nw, nh), preserving the top-left
+ * overlapping pixels (RESIZE, and title-bar maximise/restore — the
+ * off-screen buffer must always match w/h or the composite blit reads
+ * out of bounds and the maximised window renders only partially). */
+static int gui_win_realloc(gui_win_t *w, int nw, int nh) {
+    size_t bytes = (size_t)nw * nh * 4;
+    u8    *nbuf  = (u8 *)malloc(bytes);
+    if (!nbuf)
+        return -1;
+    memset(nbuf, 0, bytes);
+    int copyw = (nw < w->w) ? nw : w->w;
+    int copyh = (nh < w->h) ? nh : w->h;
+    for (int yy = 0; yy < copyh; yy++)
+        for (int xx = 0; xx < copyw; xx++) {
+            u32 v = 0;
+            if (w->buf.buf)
+                v = ((u32 *)w->buf.buf)[yy * w->w + xx];
+            ((u32 *)nbuf)[yy * nw + xx] = v;
+        }
+    if (w->buf.buf)
+        free((void *)w->buf.buf);
+    w->buf.buf   = nbuf;
+    w->buf.w     = (u32)nw;
+    w->buf.h     = (u32)nh;
+    w->buf.pitch = (u32)nw * 4;
+    w->buf.bpp   = 32;
+    w->w         = nw;
+    w->h         = nh;
+    return 0;
+}
+
+/* Number of live windows (hidden/minimized included). */
+static int gui_win_count(void) {
+    int n = 0;
+    for (int i = 0; i < GUI_MAX_WINDOWS; i++)
+        if (s_wins[i].in_use)
+            n++;
+    return n;
+}
+
+/* Minimized-window taskbar button under (px, py): the window id, or 0.
+ * Buttons lay left-to-right in window-slot order (must match the
+ * composite's taskbar drawing exactly). */
+static int taskbar_button_at(i32 px, i32 py) {
+    if (py < (i32)s_fb.h - GUI_TASKBAR_H || py >= (i32)s_fb.h)
+        return 0;
+    int bx = 4;
+    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+        gui_win_t *w = &s_wins[i];
+        if (!w->in_use || !w->hidden)
+            continue;
+        int bw = 12 + gui_text_width(w->title);
+        if (bw > GUI_TASKBAR_MAX_W)
+            bw = GUI_TASKBAR_MAX_W;
+        if (px >= bx && px < bx + bw)
+            return w->id;
+        bx += bw + 4;
+        if (bx >= (i32)s_fb.w)
+            break;
+    }
+    return 0;
+}
+
+/* Dirty the taskbar strip (a minimize/restore changed its buttons).
+ * The caller must already hold s_lock (both call sites are inside the
+ * input thread's press handling). */
+static void gui_dirty_taskbar(void) {
+    gui_dirty_add_nolock(0, (i32)s_fb.h - GUI_TASKBAR_H, (i32)s_fb.w, GUI_TASKBAR_H);
 }
 
 static void do_create(int token, int msg_len, u64 caller) {
@@ -629,7 +759,13 @@ static void do_destroy(int token, int msg_len, u64 caller) {
 
     resp->ret = 0;
     gui_dirty_add(dx, dy, dw, dh);
-    gui_composite();
+    if (gui_win_count() == 0) {
+        /* Last window destroyed: hand the screen back to the shell
+         * (the term repaints its text screen). */
+        gui_shutdown();
+    } else {
+        gui_composite();
+    }
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
@@ -710,37 +846,15 @@ static void do_resize(int token, int msg_len, u64 caller) {
     int ow = w->w + 2 * GUI_BORDER;
     int oh = w->h + 2 * GUI_BORDER + GUI_TITLE_H;
 
-    /* Allocate the new buffer before touching state. */
-    size_t bytes = (size_t)r->w * r->h * 4;
-    u8    *nbuf  = (u8 *)malloc(bytes);
-    if (!nbuf) {
+    /* Allocate the new buffer before touching state (realloc preserves
+     * the overlapping top-left of the old content). */
+    if (gui_win_realloc(w, (int)r->w, (int)r->h) < 0) {
         if (s_lock >= 0)
             (void)mutex_unlock(s_lock);
         resp->ret = -1;
         (void)ipc_reply(token, resp, (int)sizeof(*resp));
         return;
     }
-    /* Copy the overlapping top-left of the old content. */
-    memset(nbuf, 0, bytes);
-    gui_canvas_t oc = w->buf;
-    int copyw = (r->w < w->w) ? r->w : w->w;
-    int copyh = (r->h < w->h) ? r->h : w->h;
-    for (int yy = 0; yy < copyh; yy++)
-        for (int xx = 0; xx < copyw; xx++) {
-            u32 v = 0;
-            if (oc.buf)
-                v = ((u32 *)oc.buf)[yy * w->w + xx];
-            ((u32 *)nbuf)[yy * r->w + xx] = v;
-        }
-    if (w->buf.buf)
-        free((void *)w->buf.buf);
-    w->buf.buf   = nbuf;
-    w->buf.w     = (u32)r->w;
-    w->buf.h     = (u32)r->h;
-    w->buf.pitch = (u32)r->w * 4;
-    w->buf.bpp   = 32;
-    w->w         = r->w;
-    w->h         = r->h;
 
     /* Clamp the window back inside the screen. */
     int maxx = (int)s_fb.w - (w->w + 2 * GUI_BORDER);
@@ -973,9 +1087,11 @@ static void do_activate(int token, u64 caller) {
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_deactivate(int token) {
-    gui_resp_t *resp = (gui_resp_t *)s_resp;
-
+/* Release the compositor: keyboard focus back to the shell, term
+ * screen restored, compositor idle.  Must be called WITHOUT s_lock
+ * held (it IPC-calls the keyboard and term services while the input
+ * thread may be parked in do_poll). */
+static void gui_shutdown(void) {
     /* Release the keyboard focus. */
     if (s_kbd_port >= 0) {
         u32 req[2] = {4, 0}; /* KBD_OP_RELEASE_FOCUS */
@@ -986,8 +1102,9 @@ static void do_deactivate(int token) {
 
     if (s_lock >= 0)
         (void)mutex_lock(s_lock);
-    s_active = 0;
+    s_active      = 0;
     s_dirty_valid = 0; /* drop any pending rect: the screen is handed back */
+    s_focus_id    = 0;
     if (s_lock >= 0)
         (void)mutex_unlock(s_lock);
 
@@ -998,7 +1115,11 @@ static void do_deactivate(int token) {
         int rl = (int)sizeof(rsp);
         (void)ipc_call(s_term_port, req, 8, rsp, &rl);
     }
+}
 
+static void do_deactivate(int token) {
+    gui_resp_t *resp = (gui_resp_t *)s_resp;
+    gui_shutdown();
     resp->ret = 0;
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
@@ -1057,13 +1178,13 @@ static void gui_server_loop(int port) {
  * user actually sees at that pixel. */
 static int hit_test(i32 px, i32 py) {
     gui_win_t *f = win_find(s_focus_id);
-    if (f && f->in_use &&
+    if (f && f->in_use && !f->hidden &&
         px >= f->x && px < f->x + f->w + 2 * GUI_BORDER &&
         py >= f->y && py < f->y + f->h + 2 * GUI_BORDER + GUI_TITLE_H)
         return f->id;
     for (int i = GUI_MAX_WINDOWS - 1; i >= 0; i--) {
         gui_win_t *w = &s_wins[i];
-        if (!w->in_use || w->id == s_focus_id)
+        if (!w->in_use || w->hidden || w->id == s_focus_id)
             continue;
         if (px >= w->x && px < w->x + w->w + 2 * GUI_BORDER &&
             py >= w->y && py < w->y + w->h + 2 * GUI_BORDER + GUI_TITLE_H)
@@ -1179,19 +1300,55 @@ static void gui_input_main(void *arg) {
                 if (bt != s_ptr_buttons) {
                     int focus_changed = 0;
                     int fx = 0, fy = 0, fw = 0, fh = 0;
+                    int shutdown = 0; /* auto-deactivate after the last window closes */
                     if (s_lock >= 0)
                         (void)mutex_lock(s_lock);
                     u8 pressed = bt & ~s_ptr_buttons;
                     u8 released = s_ptr_buttons & ~bt;
                     s_ptr_buttons = bt;
                     if (pressed) {
+                        /* Taskbar: a click on a minimized window's button
+                         * restores it (takes priority over the hit test —
+                         * hidden windows are not hit-testable). */
+                        int tb = taskbar_button_at(s_ptr_x, s_ptr_y);
+                        if (tb != 0) {
+                            gui_win_t *tw = win_find(tb);
+                            if (tw) {
+                                tw->hidden = 0;
+                                gui_dirty_add_nolock(tw->x, tw->y,
+                                                     tw->w + 2 * GUI_BORDER,
+                                                     tw->h + 2 * GUI_BORDER +
+                                                         GUI_TITLE_H);
+                                gui_dirty_taskbar();
+                                if (s_focus_id != tb) {
+                                    gui_win_t *old = win_find(s_focus_id);
+                                    if (old) {
+                                        fx = old->x;
+                                        fy = old->y;
+                                        fw = old->w + 2 * GUI_BORDER;
+                                        fh = old->h + 2 * GUI_BORDER + GUI_TITLE_H;
+                                    }
+                                    focus_changed = 1;
+                                }
+                                s_focus_id = tb;
+                                changed    = 1;
+                            }
+                            s_press_grab = tb;
+                            ev_push(GUI_EV_BUTTON, 1, s_ptr_x, s_ptr_y, tb);
+                            goto button_done;
+                        }
                         int hit = hit_test(s_ptr_x, s_ptr_y);
                         if (hit != 0) {
                             gui_win_t *hw = win_find(hit);
+                            int in_title = hw && s_ptr_y >= hw->y &&
+                                           s_ptr_y < hw->y + GUI_BORDER + GUI_TITLE_H;
                             /* Double-click on the title bar (not on a
-                             * button) toggles maximise. */
-                            if (hw && s_ptr_y >= hw->y &&
-                                s_ptr_y < hw->y + GUI_BORDER + GUI_TITLE_H &&
+                             * button) toggles maximise.  Only the FOCUSED
+                             * window reacts: on an unfocused window the
+                             * buttons are invisible, so a press there just
+                             * focuses it (the second click of a fast pair
+                             * already lands on the now-focused window). */
+                            if (in_title && hit == s_focus_id &&
                                 title_button_at(hw, s_ptr_x, s_ptr_y) == 0) {
                                 int now = get_time();
                                 if (hit == s_last_press_win &&
@@ -1201,29 +1358,40 @@ static void gui_input_main(void *arg) {
                                     int ox = hw->x, oy = hw->y;
                                     int ow = hw->w + 2 * GUI_BORDER;
                                     int oh = hw->h + 2 * GUI_BORDER + GUI_TITLE_H;
+                                    int nw, nh;
                                     if (hw->maxed) {
-                                        hw->x = hw->rx;
-                                        hw->y = hw->ry;
-                                        hw->w = hw->rw;
-                                        hw->h = hw->rh;
-                                        hw->maxed = 0;
+                                        nw = hw->rw;
+                                        nh = hw->rh;
                                     } else {
+                                        /* Save the restore rect BEFORE the
+                                         * realloc changes w/h. */
                                         hw->rx = hw->x;
                                         hw->ry = hw->y;
                                         hw->rw = hw->w;
                                         hw->rh = hw->h;
-                                        hw->x = 0;
-                                        hw->y = 0;
-                                        hw->w = (i32)s_fb.w - 2 * GUI_BORDER;
-                                        hw->h = (i32)s_fb.h - 2 * GUI_BORDER - GUI_TITLE_H;
-                                        hw->maxed = 1;
+                                        nw = (i32)s_fb.w - 2 * GUI_BORDER;
+                                        nh = (i32)s_fb.h - GUI_TASKBAR_H -
+                                             2 * GUI_BORDER - GUI_TITLE_H;
                                     }
-                                    gui_dirty_add_nolock(ox, oy, ow, oh);
-                                    gui_dirty_add_nolock(hw->x, hw->y,
-                                                         hw->w + 2 * GUI_BORDER,
-                                                         hw->h + 2 * GUI_BORDER +
-                                                             GUI_TITLE_H);
-                                    changed = 1;
+                                    /* Reallocate first so the composite
+                                     * blit never reads out of bounds. */
+                                    if (gui_win_realloc(hw, nw, nh) == 0) {
+                                        if (hw->maxed) {
+                                            hw->x = hw->rx;
+                                            hw->y = hw->ry;
+                                            hw->maxed = 0;
+                                        } else {
+                                            hw->x  = 0;
+                                            hw->y  = 0;
+                                            hw->maxed = 1;
+                                        }
+                                        gui_dirty_add_nolock(ox, oy, ow, oh);
+                                        gui_dirty_add_nolock(hw->x, hw->y,
+                                                             hw->w + 2 * GUI_BORDER,
+                                                             hw->h + 2 * GUI_BORDER +
+                                                                 GUI_TITLE_H);
+                                        changed = 1;
+                                    }
                                     s_last_press_win = 0; /* consume */
                                     goto button_done;
                                 }
@@ -1232,10 +1400,11 @@ static void gui_input_main(void *arg) {
                                 s_last_press_y     = s_ptr_y;
                                 s_last_press_win   = hit;
                             }
-                            /* Title-bar buttons take priority over drag
-                             * and focus (close / minimise / maximise). */
-                            if (hw && s_ptr_y >= hw->y &&
-                                s_ptr_y < hw->y + GUI_BORDER + GUI_TITLE_H) {
+                            /* Title-bar buttons act only on the FOCUSED
+                             * window (they are drawn there only — on an
+                             * unfocused window the press falls through to
+                             * focus/drag below). */
+                            if (in_title && hit == s_focus_id) {
                                 int btn = title_button_at(hw, s_ptr_x, s_ptr_y);
                                 if (btn != 0) {
                                     if (btn == 1) { /* close */
@@ -1247,42 +1416,62 @@ static void gui_input_main(void *arg) {
                                         if (s_focus_id == hit)
                                             s_focus_id = 0;
                                         gui_dirty_add_nolock(dx, dy, dw, dh);
+                                        if (gui_win_count() == 0)
+                                            shutdown = 1; /* last window: back to the shell */
                                         changed = 1;
                                     } else if (btn == 2) { /* maximise */
                                         int ox = hw->x, oy = hw->y;
                                         int ow = hw->w + 2 * GUI_BORDER;
                                         int oh = hw->h + 2 * GUI_BORDER + GUI_TITLE_H;
+                                        int nw, nh;
                                         if (hw->maxed) {
-                                            hw->x = hw->rx;
-                                            hw->y = hw->ry;
-                                            hw->w = hw->rw;
-                                            hw->h = hw->rh;
-                                            hw->maxed = 0;
+                                            nw = hw->rw;
+                                            nh = hw->rh;
                                         } else {
+                                            /* Save the restore rect BEFORE
+                                             * the realloc changes w/h. */
                                             hw->rx = hw->x;
                                             hw->ry = hw->y;
                                             hw->rw = hw->w;
                                             hw->rh = hw->h;
-                                            hw->x = 0;
-                                            hw->y = 0;
-                                            hw->w = (i32)s_fb.w - 2 * GUI_BORDER;
-                                            hw->h = (i32)s_fb.h - 2 * GUI_BORDER - GUI_TITLE_H;
-                                            hw->maxed = 1;
+                                            nw = (i32)s_fb.w - 2 * GUI_BORDER;
+                                            nh = (i32)s_fb.h - GUI_TASKBAR_H -
+                                                 2 * GUI_BORDER - GUI_TITLE_H;
                                         }
-                                        gui_dirty_add_nolock(ox, oy, ow, oh);
-                                        gui_dirty_add_nolock(hw->x, hw->y,
-                                                             hw->w + 2 * GUI_BORDER,
-                                                             hw->h + 2 * GUI_BORDER +
-                                                                 GUI_TITLE_H);
+                                        if (gui_win_realloc(hw, nw, nh) == 0) {
+                                            if (hw->maxed) {
+                                                hw->x = hw->rx;
+                                                hw->y = hw->ry;
+                                                hw->maxed = 0;
+                                            } else {
+                                                hw->x  = 0;
+                                                hw->y  = 0;
+                                                hw->maxed = 1;
+                                            }
+                                            gui_dirty_add_nolock(ox, oy, ow, oh);
+                                            gui_dirty_add_nolock(hw->x, hw->y,
+                                                                 hw->w + 2 * GUI_BORDER,
+                                                                 hw->h + 2 * GUI_BORDER +
+                                                                     GUI_TITLE_H);
+                                            changed = 1;
+                                        }
+                                    } else { /* btn 3: minimise */
+                                        int dx = hw->x, dy = hw->y;
+                                        int dw = hw->w + 2 * GUI_BORDER;
+                                        int dh = hw->h + 2 * GUI_BORDER + GUI_TITLE_H;
+                                        hw->hidden = 1;
+                                        if (s_focus_id == hit)
+                                            s_focus_id = 0;
+                                        gui_dirty_add_nolock(dx, dy, dw, dh);
+                                        gui_dirty_taskbar();
                                         changed = 1;
-                                    } /* btn 3 (minimise): no taskbar yet */
+                                    }
                                     goto button_done;
                                 }
                             }
                             /* Dragging starts when the press lands on
                              * the window's border/title-bar strip. */
-                            if (hw && s_ptr_y >= hw->y &&
-                                s_ptr_y < hw->y + GUI_BORDER + GUI_TITLE_H) {
+                            if (in_title) {
                                 s_drag_id  = hit;
                                 s_drag_offx = s_ptr_x - hw->x;
                                 s_drag_offy = s_ptr_y - hw->y;
@@ -1326,9 +1515,18 @@ static void gui_input_main(void *arg) {
                     }
                     if (s_lock >= 0)
                         (void)mutex_unlock(s_lock);
-                    if (focus_changed && fw > 0)
-                        gui_dirty_add(fx, fy, fw, fh);
-                    changed = 1;
+                    if (shutdown) {
+                        /* The last window was closed: hand the screen
+                         * back to the shell (keyboard focus + term
+                         * redraw).  Skip the composite — the term owns
+                         * the framebuffer again. */
+                        gui_shutdown();
+                        changed = 0;
+                    } else {
+                        if (focus_changed && fw > 0)
+                            gui_dirty_add(fx, fy, fw, fh);
+                        changed = 1;
+                    }
                 }
             }
         }

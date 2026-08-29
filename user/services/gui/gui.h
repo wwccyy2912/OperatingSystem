@@ -105,7 +105,9 @@ typedef struct {
     u32 code;
     i32 x;
     i32 y;
-    i32 win; /* target window id (focus for KEY, hit for mouse) */
+    i32 win;  /* target window id (focus for KEY, hit for mouse) */
+    u64 owner; /* window owner subject; 0 = broadcast.  The compositor
+                * filters events per polling client (event isolation). */
 } gui_event_t;
 
 typedef struct {

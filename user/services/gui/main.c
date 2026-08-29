@@ -90,7 +90,21 @@ static int s_term_port = -1;
 /* Events                                                             */
 /* ------------------------------------------------------------------ */
 
+static gui_win_t *win_find(int id); /* fwd: used by ev_push */
+
+/* Resolve the owner subject of a window id (0 = none). */
+static u64 win_owner(int id) {
+    gui_win_t *w = win_find(id);
+    return w ? w->owner : 0;
+}
+
 static void ev_push(u32 type, u32 code, i32 x, i32 y, i32 win) {
+    /* Event isolation: the event is routed to the owner of the target
+     * window (KEY -> focused window; mouse -> window under the pointer).
+     * No window = broadcast (owner 0): every polling client sees it. */
+    u64 owner = 0;
+    if (win != 0)
+        owner = win_owner(win);
     if (s_ev_count >= GUI_MAX_EVENTS)
         return; /* ring full: drop the oldest-free slot semantics */
     u32 idx          = (s_ev_head + s_ev_count) % GUI_MAX_EVENTS;
@@ -99,6 +113,7 @@ static void ev_push(u32 type, u32 code, i32 x, i32 y, i32 win) {
     s_events[idx].x    = x;
     s_events[idx].y    = y;
     s_events[idx].win  = win;
+    s_events[idx].owner = owner;
     s_ev_count++;
 }
 
@@ -766,18 +781,32 @@ static void do_text(int token, int msg_len, u64 caller) {
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_poll(int token) {
+static void do_poll(int token, u64 caller) {
     gui_resp_poll_t *resp = (gui_resp_poll_t *)s_resp;
     resp->ret             = 0;
 
     if (s_lock >= 0)
         (void)mutex_lock(s_lock);
     resp->count = 0;
-    while (s_ev_count > 0 && resp->count < GUI_MAX_EVENTS) {
-        resp->events[resp->count++] = s_events[s_ev_head];
-        s_ev_head                   = (s_ev_head + 1) % GUI_MAX_EVENTS;
-        s_ev_count--;
+    /* Event isolation: consume events addressed to this client (owner
+     * == caller subject) or broadcast (owner == 0); compact the ring,
+     * keeping other windows' events for their owners.  The ring holds
+     * at most GUI_MAX_EVENTS so the response can never overflow. */
+    u32 n   = s_ev_count;
+    u32 src = s_ev_head;
+    u32 dst = s_ev_head;
+    for (u32 i = 0; i < n; i++) {
+        gui_event_t e = s_events[src];
+        src = (src + 1) % GUI_MAX_EVENTS;
+        if (e.owner != 0 && e.owner != caller) {
+            s_events[dst] = e; /* not ours: keep */
+            dst = (dst + 1) % GUI_MAX_EVENTS;
+        } else {
+            resp->events[resp->count++] = e; /* ours: deliver */
+        }
     }
+    s_ev_head  = dst;
+    s_ev_count = n - resp->count;
     if (s_lock >= 0)
         (void)mutex_unlock(s_lock);
 
@@ -885,7 +914,7 @@ static void gui_server_loop(int port) {
         case GUI_OP_FOCUS:     do_focus(token, msg_len, caller); break;
         case GUI_OP_FILL:      do_fill(token, msg_len, caller); break;
         case GUI_OP_TEXT:      do_text(token, msg_len, caller); break;
-        case GUI_OP_POLL:      do_poll(token); break;
+        case GUI_OP_POLL:      do_poll(token, caller); break;
         case GUI_OP_POINTER:   do_pointer(token); break;
         case GUI_OP_ACTIVATE:  do_activate(token, caller); break;
         case GUI_OP_DEACTIVATE: do_deactivate(token); break;

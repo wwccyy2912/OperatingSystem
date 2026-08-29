@@ -948,6 +948,92 @@ static int read_line_impl(char *buf, int maxlen, int mask) {
                 }
                 break;
 
+            /* ---- Ctrl / Alt editing keys (0x80+/0xE0+ bands) ---- */
+            case 0x81: /* Ctrl-A — line start (same as Home) */
+                pos = 0;
+                shell_redraw_line(buf, pos);
+                break;
+            case 0x85: /* Ctrl-E — line end (same as End) */
+                pos = (int)strlen(buf);
+                shell_redraw_line(buf, pos);
+                break;
+            case 0x91: { /* Ctrl-U — kill to line start */
+                int l = (int)strlen(buf);
+                for (int k = pos; k < l; k++)
+                    buf[k - pos] = buf[k];
+                buf[l - pos] = '\0';
+                pos = 0;
+                shell_redraw_line(buf, pos);
+                break;
+            }
+            case 0x8B: /* Ctrl-K — kill to line end */
+                buf[pos] = '\0';
+                shell_redraw_line(buf, pos);
+                break;
+            case 0x97: { /* Ctrl-W — delete previous word */
+                int p = pos;
+                while (p > 0 && buf[p - 1] == ' ')
+                    p--;
+                while (p > 0 && buf[p - 1] != ' ')
+                    p--;
+                for (int k = pos; buf[k] != '\0'; k++)
+                    buf[p + (k - pos)] = buf[k];
+                buf[p + ((int)strlen(buf) - pos)] = '\0';
+                pos = p;
+                shell_redraw_line(buf, pos);
+                break;
+            }
+            case 0x8C: /* Ctrl-L — clear screen, redraw line */
+                shell_write("\033[2J\033[H");
+                shell_redraw_line(buf, pos);
+                break;
+            case 0x83: /* Ctrl-C — cancel the current line */
+                shell_write("^C\r\n");
+                buf[0] = '\0';
+                pos    = 0;
+                s_hist_view = -1;
+                break;
+            case 0x84: /* Ctrl-D — EOF on an empty line exits the shell */
+                if (buf[0] == '\0') {
+                    shell_write("\r\n");
+                    return -1;
+                }
+                break;
+            case 0xE2: { /* Alt-B — move back one word */
+                int p = pos;
+                while (p > 0 && buf[p - 1] == ' ')
+                    p--;
+                while (p > 0 && buf[p - 1] != ' ')
+                    p--;
+                pos = p;
+                shell_redraw_line(buf, pos);
+                break;
+            }
+            case 0xE6: { /* Alt-F — move forward one word */
+                int l = (int)strlen(buf);
+                int p = pos;
+                while (p < l && buf[p] != ' ')
+                    p++;
+                while (p < l && buf[p] == ' ')
+                    p++;
+                pos = p;
+                shell_redraw_line(buf, pos);
+                break;
+            }
+            case 0xE4: { /* Alt-D — delete word after cursor */
+                int l = (int)strlen(buf);
+                int p = pos;
+                while (p < l && buf[p] != ' ')
+                    p++;
+                while (p < l && buf[p] == ' ')
+                    p++;
+                for (int k = p; buf[k] != '\0'; k++)
+                    buf[pos + (k - p)] = buf[k];
+                buf[pos + (l - p)] = '\0';
+                shell_redraw_line(buf, pos);
+                break;
+            }
+
             default:
                 if (ch >= ' ' && ch < 0x7F) {
                     int l = (int)strlen(buf);
@@ -1364,7 +1450,9 @@ static int cmd_scroll(int argc, char *argv[]) {
         shell_write("scroll: terminal unavailable\n");
         return -1;
     }
-    /* Default (no arg): page back one screen (~20 lines). */
+    /* Pager: enter the scrollback view and loop on keys until the user
+     * quits (q/Enter) — the WRITE-to-live reset in term only fires on
+     * text output, so the view stays up while we read keys. */
     i32 delta = 20;
     if (argc >= 2) {
         if (strcmp(argv[1], "end") == 0)
@@ -1379,6 +1467,7 @@ static int cmd_scroll(int argc, char *argv[]) {
             delta = (i32)v;
         }
     }
+    /* Enter the view. */
     u32 req[3];
     req[0] = 10; /* TERM_OP_SCROLLVIEW */
     req[1] = 4;
@@ -1390,6 +1479,41 @@ static int cmd_scroll(int argc, char *argv[]) {
         shell_write("scroll: term op failed\n");
         return -1;
     }
+    /* NOTE: no shell_write here — any WRITE to the terminal resets the
+     * scrollback view to live (term.c).  The pager is silent; only the
+     * key loop runs until the user quits. */
+
+    /* Pager loop: keys come from the keyboard service. */
+    for (;;) {
+        u32 kreq[2] = {2, 8}; /* KBD_OP_READ_BLOCK */
+        u8  kresp[4 + 8];
+        int krl = (int)sizeof(kresp);
+        if (ipc_call(s_kbd_port, kreq, 8, kresp, &krl) < 0 || krl < 4)
+            break;
+        i32 n = (i32)((u32 *)kresp)[0];
+        if (n <= 0)
+            continue;
+        u8 key = kresp[4];
+        if (key == 'q' || key == 'Q' || key == '\r' || key == '\n')
+            break;
+        i32 step = 0;
+        if (key == 0x02 || key == 0x0B) /* PgUp / Up */
+            step = 20;
+        else if (key == 0x06 || key == 0x0C) /* PgDn / Down */
+            step = -20;
+        else
+            continue;
+        req[0] = 10;
+        req[1] = 4;
+        req[2] = (u32)step;
+        (void)ipc_call(s_term_port, req, 12, resp, &resp_len);
+    }
+
+    /* Return to live. */
+    req[0] = 10;
+    req[1] = 4;
+    req[2] = 0;
+    (void)ipc_call(s_term_port, req, 12, resp, &resp_len);
     return 0;
 }
 

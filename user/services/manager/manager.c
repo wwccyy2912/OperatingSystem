@@ -358,11 +358,12 @@ static void serial_test_run(void) {
  * immediately after.
  */
 static int spawn_service(service_t *svc, int quiet) {
-    char *blob_buf = malloc(262144); /* must hold the largest service ELF */
+    char *blob_buf = malloc(524288); /* must hold the largest service ELF
+                                      * (term embeds the 230KB CJK font) */
     if (!blob_buf)
         return ERR_NOMEM;
 
-    int size = blob_get(svc->name, blob_buf, 262144);
+    int size = blob_get(svc->name, blob_buf, 524288);
     if (size < 0) {
         free(blob_buf);
         if (!quiet)

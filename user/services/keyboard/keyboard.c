@@ -112,7 +112,20 @@ typedef uint64_t u64;
 #define SC_RSHIFT_MAKE  0x36
 #define SC_RSHIFT_BREAK 0xB6
 #define SC_CAPS         0x3A
+#define SC_CTRL_MAKE    0x1D
+#define SC_CTRL_BREAK   0x9D
+#define SC_ALT_MAKE     0x38
+#define SC_ALT_BREAK    0xB8
 #define SC_EXT_PREFIX   0xE0
+
+/* Ctrl+letter payloads use the 0x80-0x9F band so they cannot collide
+ * with the navigation keys (0x01..0x14) or with UTF-8 text bytes the
+ * terminal consumes.  Ctrl-A -> 0x81 ... Ctrl-Z -> 0x9A; Ctrl-[ -> 0x9B,
+ * Ctrl-\ -> 0x9C, Ctrl-] -> 0x9D, Ctrl-6 -> 0x9E, Ctrl-- -> 0x9F,
+ * Ctrl-@/space -> 0x80.  Alt+letter uses 0xE0..0xEF (Alt-B=0xE2 word
+ * left, Alt-F=0xE6 word right, Alt-D=0xE4 delete word). */
+#define KBD_CTRL_BASE 0x80
+#define KBD_ALT_BASE  0xE0
 
 /* ====================================================================
  * Protocol structures (flat, raw copy — see header comment)
@@ -187,6 +200,8 @@ static u8 s_mouse_pkt[3];
 static u8 s_extended; /* last byte was the 0xE0 prefix */
 static u8 s_shift;    /* left or right shift held */
 static u8 s_caps;     /* caps lock toggled on */
+static u8 s_ctrl;     /* ctrl held */
+static u8 s_alt;      /* alt held */
 
 /* ====================================================================
  * Scancode set-1 → ASCII (US layout)
@@ -351,6 +366,22 @@ static void kbd_decode_byte(u8 sc) {
         s_caps = !s_caps;
         return;
     }
+    if (sc == SC_CTRL_MAKE) {
+        s_ctrl = 1;
+        return;
+    }
+    if (sc == SC_CTRL_BREAK) {
+        s_ctrl = 0;
+        return;
+    }
+    if (sc == SC_ALT_MAKE) {
+        s_alt = 1;
+        return;
+    }
+    if (sc == SC_ALT_BREAK) {
+        s_alt = 0;
+        return;
+    }
 
     if (sc & 0x80)
         return; /* non-modifier break code: ignore */
@@ -358,6 +389,29 @@ static void kbd_decode_byte(u8 sc) {
     char ch = s_shift ? s_key_shift[sc] : s_key_normal[sc];
     if (s_caps && ch >= 'a' && ch <= 'z')
         ch = (char)(ch - 'a' + 'A');
+
+    /* Ctrl / Alt combinations encode into the 0x80+/0xE0+ bands. */
+    if (s_ctrl) {
+        if (ch >= 'a' && ch <= 'z')
+            ch = (char)(KBD_CTRL_BASE + (ch - 'a' + 1));
+        else if (ch >= 'A' && ch <= 'Z')
+            ch = (char)(KBD_CTRL_BASE + (ch - 'A' + 1));
+        else if (ch == '[')      ch = (char)(KBD_CTRL_BASE + 27); /* ESC */
+        else if (ch == '\\')     ch = (char)(KBD_CTRL_BASE + 28);
+        else if (ch == ']')      ch = (char)(KBD_CTRL_BASE + 29);
+        else if (ch == '6' || ch == '^') ch = (char)(KBD_CTRL_BASE + 30);
+        else if (ch == '-' || ch == '_') ch = (char)(KBD_CTRL_BASE + 31);
+        else if (ch == ' ' || ch == '@' || ch == '2')
+            ch = (char)KBD_CTRL_BASE;
+        else if (ch == 0)
+            return; /* Ctrl+modifier: no payload */
+        else
+            return; /* other Ctrl combos: ignore for now */
+        /* fall through to emit ch */
+    } else if (s_alt && ch >= 'a' && ch <= 'z') {
+        ch = (char)(KBD_ALT_BASE + (ch - 'a' + 1));
+    }
+
     if (ch == 0)
         return;
 

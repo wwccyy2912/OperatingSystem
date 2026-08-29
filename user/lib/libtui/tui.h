@@ -33,6 +33,7 @@
 #define TUI_OP_GET_CURSOR  7 /* query cursor position */
 #define TUI_OP_SNAPSHOT    8 /* save a cell region: {x,y,w,h} -> cells[] */
 #define TUI_OP_RESTORE     9 /* redraw a saved cell region: {x,y,w,h,cells} */
+#define TUI_OP_GET_SIZE    12 /* query terminal size -> {cols, rows} */
 
 #define TUI_MAX_TEXT 256 /* max payload per operation */
 
@@ -111,6 +112,12 @@ int tui_set_cursor(uint32_t x, uint32_t y);
  * Returns 0 on success and fills x/y, or negative error.
  */
 int tui_get_cursor(uint32_t *x, uint32_t *y);
+
+/**
+ * Query the terminal size in cells.  Returns 0 on success and fills
+ * cols/rows (either may be NULL), or a negative error.
+ */
+int tui_get_size(uint32_t *cols, uint32_t *rows);
 
 /* ====================================================================
  * Utility functions

@@ -187,6 +187,19 @@ int tui_get_cursor(uint32_t *x, uint32_t *y) {
     return 0;
 }
 
+int tui_get_size(uint32_t *cols, uint32_t *rows) {
+    int ret = tui_call(TUI_OP_GET_SIZE, NULL, 0);
+    if (ret < 0)
+        return ret;
+    if (s_resp_len < 12)
+        return -1;
+    if (cols)
+        *cols = ((u32 *)s_resp)[1];
+    if (rows)
+        *rows = ((u32 *)s_resp)[2];
+    return 0;
+}
+
 /* ====================================================================
  * Utility: formatted output
  * ==================================================================== */

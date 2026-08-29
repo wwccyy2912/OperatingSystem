@@ -76,6 +76,11 @@ static u8  s_ptr_buttons;
 static int s_drag_id;    /* window being dragged (0 = none) */
 static int s_press_grab; /* window that received the last button press
                           * (implicit pointer grab; 0 = none) */
+/* Double-click detection (title-bar double-click = maximise). */
+static int s_last_press_ticks;
+static int s_last_press_x;
+static int s_last_press_y;
+static int s_last_press_win;
 static int s_drag_offx;  /* pointer offset within the window border */
 static int s_drag_offy;
 
@@ -1133,6 +1138,50 @@ static void gui_input_main(void *arg) {
                         int hit = hit_test(s_ptr_x, s_ptr_y);
                         if (hit != 0) {
                             gui_win_t *hw = win_find(hit);
+                            /* Double-click on the title bar (not on a
+                             * button) toggles maximise. */
+                            if (hw && s_ptr_y >= hw->y &&
+                                s_ptr_y < hw->y + GUI_BORDER + GUI_TITLE_H &&
+                                title_button_at(hw, s_ptr_x, s_ptr_y) == 0) {
+                                int now = get_time();
+                                if (hit == s_last_press_win &&
+                                    now - s_last_press_ticks < 30 &&
+                                    s_ptr_x > s_last_press_x - 8 && s_ptr_x < s_last_press_x + 8 &&
+                                    s_ptr_y > s_last_press_y - 8 && s_ptr_y < s_last_press_y + 8) {
+                                    int ox = hw->x, oy = hw->y;
+                                    int ow = hw->w + 2 * GUI_BORDER;
+                                    int oh = hw->h + 2 * GUI_BORDER + GUI_TITLE_H;
+                                    if (hw->maxed) {
+                                        hw->x = hw->rx;
+                                        hw->y = hw->ry;
+                                        hw->w = hw->rw;
+                                        hw->h = hw->rh;
+                                        hw->maxed = 0;
+                                    } else {
+                                        hw->rx = hw->x;
+                                        hw->ry = hw->y;
+                                        hw->rw = hw->w;
+                                        hw->rh = hw->h;
+                                        hw->x = 0;
+                                        hw->y = 0;
+                                        hw->w = (i32)s_fb.w - 2 * GUI_BORDER;
+                                        hw->h = (i32)s_fb.h - 2 * GUI_BORDER - GUI_TITLE_H;
+                                        hw->maxed = 1;
+                                    }
+                                    gui_dirty_add_nolock(ox, oy, ow, oh);
+                                    gui_dirty_add_nolock(hw->x, hw->y,
+                                                         hw->w + 2 * GUI_BORDER,
+                                                         hw->h + 2 * GUI_BORDER +
+                                                             GUI_TITLE_H);
+                                    changed = 1;
+                                    s_last_press_win = 0; /* consume */
+                                    goto button_done;
+                                }
+                                s_last_press_ticks = now;
+                                s_last_press_x     = s_ptr_x;
+                                s_last_press_y     = s_ptr_y;
+                                s_last_press_win   = hit;
+                            }
                             /* Title-bar buttons take priority over drag
                              * and focus (close / minimise / maximise). */
                             if (hw && s_ptr_y >= hw->y &&

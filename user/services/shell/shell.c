@@ -26,7 +26,7 @@
  */
 
 #include "shell.h"              /* cmd_func_t, shell_register_command */
-#include "../lib/libc/stdio.h"  /* printf -> SYS_DEBUG_LOG (serial) */
+#include "../lib/libc/stdio.h"  /* printf, sscanf -> SYS_DEBUG_LOG (serial) */
 #include "../lib/libc/stdlib.h" /* atoi */
 #include "../lib/libc/string.h" /* strcmp, strlen, strdup */
 #include "../lib/libfs/fs.h"    /* libfs VFS client (ls/cat/stat/tee/fallocate/mkdir/rm) */
@@ -2266,7 +2266,46 @@ static int cmd_net(int argc, char *argv[]) {
         }
         return -1;
     }
-    shell_write("Usage: net mac | arp | recv | stats\n");
+    if (strcmp(argv[1], "ping") == 0 && argc >= 3) {
+        /* ICMP echo to a dotted-quad address (e.g. 10.0.2.2). */
+        u8 ip[4] = {0, 0, 0, 0};
+        const char *s = argv[2];
+        int ok = 1;
+        for (int i = 0; i < 4; i++) {
+            char *end = NULL;
+            long  v   = strtol(s, &end, 10);
+            if (end == s || v < 0 || v > 255 ||
+                (i < 3 && *end != '.')) {
+                ok = 0;
+                break;
+            }
+            ip[i] = (u8)v;
+            if (i < 3)
+                s = end + 1;
+            else if (*end != '\0')
+                ok = 0;
+        }
+        if (!ok) {
+            shell_write("net: bad address\n");
+            return -1;
+        }
+        net_req_t req;
+        memset(&req, 0, sizeof(req));
+        req.op = 7; /* NET_OP_PING */
+        req.len = 4;
+        memcpy(req.data, ip, 4);
+        net_resp_t resp;
+        memset(&resp, 0, sizeof(resp));
+        int rl = (int)sizeof(resp);
+        shell_printf("net: ping %d.%d.%d.%d ...\n", ip[0], ip[1], ip[2], ip[3]);
+        if (ipc_call(port, &req, 8 + 4, &resp, &rl) == 0 && resp.ret == 0) {
+            shell_write("net: reply OK\n");
+            return 0;
+        }
+        shell_printf("net: no reply (ret=%d)\n", resp.ret);
+        return -1;
+    }
+    shell_write("Usage: net mac | arp | ping <ip> | recv | stats\n");
     return -1;
 }
 

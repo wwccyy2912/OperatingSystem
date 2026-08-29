@@ -24,6 +24,7 @@
  */
 
 #include "net.h"
+#include "proto.h"
 
 #include <libc/stdio.h>
 #include <libc/stdlib.h> /* getenv */
@@ -247,32 +248,104 @@ static int pcnet_start(void) {
 
 /* ---- Tx ---- */
 
+/* ---- protocol-stack glue (implementations for proto.c) ---- */
+
+static int net_send(const u8 *data, u32 len); /* fwd */
+static void net_service_rx(void);             /* fwd */
+
+/* Send a raw Ethernet frame (the protocol stack's egress path). */
+int net_send_raw(const u8 *frame, u32 len) {
+    return net_send(frame, len);
+}
+
+void net_get_mac(u8 mac[6]) {
+    memcpy(mac, s_mac, 6);
+}
+
+/* Pull one received frame out of the driver queue (the protocol stack
+ * consumes these).  Returns 1 and fills *out when a frame is pending. */
+int net_rx_pump(u8 *out, u32 *out_len) {
+    if (s_lock >= 0)
+        (void)mutex_lock(s_lock);
+    int have = 0;
+    if (s_rxq_count > 0) {
+        u32 slot = s_rxq_head;
+        u32 n    = s_rxq_len[slot];
+        if (n > NET_MTU)
+            n = NET_MTU;
+        memcpy(out, s_rxq[slot], n);
+        *out_len = n;
+        s_rxq_head = (s_rxq_head + 1) % NET_RXQ_DEPTH;
+        s_rxq_count--;
+        have = 1;
+    }
+    if (s_lock >= 0)
+        (void)mutex_unlock(s_lock);
+    return have;
+}
+
+/* Drain the NIC ring into the driver queue (used by the protocol
+ * stack while it waits for ARP/ICMP replies). */
+void net_rx_pump_now(void) {
+    net_service_rx();
+}
+
+/* Yield one scheduling tick while the stack waits for replies. */
+void net_yield(void) {
+    (void)sleep(1); /* 10 ms */
+}
+
 static int net_send(const u8 *data, u32 len) {
     if (!data || len == 0 || len > NET_MTU)
         return -2; /* ERR_INVAL */
     if (s_lock >= 0)
         (void)mutex_lock(s_lock);
 
-    for (int i = 0; i < NET_RINGS; i++) {
-        pcnet_desc_t *t = &s_tx_ring[i];
-        if (t->status & 0x8000)
-            continue; /* still owned by the NIC */
-        u8 *dst = s_pool_va + NET_OFF_TXBUF + i * NET_BUF_SIZE;
-        memcpy(dst, data, len);
-        /* IEEE 802.3 minimum frame: pad short frames (e.g. a 42-byte
-         * ARP request) to 60 bytes, or real hardware/switches drop
-         * them as runts. */
-        if (len < 60) {
-            memset(dst + len, 0, 60 - len);
-            len = 60;
+    /* QEMU's transmitter consumes descriptors strictly in XMTRC order
+     * (csr[74]): the next frame must go into slot (XMTRL - XMTRC).
+     * Picking "the first free OWN=0 slot" desynchronises from that
+     * pointer on the second packet (the NIC reads a different slot),
+     * so the transmit demand never fires.  Read XMTRC, target its
+     * slot, and wait for that slot to drain before refilling it. */
+    u16 xmtrc = csr_read(74); /* CSR_XMTRC: 1..XMTRL */
+    int slot  = (NET_RINGS - (int)xmtrc) % NET_RINGS;
+    if (slot < 0)
+        slot += NET_RINGS;
+    pcnet_desc_t *t = &s_tx_ring[slot];
+
+    /* Wait for the NIC to consume any previous frame in this slot. */
+    {
+        int spins = 0;
+        while ((t->status & DESC_OWN) && spins < 1000000)
+            spins++;
+        if (spins >= 1000000) {
+            t->status = 0;
+            t->len    = (u16)((4096 - NET_BUF_SIZE) | 0xF000);
+            t->mcnt   = 0;
+            s_stat_err++;
+            if (s_lock >= 0)
+                (void)mutex_unlock(s_lock);
+            return -7; /* ERR_FAULT: ring stuck */
         }
-        t->addr   = (u32)(s_pool_phys + NET_OFF_TXBUF + i * NET_BUF_SIZE);
-        t->len    = (u16)((4096 - len) | 0xF000); /* BCNT + ONES nibble */
-        t->mcnt   = 0;
-        t->status = DESC_OWN | DESC_STP | DESC_ENP;
-        csr_write(0, CSR0_TDMD); /* transmit demand */
-        /* Wait for the NIC to consume the descriptor (OWN cleared).
-         * Confirms the frame was actually transmitted. */
+    }
+
+    u8 *dst = s_pool_va + NET_OFF_TXBUF + slot * NET_BUF_SIZE;
+    memcpy(dst, data, len);
+    /* IEEE 802.3 minimum frame: pad short frames (e.g. a 42-byte
+     * ARP request) to 60 bytes, or real hardware/switches drop
+     * them as runts. */
+    if (len < 60) {
+        memset(dst + len, 0, 60 - len);
+        len = 60;
+    }
+    t->addr   = (u32)(s_pool_phys + NET_OFF_TXBUF + slot * NET_BUF_SIZE);
+    t->len    = (u16)((4096 - len) | 0xF000); /* BCNT + ONES nibble */
+    t->mcnt   = 0;
+    t->status = DESC_OWN | DESC_STP | DESC_ENP;
+    csr_write(0, CSR0_TDMD); /* transmit demand */
+    /* Wait for the NIC to consume the descriptor (OWN cleared).
+     * Confirms the frame was actually transmitted. */
+    {
         int spins = 0;
         while ((t->status & DESC_OWN) && spins < 1000000)
             spins++;
@@ -280,6 +353,8 @@ static int net_send(const u8 *data, u32 len) {
             /* Timeout: the NIC never consumed the descriptor.  Reset
              * the slot so it does not leak (an OWN=1 TMD would make the
              * ring permanently short), then report the fault. */
+            printf("net: TX timeout len=%d c0=%04x tstat=%04x\n", len,
+                   csr_read(0), (u16)t->status);
             t->status = 0;
             t->len    = (u16)((4096 - NET_BUF_SIZE) | 0xF000);
             t->mcnt   = 0;
@@ -288,14 +363,11 @@ static int net_send(const u8 *data, u32 len) {
                 (void)mutex_unlock(s_lock);
             return -7; /* ERR_FAULT: NIC never transmitted */
         }
-        s_stat_tx++;
-        if (s_lock >= 0)
-            (void)mutex_unlock(s_lock);
-        return 0;
     }
+    s_stat_tx++;
     if (s_lock >= 0)
         (void)mutex_unlock(s_lock);
-    return -6; /* ERR_AGAIN: no free descriptor */
+    return 0;
 }
 
 /* ---- Rx (IRQ thread) ---- */
@@ -355,6 +427,14 @@ static void net_server_loop(int port) {
          * unreliable; the IRQ thread is a bonus, not the delivery
          * mechanism).  Draining here keeps RECV latency low. */
         net_service_rx();
+        /* Feed every received frame into the protocol stack (ARP
+         * cache learning/replies, ICMP echo, UDP queueing). */
+        {
+            u8 frame[1600];
+            u32 flen;
+            while (net_rx_pump(frame, &flen))
+                proto_rx(frame, flen);
+        }
 
         int msg_len = (int)sizeof(s_req);
         int token   = 0;
@@ -417,6 +497,82 @@ static void net_server_loop(int port) {
             if (s_lock >= 0)
                 (void)mutex_unlock(s_lock);
             break;
+
+        /* ---- L3/L4 protocol ops ---- */
+        case NET_OP_SET_IP: {
+            /* { ip[4]; gw[4] } — reconfigure the static address. */
+            if (req->len >= 8) {
+                proto_init(req->data, req->data + 4);
+                resp->ret = 0;
+            }
+            break;
+        }
+        case NET_OP_IP_SEND: {
+            /* { ip[4]; proto; payload } */
+            if (req->len >= 5) {
+                u8 dst[4];
+                memcpy(dst, req->data, 4);
+                resp->ret = proto_ip_send(dst, req->data[4],
+                                          req->data + 5, req->len - 5);
+            }
+            break;
+        }
+        case NET_OP_PING: {
+            if (req->len >= 4) {
+                u8 dst[4];
+                memcpy(dst, req->data, 4);
+                resp->ret = proto_ping(dst);
+            }
+            break;
+        }
+        case NET_OP_UDP_BIND: {
+            if (req->len >= 2) {
+                u16 p = (u16)((req->data[0] << 8) | req->data[1]);
+                resp->ret = proto_udp_bind(p);
+            }
+            break;
+        }
+        case NET_OP_UDP_UNBIND: {
+            if (req->len >= 2) {
+                u16 p = (u16)((req->data[0] << 8) | req->data[1]);
+                resp->ret = proto_udp_unbind(p);
+            }
+            break;
+        }
+        case NET_OP_UDP_SENDTO: {
+            /* { ip[4]; sport; dport; data } */
+            if (req->len >= 8) {
+                u8 dst[4];
+                memcpy(dst, req->data, 4);
+                u16 sport = (u16)((req->data[4] << 8) | req->data[5]);
+                u16 dport = (u16)((req->data[6] << 8) | req->data[7]);
+                resp->ret = proto_udp_sendto(dst, sport, dport,
+                                             req->data + 8, req->len - 8);
+            }
+            break;
+        }
+        case NET_OP_UDP_RECV: {
+            u8 src[4];
+            u16 sport, dport;
+            int n = proto_udp_recv(src, &sport, &dport, resp->data,
+                                   NET_MTU);
+            if (n >= 0) {
+                /* Reply: { srcip[4]; sport; dport; data } */
+                u8 out[4 + 4 + 1500];
+                memcpy(out, src, 4);
+                out[4] = (u8)(sport >> 8);
+                out[5] = (u8)(sport & 0xFF);
+                out[6] = (u8)(dport >> 8);
+                out[7] = (u8)(dport & 0xFF);
+                memcpy(out + 8, resp->data, (u32)n);
+                memcpy(resp->data, out, (u32)n + 8);
+                resp->len = (u32)n + 8;
+                resp->ret = 0;
+            } else {
+                resp->ret = n;
+            }
+            break;
+        }
         default:
             break;
         }
@@ -519,6 +675,14 @@ int main(void) {
         thread_exit(1);
     }
     printf("net: NIC started (Rx/Tx live)\n");
+
+    /* 7c. Protocol stack: static slirp-typical address. */
+    {
+        static const u8 ip[4] = {10, 0, 2, 15};
+        static const u8 gw[4] = {10, 0, 2, 2};
+        proto_init(ip, gw);
+        printf("net: stack up 10.0.2.15 gw 10.0.2.2\n");
+    }
 
     /* 8. IPC port. */
     int port = ipc_port_create();

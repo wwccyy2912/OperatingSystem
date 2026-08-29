@@ -54,6 +54,7 @@
 
 #include "../lib/libc/stdio.h"
 #include "../lib/libc/string.h"
+#include "../lib/libc/utf8.h" /* UTF-8 decoding for per-byte render paths */
 #include "../lib/libos/syscalls.h"
 #include <stdint.h>
 
@@ -93,9 +94,12 @@ typedef int32_t  i32;
 #define TERM_MAX_DATA 256 /* max payload bytes per request */
 
 /* Snapshot/restore region cap: cells moved per op.  A 113x38 screen is
- * 4294 cells; dialogs/panels are far smaller, so 2048 cells (e.g.
- * 64x32 or a 100x20 box) is generous and keeps the IPC copy bounded. */
-#define TERM_MAX_REGION_CELLS 2048
+ * 4294 cells; the largest overlay is the fm file manager's menu
+ * (80x20 = 1600).  Cells travel as u16 code points (a CJK char needs
+ * 16 bits; CELL_WIDE_CONT round-trips as 0xFFFE), so the IPC payload is
+ * 2 bytes per cell and the cap is bounded by the kernel's 4096-byte
+ * MAX_MSG_SIZE: request = 8 (hdr) + 16 (x,y,w,h) + 2*cells <= 4096. */
+#define TERM_MAX_REGION_CELLS 2036
 
 /* Virtual address for the framebuffer mapping.  Must be page-aligned,
  * below USER_PTR_MAX (0x0000800000000000), and must not collide with
@@ -170,12 +174,12 @@ typedef struct {
  * Terminal state
  * ==================================================================== */
 
-/* RESTORE payload = {x,y,w,h} + cells, so the req buffer must hold the
- * region header plus the cells (bounded by TERM_MAX_REGION_CELLS). */
-static u8 s_req_buf[TERM_REQ_HDR + 16 + TERM_MAX_REGION_CELLS];
+/* RESTORE payload = {x,y,w,h} + cells (u16 each), so the req buffer
+ * must hold the region header plus 2 bytes per cell. */
+static u8 s_req_buf[TERM_REQ_HDR + 16 + TERM_MAX_REGION_CELLS * 2];
 /* GET_CURSOR packs {i32 ret; u32 x; u32 y} (12 bytes); SNAPSHOT returns
- * the region cells after ret (TERM_RESP_HDR + TERM_MAX_REGION_CELLS). */
-static u8 s_resp_buf[TERM_RESP_HDR + TERM_MAX_REGION_CELLS];
+ * the region cells (u16 each) after ret. */
+static u8 s_resp_buf[TERM_RESP_HDR + TERM_MAX_REGION_CELLS * 2];
 
 /* Framebuffer descriptor (from SYS_FB_GET_INFO) */
 static u64 s_fb_va;     /* mapped virtual address        */
@@ -421,6 +425,68 @@ static void term_set_cell(u32 x, u32 y, u32 ch, u32 fg_rgb, u32 bg_rgb) {
     term_draw_cell(x, y, s_cells[y][x]);
 }
 
+/*
+ * Clear one cell, keeping the wide-character pair model intact: if the
+ * cell is a continuation of a CJK pair the LEAD is cleared too (and
+ * vice versa), so no half-glyph can survive a partial erase (the
+ * framebuffer shows the lead's 16-px paint until BOTH cells are
+ * rewritten as spaces).
+ */
+static void term_clear_cell(u32 x, u32 y) {
+    if (x >= s_cols || y >= s_rows)
+        return;
+    u32 ch = CELL_CH(s_cells[y][x]);
+    /* Continuation cell: clear the wide char's lead as well. */
+    if (ch == CELL_WIDE_CONT && x > 0) {
+        u32 lead = CELL_CH(s_cells[y][x - 1]);
+        if (lead > 0x7F && lead != CELL_WIDE_CONT) {
+            CELL_SET(s_cells[y][x - 1], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
+            term_draw_cell(x - 1, y, s_cells[y][x - 1]);
+        }
+    }
+    /* Wide char lead: clear its continuation cell as well. */
+    if (ch > 0x7F && ch != CELL_WIDE_CONT && x + 1 < s_cols &&
+        CELL_CH(s_cells[y][x + 1]) == CELL_WIDE_CONT) {
+        CELL_SET(s_cells[y][x + 1], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
+        term_draw_cell(x + 1, y, s_cells[y][x + 1]);
+    }
+    CELL_SET(s_cells[y][x], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
+    term_draw_cell(x, y, s_cells[y][x]);
+}
+
+/*
+ * Render a UTF-8 string at (x, y) advancing by display columns (CJK
+ * wide = 2), decoding incrementally so multi-byte characters survive
+ * the per-byte STATUS/BOX/RENDER_LINE paths.  Stops at max_cols
+ * columns (never splitting a code point) or the string end.  Returns
+ * the column after the last glyph, for callers that pad or centre.
+ */
+static u32 term_puts_utf8(u32 x, u32 y, const char *s, u32 max_cols,
+                          u32 fg_rgb, u32 bg_rgb) {
+    u32 col = x;
+    u32 i   = 0;
+    while (s[i] && col < max_cols) {
+        u32 cp;
+        int n = utf8_decode(s + i, &cp);
+        if (n <= 0) { /* stray byte: render as itself, single width */
+            cp = (u32)(u8)s[i];
+            n  = 1;
+        }
+        int wide = (cp > 0x7F && font_cjk_lookup(cp) != NULL) ? 1 : 0;
+        if (col + 1 > max_cols)
+            break; /* glyph would cross the column limit */
+        term_set_cell(col, y, cp, fg_rgb, bg_rgb);
+        col += 1;
+        if (wide) {
+            if (col < max_cols && col < s_cols)
+                term_set_cell(col, y, CELL_WIDE_CONT, fg_rgb, bg_rgb);
+            col += 1;
+        }
+        i += (u32)n;
+    }
+    return col;
+}
+
 /* ====================================================================
  * Cursor rendering
  *
@@ -428,21 +494,40 @@ static void term_set_cell(u32 x, u32 y, u32 ch, u32 fg_rgb, u32 bg_rgb) {
  * re-rendered with foreground/background swapped.  To erase it we
  * re-render the same cell normally (s_cells holds the cell, so no
  * pixel read-back is needed).
+ *
+ * When the cursor sits ON a wide character's continuation cell the
+ * inverted rectangle is anchored at the LEAD column: drawing it at the
+ * continuation column would paint the 16-px glyph shifted one cell
+ * right, covering the next character (and erasing would be a no-op —
+ * term_draw_cell skips CELL_WIDE_CONT).  Anchoring at the lead keeps
+ * both halves covered and both draw/erase symmetric.
  * ==================================================================== */
+
+/* Column where the cursor rectangle must be drawn/erased: the cursor's
+ * own column, or the wide-char lead when the cursor is on a
+ * continuation cell. */
+static u32 term_cursor_anchor_x(void) {
+    u32 x = s_cursor_x;
+    if (x > 0 && CELL_CH(s_cells[s_cursor_y][x]) == CELL_WIDE_CONT) {
+        u32 lead = CELL_CH(s_cells[s_cursor_y][x - 1]);
+        if (lead > 0x7F && lead != CELL_WIDE_CONT)
+            return x - 1;
+    }
+    return x;
+}
 
 static void term_draw_cursor(void) {
     if (!s_cursor_visible)
         return;
-    u32 cell = s_cells[s_cursor_y][s_cursor_x];
-    u32 ch   = CELL_CH(cell);
-    if (ch == CELL_WIDE_CONT) /* cursor on a continuation cell: move left */
-        cell = s_cells[s_cursor_y][s_cursor_x > 0 ? s_cursor_x - 1 : 0];
+    u32 x    = term_cursor_anchor_x();
+    u32 cell = s_cells[s_cursor_y][x];
     CELL_SET(cell, CELL_CH(cell), (u8)CELL_BG(cell), (u8)CELL_FG(cell)); /* swap */
-    term_draw_cell(s_cursor_x, s_cursor_y, cell);
+    term_draw_cell(x, s_cursor_y, cell);
 }
 
 static void term_erase_cursor(void) {
-    term_draw_cell(s_cursor_x, s_cursor_y, s_cells[s_cursor_y][s_cursor_x]);
+    u32 x = term_cursor_anchor_x();
+    term_draw_cell(x, s_cursor_y, s_cells[s_cursor_y][x]);
 }
 
 /* ====================================================================
@@ -504,10 +589,20 @@ static void term_put_code_point(u32 cp) {
         goto finish;
     case '\b':
         if (s_cursor_x > 0) {
-            s_cursor_x--;
-            CELL_SET(s_cells[s_cursor_y][s_cursor_x], ' ',
-                     CELL_DEFAULT_FG, CELL_DEFAULT_BG);
-            term_draw_cell(s_cursor_x, s_cursor_y, s_cells[s_cursor_y][s_cursor_x]);
+            u32 x  = s_cursor_x - 1;
+            u32 ch = CELL_CH(s_cells[s_cursor_y][x]);
+            /* Wide character continuation: back to its lead and clear
+             * the whole pair, so no half-glyph is left behind. */
+            if (ch == CELL_WIDE_CONT && x > 0) {
+                u32 lead = CELL_CH(s_cells[s_cursor_y][x - 1]);
+                if (lead > 0x7F && lead != CELL_WIDE_CONT) {
+                    term_clear_cell(x - 1, s_cursor_y);
+                    s_cursor_x = x - 1;
+                    goto finish;
+                }
+            }
+            term_clear_cell(x, s_cursor_y);
+            s_cursor_x = x;
         }
         goto finish;
     case '\t':
@@ -515,6 +610,10 @@ static void term_put_code_point(u32 cp) {
         s_cursor_x = (s_cursor_x / 8 + 1) * 8;
         if (s_cursor_x >= s_cols)
             s_cursor_x = s_cols - 1;
+        /* A tab stop can land inside a wide character.  Clear the pair
+         * so the next write does not orphan a half glyph. */
+        if (CELL_CH(s_cells[s_cursor_y][s_cursor_x]) == CELL_WIDE_CONT)
+            term_clear_cell(s_cursor_x, s_cursor_y);
         goto finish;
     case 0x0C: /* \f form feed = clear screen */
         for (u32 r = 0; r < s_rows; r++)
@@ -548,6 +647,16 @@ static void term_put_code_point(u32 cp) {
             term_scroll();
             s_cursor_y = s_rows - 1;
         }
+    }
+    /* Overwriting a wide character (the cursor may have landed on or
+     * after a CJK char via CUP/CHA/SET_CURSOR): clear the whole pair
+     * first so a half-glyph is never left behind. */
+    {
+        u32 tgt = CELL_CH(s_cells[s_cursor_y][x]);
+        if (tgt == CELL_WIDE_CONT ||
+            (tgt > 0x7F && tgt != CELL_WIDE_CONT && x + 1 < s_cols &&
+             CELL_CH(s_cells[s_cursor_y][x + 1]) == CELL_WIDE_CONT))
+            term_clear_cell(x, s_cursor_y);
     }
     CELL_SET(s_cells[s_cursor_y][x], cp, s_cur_fg, s_cur_bg);
     term_draw_cell(x, s_cursor_y, s_cells[s_cursor_y][x]);
@@ -697,7 +806,7 @@ static void term_csi_final(u8 b) {
             s_cursor_y = 0;
         } else if (mode == 0) { /* cursor -> end of screen */
             for (u32 c = s_cursor_x; c < s_cols; c++)
-                CELL_SET(s_cells[s_cursor_y][c], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
+                term_clear_cell(c, s_cursor_y);
             for (u32 r = s_cursor_y + 1; r < s_rows; r++)
                 for (u32 c = 0; c < s_cols; c++)
                     CELL_SET(s_cells[r][c], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
@@ -707,7 +816,7 @@ static void term_csi_final(u8 b) {
                 for (u32 c = 0; c < s_cols; c++) {
                     if (r == s_cursor_y && c > s_cursor_x)
                         continue;
-                    CELL_SET(s_cells[r][c], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
+                    term_clear_cell(c, r);
                 }
             term_redraw_screen();
         }
@@ -721,9 +830,7 @@ static void term_csi_final(u8 b) {
             start = 0, end = s_cols;
         if (start < end) {
             for (u32 c = start; c < end && c < s_cols; c++)
-                CELL_SET(s_cells[s_cursor_y][c], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
-            for (u32 c = start; c < end && c < s_cols; c++)
-                term_draw_cell(c, s_cursor_y, s_cells[s_cursor_y][c]);
+                term_clear_cell(c, s_cursor_y);
         }
         break;
     }
@@ -962,6 +1069,12 @@ static void term_clear(void) {
     if (s_render_lock >= 0)
         (void)mutex_lock(s_render_lock);
 
+    /* Reset the incremental UTF-8 decoder and the ANSI state machine so
+     * a half-received sequence cannot span the clear boundary. */
+    s_utf8_left   = 0;
+    s_ansi_state  = ANSI_STATE_TEXT;
+    s_csi_nparams = 0;
+
     for (u32 r = 0; r < s_rows; r++)
         for (u32 c = 0; c < s_cols; c++)
             CELL_SET(s_cells[r][c], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
@@ -1012,15 +1125,11 @@ static void term_render_status(const char *prefix, const char *msg) {
     } else {
         term_fill_rect(0, row * 20, s_fb_width, 20, TERM_STATUS_BG);
     }
+    for (u32 c = 0; c < s_cols; c++)
+        CELL_SET(s_cells[row][c], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
 
-    /* Render prefix and message */
-    u32         col = 0;
-    const char *p   = prefix;
-    while (*p && col < s_cols) {
-        term_set_cell(col, row, (u8)*p, TERM_FG, TERM_STATUS_BG);
-        col++;
-        p++;
-    }
+    /* Render prefix and message (UTF-8 aware: CJK advances 2 columns) */
+    u32 col = term_puts_utf8(0, row, prefix, s_cols, TERM_FG, TERM_STATUS_BG);
 
     if (col < s_cols) {
         term_set_cell(col, row, ':', TERM_FG, TERM_STATUS_BG);
@@ -1031,12 +1140,7 @@ static void term_render_status(const char *prefix, const char *msg) {
         col++;
     }
 
-    p = msg;
-    while (*p && col < s_cols - 1) {
-        term_set_cell(col, row, (u8)*p, TERM_FG, TERM_STATUS_BG);
-        col++;
-        p++;
-    }
+    col = term_puts_utf8(col, row, msg, s_cols - 1, TERM_FG, TERM_STATUS_BG);
 
     /* Pad to end of row */
     while (col < s_cols) {
@@ -1094,14 +1198,14 @@ static void term_render_box(u32 x, u32 y, u32 w, u32 h, const char *title) {
         for (u32 c = 1; c + 1 < w; c++)
             term_draw_ch(x + c, y + r, ' ', TERM_FG, TERM_BG);
 
-    /* Title bar (if provided) */
+    /* Title bar (if provided) — centred by DISPLAY width so a CJK
+     * title (2 columns per glyph) is not misaligned by byte count. */
     if (title && h > 2) {
-        u32 tlen = 0;
-        while (title[tlen] && tlen < w - 4)
-            tlen++;
-        u32 start = x + (w - tlen) / 2;
-        for (u32 i = 0; i < tlen && start + i < x + w - 1; i++)
-            term_draw_ch(start + i, y, (u8)title[i], TERM_FG, TERM_BG);
+        u32 tw = (u32)utf8_str_width(title, (int)strlen(title));
+        if (tw > w - 4)
+            tw = w - 4;
+        u32 start = x + (w - tw) / 2;
+        (void)term_puts_utf8(start, y, title, x + w - 1, TERM_FG, TERM_BG);
     }
 
     if (s_render_lock >= 0)
@@ -1119,11 +1223,22 @@ static void term_render_line_at(u32 x, u32 y, const char *text, u32 maxlen) {
     if (s_render_lock >= 0)
         (void)mutex_lock(s_render_lock);
 
-    u32 col = x;
-    for (u32 i = 0; i < maxlen && text[i] && col < s_cols; i++) {
-        term_set_cell(col, y, (u8)text[i], TERM_FG, TERM_BG);
-        col++;
+    /* Bounded copy; trim back to a UTF-8 character boundary so a
+     * truncated multi-byte character is never rendered as garbage. */
+    char tmp[TERM_MAX_DATA + 1];
+    u32  n = (maxlen < TERM_MAX_DATA) ? maxlen : TERM_MAX_DATA;
+    memcpy(tmp, text, n);
+    int back = 0;
+    while (back < 3 && n > 0 && ((unsigned char)tmp[n - 1 - back] & 0xC0) == 0x80)
+        back++;
+    if (back > 0) {
+        int need = utf8_seq_len(tmp + (n - 1 - back));
+        if (need == 0 || need > back + 1)
+            n -= (u32)back; /* drop the incomplete trailing character */
     }
+    tmp[n] = '\0';
+
+    (void)term_puts_utf8(x, y, tmp, s_cols, TERM_FG, TERM_BG);
 
     if (s_render_lock >= 0)
         (void)mutex_unlock(s_render_lock);
@@ -1292,7 +1407,9 @@ static void term_handle_request(int token, int msg_len) {
         (void)ipc_reply(token, resp, resp_len);
         return;
     } else if (req->op == TERM_OP_SNAPSHOT) {
-        /* SNAPSHOT: {x, y, w, h} -> response = {ret; cells[w*h]} */
+        /* SNAPSHOT: {x, y, w, h} -> response = {ret; u16 cells[w*h]}.
+         * Cells travel as 16-bit code points (CELL_WIDE_CONT = 0xFFFE
+         * round-trips), so CJK survives a menu/dialog overlay. */
         if (req->len < 16) {
             term_reply(token, ERR_INVAL);
             return;
@@ -1308,21 +1425,22 @@ static void term_handle_request(int token, int msg_len) {
         }
         term_resp_t *resp = (term_resp_t *)s_resp_buf;
         resp->ret         = 0;
-        u8 *dst           = (u8 *)(resp + 1);
+        u16 *dst          = (u16 *)(resp + 1);
         if (s_render_lock >= 0)
             (void)mutex_lock(s_render_lock);
         u32 n = 0;
         for (u32 r = 0; r < h && y + r < s_rows; r++)
             for (u32 c = 0; c < w && x + c < s_cols; c++) {
                 u32 cp = CELL_CH(s_cells[y + r][x + c]);
-                dst[n++] = (cp < 0x100) ? (u8)cp : (u8)'?';
+                dst[n++] = (u16)cp;
             }
         if (s_render_lock >= 0)
             (void)mutex_unlock(s_render_lock);
-        (void)ipc_reply(token, s_resp_buf, (int)(sizeof(term_resp_t) + n));
+        (void)ipc_reply(token, s_resp_buf,
+                        (int)(sizeof(term_resp_t) + n * 2));
         return;
     } else if (req->op == TERM_OP_RESTORE) {
-        /* RESTORE: {x, y, w, h, cells[w*h]} — redraw a saved region. */
+        /* RESTORE: {x, y, w, h, u16 cells[w*h]} — redraw a saved region. */
         if (req->len < 16) {
             term_reply(token, ERR_INVAL);
             return;
@@ -1333,19 +1451,17 @@ static void term_handle_request(int token, int msg_len) {
         u32  w    = snap[2];
         u32  h    = snap[3];
         if (w == 0 || h == 0 || (u64)w * h > TERM_MAX_REGION_CELLS ||
-            req->len < 16 + (u32)(w * h)) {
+            req->len < 16 + (u32)(w * h * 2)) {
             term_reply(token, ERR_INVAL);
             return;
         }
-        const u8 *cells = (const u8 *)(snap + 4);
+        const u16 *cells = (const u16 *)(snap + 4);
         if (s_render_lock >= 0)
             (void)mutex_lock(s_render_lock);
         u32 n = 0;
         for (u32 r = 0; r < h && y + r < s_rows; r++)
             for (u32 c = 0; c < w && x + c < s_cols; c++) {
-                u8 ch = cells[n++];
-                if (ch < 0x20 || ch > 0x7E)
-                    ch = ' ';
+                u32 ch = cells[n++];
                 term_set_cell(x + c, y + r, ch, TERM_FG, TERM_BG);
             }
         if (s_render_lock >= 0)
@@ -1498,11 +1614,18 @@ static void perm_ui_cell(u32 x, u32 y, char ch, u32 fg) {
     term_set_cell(x, y, (u8)ch, fg, TERM_BG);
 }
 
-/* Render a line of `width` cells, padded with spaces, sanitized. */
+/* Render a line of `width` columns, padded with spaces, sanitized.
+ * UTF-8 aware: CJK code points advance 2 columns, so a Chinese URL or
+ * file name in a permission query renders correctly. */
 static void perm_ui_line(u32 x, u32 y, u32 fg, const char *s, u32 maxlen, u32 width) {
-    for (u32 i = 0; i < width; i++) {
-        char ch = (i < maxlen && s[i]) ? s[i] : ' ';
-        perm_ui_cell(x + i, y, ch, fg);
+    char tmp[TERM_MAX_DATA + 1];
+    u32  n = (maxlen < TERM_MAX_DATA) ? maxlen : TERM_MAX_DATA;
+    memcpy(tmp, s, n);
+    tmp[n] = '\0';
+    u32 col = term_puts_utf8(x, y, tmp, x + width, fg, TERM_BG);
+    while (col < x + width) {
+        term_set_cell(col, y, ' ', fg, TERM_BG);
+        col++;
     }
 }
 

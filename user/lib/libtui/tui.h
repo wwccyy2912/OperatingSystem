@@ -37,8 +37,10 @@
 
 #define TUI_MAX_TEXT 256 /* max payload per operation */
 
-/* Snapshot/restore region cap (must match term.c TERM_MAX_REGION_CELLS). */
-#define TUI_MAX_REGION_CELLS 2048
+/* Snapshot/restore region cap (must match term.c TERM_MAX_REGION_CELLS).
+ * Cells travel as u16 code points (2 bytes each); the cap is bounded by
+ * the kernel's 4096-byte MAX_MSG_SIZE (8 hdr + 16 x,y,w,h + 2*cells). */
+#define TUI_MAX_REGION_CELLS 2036
 
 /* ====================================================================
  * Basic output
@@ -142,21 +144,23 @@ int tui_printf(const char *fmt, ...);
  * Region snapshot/restore (v1.2): save a rectangular block of screen
  * cells and redraw it later.  The basis for non-destructive dialog
  * overlays: save the area under a dialog, render the dialog, then
- * restore the area when it closes.  Cells are plain ASCII.
+ * restore the area when it closes.  Cells are u16 code points (CJK and
+ * wide-char continuation markers round-trip, so a Chinese screen
+ * survives a menu/dialog overlay).
  * ==================================================================== */
 
 /**
  * Save the w*h cells of the region at (x,y) into cells[] (which must
- * hold at least w*h bytes; w*h must not exceed TUI_MAX_REGION_CELLS).
- * Returns 0 on success, negative error on failure.
+ * hold at least w*h uint16_t values; w*h must not exceed
+ * TUI_MAX_REGION_CELLS).  Returns 0 on success, negative error.
  */
-int tui_region_save(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t *cells);
+int tui_region_save(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint16_t *cells);
 
 /**
  * Redraw the w*h cells previously saved by tui_region_save at (x,y).
  * Returns 0 on success, negative error on failure.
  */
-int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *cells);
+int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint16_t *cells);
 
 /* ====================================================================
  * Interactive components (v1.1): input line, password line, confirm box.

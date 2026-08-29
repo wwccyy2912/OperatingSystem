@@ -8,9 +8,12 @@
  */
 
 #include "wchar.h"
+#include "uchar.h" /* char16_t / char32_t (mbrtoc16 & co.) */
 #include "string.h"
 #include "stdlib.h"
+#include "utf8.h"
 #include <malloc.h>
+#include <stdint.h>
 
 /* ====================================================================
  * Length
@@ -323,4 +326,304 @@ unsigned long long wcstoull(const wchar_t *s, wchar_t **endptr, int base) {
         *endptr = (wchar_t *)(s + (size_t)(nend - buf));
     free(buf);
     return val;
+}
+
+/* ====================================================================
+ * Multibyte <-> wide character conversion (C11 §7.29.6)
+ *
+ * The execution encoding is UTF-8 end to end, so these implement the
+ * standard stateful entry points on top of the utf8 helpers.  mbstate
+ * tracks an incomplete multi-byte sequence (or a pending UTF-16
+ * surrogate for mbrtoc16/c16rtomb).
+ * ==================================================================== */
+
+int mbsinit(const mbstate_t *ps) {
+    return (ps == NULL) || (ps->__len == 0);
+}
+
+/* Pending-surrogate sentinel for mbrtoc16/c16rtomb state (distinct
+ * from a pending-byte count, which is always <= 4). */
+#define MBSTATE_SURROGATE ((size_t)0xFFFFFFFFu)
+
+static void mbstate_put_surrogate(mbstate_t *ps, unsigned v) {
+    ps->__buf[0] = (char)(v & 0xFF);
+    ps->__buf[1] = (char)((v >> 8) & 0xFF);
+    ps->__buf[2] = (char)((v >> 16) & 0xFF);
+    ps->__buf[3] = (char)((v >> 24) & 0xFF);
+    ps->__len    = MBSTATE_SURROGATE;
+}
+
+/* Returns the pending surrogate, or -1 when none; clears the state. */
+static int mbstate_get_surrogate(mbstate_t *ps) {
+    if (ps->__len != MBSTATE_SURROGATE)
+        return -1;
+    unsigned v = (unsigned)(unsigned char)ps->__buf[0] |
+                 ((unsigned)(unsigned char)ps->__buf[1] << 8) |
+                 ((unsigned)(unsigned char)ps->__buf[2] << 16) |
+                 ((unsigned)(unsigned char)ps->__buf[3] << 24);
+    ps->__len = 0;
+    return (int)v;
+}
+
+size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps) {
+    static mbstate_t s_internal;
+    if (!ps)
+        ps = &s_internal;
+    if (!s) { /* reset */
+        ps->__len = 0;
+        return 0;
+    }
+    if (n == 0)
+        return (size_t)-2;
+
+    /* Assemble the sequence: pending bytes from a previous call plus
+     * fresh bytes from s. */
+    unsigned char seq[4];
+    size_t        have = 0;
+    if (ps->__len > 0 && ps->__len <= 4) {
+        memcpy(seq, ps->__buf, ps->__len);
+        have = ps->__len;
+    }
+    size_t used = 0;
+    while (used < n && have < 4)
+        seq[have++] = (unsigned char)s[used++];
+
+    int need;
+    if (seq[0] < 0x80)
+        need = 1;
+    else if (seq[0] < 0xC2) { /* stray continuation / invalid lead */
+        ps->__len = 0;
+        return (size_t)-1;
+    } else if (seq[0] <= 0xDF)
+        need = 2;
+    else if (seq[0] <= 0xEF)
+        need = 3;
+    else if (seq[0] <= 0xF4)
+        need = 4;
+    else {
+        ps->__len = 0;
+        return (size_t)-1;
+    }
+
+    if (have < (size_t)need) { /* incomplete: park and wait */
+        memcpy(ps->__buf, seq, have);
+        ps->__len = have;
+        return (size_t)-2;
+    }
+
+    for (size_t i = 1; i < (size_t)need; i++)
+        if ((seq[i] & 0xC0) != 0x80) {
+            ps->__len = 0;
+            return (size_t)-1;
+        }
+
+    uint32_t cp;
+    switch (need) {
+    case 1: cp = seq[0]; break;
+    case 2: cp = ((uint32_t)(seq[0] & 0x1F) << 6) | (seq[1] & 0x3F); break;
+    case 3: cp = ((uint32_t)(seq[0] & 0x0F) << 12) |
+                 ((uint32_t)(seq[1] & 0x3F) << 6) | (seq[2] & 0x3F); break;
+    default: cp = ((uint32_t)(seq[0] & 0x07) << 18) |
+                  ((uint32_t)(seq[1] & 0x3F) << 12) |
+                  ((uint32_t)(seq[2] & 0x3F) << 6) | (seq[3] & 0x3F); break;
+    }
+
+    /* Reject overlong encodings and surrogates. */
+    if ((need == 2 && cp < 0x80) || (need == 3 && cp < 0x800) ||
+        (need == 4 && cp < 0x10000) ||
+        (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) {
+        ps->__len = 0;
+        return (size_t)-1;
+    }
+
+    ps->__len = 0;
+    if (pwc)
+        *pwc = (wchar_t)cp;
+    return used;
+}
+
+size_t mbrlen(const char *s, size_t n, mbstate_t *ps) {
+    return mbrtowc(NULL, s, n, ps);
+}
+
+size_t wcrtomb(char *s, wchar_t wc, mbstate_t *ps) {
+    (void)ps;
+    if (!s)
+        return 1; /* UTF-8 has no shift state */
+    uint32_t cp = (uint32_t)wc;
+    if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+        return (size_t)-1;
+    if (cp < 0x80) {
+        s[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        s[0] = (char)(0xC0 | (cp >> 6));
+        s[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        s[0] = (char)(0xE0 | (cp >> 12));
+        s[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        s[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    s[0] = (char)(0xF0 | (cp >> 18));
+    s[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    s[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    s[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+size_t mbsrtowcs(wchar_t *dest, const char **src, size_t len, mbstate_t *ps) {
+    static mbstate_t s_internal;
+    if (!ps)
+        ps = &s_internal;
+    if (!src || !*src)
+        return 0;
+    const char *s     = *src;
+    size_t      count = 0;
+    while (*s) {
+        wchar_t wc;
+        size_t  r = mbrtowc(&wc, s, strlen(s), ps);
+        if (r == (size_t)-1 || r == (size_t)-2) {
+            *src = s;
+            return (size_t)-1;
+        }
+        if (dest) {
+            if (count >= len) {
+                *src = s;
+                return count; /* buffer full */
+            }
+            dest[count] = wc;
+        }
+        count++;
+        s += r;
+    }
+    if (dest) {
+        dest[count] = L'\0';
+        *src        = NULL;
+    } else {
+        *src = s;
+    }
+    return count;
+}
+
+size_t wcsrtombs(char *dest, const wchar_t **src, size_t len, mbstate_t *ps) {
+    (void)ps;
+    if (!src || !*src)
+        return 0;
+    const wchar_t *s     = *src;
+    size_t         total = 0;
+    while (*s) {
+        char  tmp[4];
+        size_t r = wcrtomb(tmp, *s, NULL);
+        if (r == (size_t)-1) {
+            *src = s;
+            return (size_t)-1;
+        }
+        if (dest) {
+            if (total + r > len) {
+                *src = s;
+                return total; /* no room for this character */
+            }
+            memcpy(dest + total, tmp, r);
+        }
+        total += r;
+        s++;
+    }
+    if (dest) {
+        if (total + 1 > len) { /* no room for the terminating NUL */
+            *src = s;
+            return total;
+        }
+        dest[total] = '\0';
+        *src        = NULL;
+    } else {
+        *src = s;
+    }
+    return total;
+}
+
+/* Terminal column width of a wide character (wcwidth(3)): -1 for
+ * control/format, 0 for combining, 1 narrow, 2 CJK wide. */
+int wcwidth(wchar_t wc) {
+    uint32_t cp = (uint32_t)wc;
+    if (cp < 0x20 || (cp >= 0x7F && cp < 0xA0))
+        return -1;
+    return utf8_char_width(cp);
+}
+
+/* ====================================================================
+ * char16_t / char32_t conversions (C11 §7.28.2) — UTF-16 on the
+ * char16_t side, UTF-8 on the byte side.
+ * ==================================================================== */
+
+size_t mbrtoc32(char32_t *pc32, const char *s, size_t n, mbstate_t *ps) {
+    wchar_t wc;
+    size_t  r = mbrtowc(&wc, s, n, ps);
+    if (r != (size_t)-1 && r != (size_t)-2 && pc32)
+        *pc32 = (char32_t)wc;
+    return r;
+}
+
+size_t c32rtomb(char *s, char32_t c32, mbstate_t *ps) {
+    return wcrtomb(s, (wchar_t)c32, ps);
+}
+
+size_t mbrtoc16(char16_t *pc16, const char *s, size_t n, mbstate_t *ps) {
+    static mbstate_t s_internal;
+    if (!ps)
+        ps = &s_internal;
+    if (!s) {
+        ps->__len = 0;
+        return 0;
+    }
+    /* A pending low surrogate from a previous astral character. */
+    int low = mbstate_get_surrogate(ps);
+    if (low >= 0) {
+        if (pc16)
+            *pc16 = (char16_t)low;
+        return (size_t)-3; /* complete char, 0 bytes consumed */
+    }
+    wchar_t wc;
+    size_t  r = mbrtowc(&wc, s, n, ps);
+    if (r == (size_t)-1 || r == (size_t)-2)
+        return r;
+    if (wc > 0xFFFF) {
+        uint32_t cp = (uint32_t)wc - 0x10000;
+        if (pc16)
+            *pc16 = (char16_t)(0xD800 + (cp >> 10));
+        mbstate_put_surrogate(ps, 0xDC00 + (cp & 0x3FF));
+    } else if (pc16) {
+        *pc16 = (char16_t)wc;
+    }
+    return r;
+}
+
+size_t c16rtomb(char *s, char16_t c16, mbstate_t *ps) {
+    static mbstate_t s_internal;
+    if (!ps)
+        ps = &s_internal;
+    if (!s) {
+        ps->__len = 0;
+        return 1;
+    }
+    unsigned c = (unsigned)c16;
+    if (c >= 0xD800 && c <= 0xDBFF) { /* high surrogate: wait for the low */
+        mbstate_put_surrogate(ps, c);
+        return 0;
+    }
+    int hi = mbstate_get_surrogate(ps);
+    if (hi >= 0) {
+        if (!(c >= 0xDC00 && c <= 0xDFFF)) { /* malformed pair */
+            ps->__len = 0;
+            return (size_t)-1;
+        }
+        uint32_t cp = 0x10000 + (((uint32_t)hi - 0xD800) << 10) + (c - 0xDC00);
+        return wcrtomb(s, (wchar_t)cp, NULL);
+    }
+    if (c >= 0xDC00 && c <= 0xDFFF) /* lone low surrogate */
+        return (size_t)-1;
+    return wcrtomb(s, (wchar_t)c, NULL);
 }

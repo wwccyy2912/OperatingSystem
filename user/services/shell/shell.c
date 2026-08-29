@@ -29,6 +29,8 @@
 #include "../lib/libc/stdio.h"  /* printf, sscanf -> SYS_DEBUG_LOG (serial) */
 #include "../lib/libc/stdlib.h" /* atoi */
 #include "../lib/libc/string.h" /* strcmp, strlen, strdup */
+#include "../lib/libc/utf8.h"   /* UTF-8-aware line editing */
+#include "../lib/libime/ime.h"  /* pinyin IME (Chinese input) */
 #include "../lib/libfs/fs.h"    /* libfs VFS client (ls/cat/stat/tee/fallocate/mkdir/rm) */
 #include "../lib/libpkg/pkg.h"  /* libpkg pkg-manager client (pkg_*) */
 #include "../lib/libos/syscalls.h"
@@ -81,14 +83,36 @@ static int  s_hist_view;  /* -1 = live editing; else index being viewed */
  * own subject comes from get_subject() when needed. */
 
 /* Terminal service protocol (mirrors user/services/term/term.c) */
-#define TERM_OP_WRITE 1
-#define TERM_OP_CLEAR 2
-#define TERM_CHUNK    32 /* max payload bytes per WRITE */
+#define TERM_OP_WRITE       1
+#define TERM_OP_CLEAR       2
+#define TERM_OP_STATUS      3 /* {prefix_len,msg_len,prefix,msg} */
+#define TERM_CHUNK          32 /* max payload bytes per WRITE */
 
 /* Keyboard service protocol (mirrors user/services/keyboard/keyboard.c) */
 #define KBD_OP_READ       1
 #define KBD_OP_READ_BLOCK 2
 #define KBD_CHUNK         32 /* max payload bytes per READ */
+
+/* Ctrl+Space (KBD_CTRL_BASE+0 = 0x80) toggles the pinyin IME. */
+#define KBD_CTRL_SPACE 0x80
+
+/* ====================================================================
+ * Pinyin IME state
+ *
+ * The keyboard service emits only ASCII, so Chinese is entered by
+ * typing pinyin (lowercase letters, which accumulate in s_ime_py) and
+ * committing a candidate with Space / digits 1-9.  The committed
+ * candidate is a UTF-8 sequence inserted into the line buffer, so the
+ * editor's codepoint-aware backspace/arrows/redraw all apply to it.
+ * The candidate list is shown in the terminal's status bar.
+ * ==================================================================== */
+
+static int         s_ime_on; /* 1 = pinyin input mode */
+static char        s_ime_py[IME_MAX_PINYIN];
+static int         s_ime_plen;
+static int         s_ime_cidx; /* selected candidate (0-based) */
+static const char *s_ime_cands[IME_MAX_CAND];
+static int         s_ime_ncand;
 
 /* ====================================================================
  * Forward declarations for built-in commands
@@ -111,6 +135,7 @@ static int cmd_exec(int argc, char *argv[]);
 static int cmd_uptime(int argc, char *argv[]);
 static int cmd_exit(int argc, char *argv[]);
 static int cmd_reboot(int argc, char *argv[]);
+static int cmd_ime(int argc, char *argv[]);
 static int cmd_kill(int argc, char *argv[]);
 static int cmd_ps(int argc, char *argv[]);
 static int cmd_ls(int argc, char *argv[]);
@@ -540,7 +565,12 @@ static void shell_prompt(char *out, size_t outsz) {
 static void shell_redraw_line(const char *line, int pos) {
     char prompt[LINE_BUF_SIZE + 16];
     shell_prompt(prompt, sizeof(prompt));
-    int plen = (int)strlen(prompt);
+    /* DISPLAY widths (columns): CJK counts 2.  The terminal cursor API
+     * and the erase run are column-based, so a UTF-8 prompt (e.g. a cwd
+     * with Chinese) must be measured by width, not by byte length. */
+    int pcols  = utf8_str_width(prompt, (int)strlen(prompt));
+    int lwidth = utf8_str_width(line, (int)strlen(line));
+    int pwidth = utf8_str_width(line, pos);
 
     /* Current row: query the term cursor, then set back to it after
      * re-printing (the shell's output cursor is on the prompt row). */
@@ -560,18 +590,19 @@ static void shell_redraw_line(const char *line, int pos) {
      * (leftovers from a longer previous line). */
     const int erase_margin = 4;
     shell_write("\r");
-    for (int i = 0; i < plen + (int)strlen(line) + erase_margin; i++)
+    for (int i = 0; i < pcols + lwidth + erase_margin; i++)
         shell_write(" ");
     shell_write("\r");
     shell_write(prompt);
     shell_write(line);
 
-    /* Place the cursor at (plen + pos, row). */
+    /* Place the cursor at (pcols + pwidth, row) — columns, so wide CJK
+     * characters keep the cursor aligned. */
     if (s_term_port >= 0) {
         u32 req[4];
         req[0] = 6; /* TERM_OP_SET_CURSOR */
         req[1] = 8;
-        req[2] = (u32)(plen + pos);
+        req[2] = (u32)(pcols + pwidth);
         req[3] = row;
         int resp_len = 8;
         u8  resp[8];
@@ -583,10 +614,161 @@ static void shell_redraw_line(const char *line, int pos) {
     }
 }
 
+/* ====================================================================
+ * Pinyin IME helpers
+ *
+ * The composition letters live IN the line buffer (typed normally), so
+ * commit replaces the trailing pinyin bytes with the chosen candidate's
+ * UTF-8 bytes.  Candidates are shown in the term status bar.
+ * ==================================================================== */
+
+static void ime_clear_composition(void) {
+    s_ime_plen  = 0;
+    s_ime_py[0] = '\0';
+    s_ime_ncand = 0;
+    s_ime_cidx  = 0;
+}
+
+/* Recompute the candidate list for the current composition. */
+static void ime_refresh_cands(void) {
+    s_ime_py[s_ime_plen] = '\0';
+    s_ime_ncand          = ime_lookup(s_ime_py, s_ime_cands);
+    if (s_ime_cidx >= s_ime_ncand)
+        s_ime_cidx = 0;
+}
+
+/* Draw the IME mode + composition + candidates in the terminal's
+ * status bar (TERM_OP_STATUS). */
+static void ime_show_status(void) {
+    if (s_term_port < 0)
+        return;
+    char msg[128];
+    int  mlen;
+    if (!s_ime_on) {
+        mlen = snprintf(msg, sizeof(msg), "off (Ctrl+Space)");
+    } else if (s_ime_plen == 0) {
+        mlen = snprintf(msg, sizeof(msg), "on (Ctrl+Space) — pinyin");
+    } else {
+        int cn = snprintf(msg, sizeof(msg), "%s", s_ime_py);
+        for (int i = 0; i < s_ime_ncand && cn < (int)sizeof(msg) - 8; i++) {
+            int add = snprintf(msg + cn, (size_t)(sizeof(msg) - cn),
+                               " %d%s", i + 1, s_ime_cands[i]);
+            if (add <= 0)
+                break;
+            cn += add;
+        }
+        mlen = cn;
+    }
+    if (mlen < 0)
+        mlen = 0;
+    if (mlen > (int)sizeof(msg) - 1)
+        mlen = (int)sizeof(msg) - 1;
+    static const char prefix[] = "IME";
+    const int         plen     = 3;
+    u8                req[16 + 128];
+    u32              *hdr = (u32 *)req;
+    hdr[0] = TERM_OP_STATUS;
+    hdr[1] = (u32)(8 + plen + mlen);
+    hdr[2] = (u32)plen;
+    hdr[3] = (u32)mlen;
+    memcpy(req + 16, prefix, (size_t)plen);
+    memcpy(req + 16 + plen, msg, (size_t)mlen);
+    u32 resp[1];
+    int resp_len = (int)sizeof(resp);
+    (void)ipc_call(s_term_port, req, 16 + plen + mlen, resp, &resp_len);
+}
+
+/* Commit candidate k: replace the composition letters (sitting in the
+ * line at [pos - plen, pos)) with the candidate's UTF-8 bytes. */
+static int ime_commit(int k, char *buf, int pos, int maxlen) {
+    if (s_ime_plen == 0 || k < 0 || k >= s_ime_ncand)
+        return pos;
+    int plen = s_ime_plen;
+    if (pos < plen)
+        return pos;
+    const char *txt  = s_ime_cands[k];
+    int         tlen = utf8_seq_len(txt);
+    if (tlen <= 0)
+        return pos;
+    int l = (int)strlen(buf);
+    if (l - plen + tlen >= maxlen)
+        return pos;
+    memmove(buf + (pos - plen) + tlen, buf + pos, (size_t)(l - pos) + 1);
+    memcpy(buf + (pos - plen), txt, (size_t)tlen);
+    int npos = pos - plen + tlen;
+    /* Serial debug via libc printf (SYS_DEBUG_LOG): the shell's screen
+     * is not mirrored to serial, so this is how tests verify that a
+     * pinyin composition committed the right code point.  The
+     * candidate pointer is NOT NUL-terminated at the character
+     * boundary, so print through a bounded copy. */
+    {
+        uint32_t cp = 0;
+        (void)utf8_decode(txt, &cp);
+        char tmp[5];
+        memcpy(tmp, txt, (size_t)tlen);
+        tmp[tlen] = '\0';
+        printf("ime: commit '%s' U+%04X\n", tmp, (unsigned)cp);
+    }
+    ime_clear_composition();
+    ime_show_status();
+    return npos;
+}
+
+/* ime [on|off] — show or change the pinyin IME mode (also Ctrl+Space). */
+static int cmd_ime(int argc, char *argv[]) {
+    if (argc >= 2) {
+        if (strcmp(argv[1], "on") == 0) {
+            s_ime_on = 1;
+        } else if (strcmp(argv[1], "off") == 0) {
+            s_ime_on = 0;
+            ime_clear_composition();
+        } else {
+            shell_write("Usage: ime [on|off]\n");
+            return -1;
+        }
+    }
+    shell_printf("IME %s (Ctrl+Space toggles; pinyin + Space/digits 1-9)\n",
+                 s_ime_on ? "on" : "off");
+    ime_show_status();
+    return 0;
+}
+
+/* Byte offset of the start of the word containing/left of pos.  A word
+ * is a run of non-space code points; both bounds move by whole UTF-8
+ * characters so CJK words are never split. */
+static int shell_word_start(const char *buf, int pos) {
+    int p = pos;
+    while (p > 0 && buf[p - 1] == ' ')
+        p = utf8_prev(buf, p);
+    while (p > 0 && buf[p - 1] != ' ')
+        p = utf8_prev(buf, p);
+    return p;
+}
+
+/* Byte offset of the first code point after the word at/right of pos. */
+static int shell_word_end(const char *buf, int pos, int len) {
+    int p = pos;
+    while (p < len && buf[p] != ' ')
+        p = utf8_next(buf, p, len);
+    while (p < len && buf[p] == ' ')
+        p = utf8_next(buf, p, len);
+    return p;
+}
+
+/* Any cursor-movement / line-rewriting edit commits (drops) the pinyin
+ * composition so the "letters at [pos-plen, pos)" invariant stays true. */
+static void ime_discard_on_edit(void) {
+    if (s_ime_plen > 0) {
+        ime_clear_composition();
+        ime_show_status();
+    }
+}
+
 /* Tab completion: first token -> command names; otherwise a path
  * fragment -> directory entries (absolute or cwd-relative).  Completes
  * to the longest common prefix; when no unique prefix, lists matches.
  * Returns 1 if the buffer changed. */
+static void fm_strncpy_utf8(char *dst, const char *src, int cap); /* below */
 static int shell_complete(char *buf, int *pos, int maxlen) {
     int tok_start = *pos;
     while (tok_start > 0 && buf[tok_start - 1] != ' ')
@@ -690,7 +872,7 @@ static int shell_complete(char *buf, int *pos, int maxlen) {
     }
 
     static vfs_enum_batch_t batch;
-    static char matches[COMPLETE_MAX_MATCHES][64];
+    static char matches[COMPLETE_MAX_MATCHES][256];
     int                    nm = 0, common = -1;
     vfs_handle_t           e;
     int                    r = fs_enum_begin(dir, &e);
@@ -702,8 +884,8 @@ static int shell_complete(char *buf, int *pos, int maxlen) {
             break;
         for (u32 i = 0; i < batch.batch_count && nm < COMPLETE_MAX_MATCHES; i++) {
             if (strncmp(batch.batch[i], frag, strlen(frag)) == 0) {
-                strncpy(matches[nm], batch.batch[i], 63);
-                matches[nm][63] = '\0';
+                /* UTF-8-safe copy: a long CJK name is not cut mid-char. */
+                fm_strncpy_utf8(matches[nm], batch.batch[i], 256);
                 if (common < 0)
                     common = (int)strlen(matches[nm]);
                 else {
@@ -801,9 +983,28 @@ static int read_line_impl(char *buf, int maxlen, int mask) {
         for (int i = 0; i < n; i++) {
             unsigned char ch = (unsigned char)((u8 *)resp)[4 + i];
 
+            /* Any editing key other than the composition keys (letters,
+             * space/digits/Enter while composing, backspace, the IME
+             * toggle) drops the pinyin composition — that keeps the
+             * "composition letters at [pos - plen, pos)" invariant that
+             * ime_commit relies on (cursor movement / line rewrites
+             * would otherwise break the byte-offset correspondence). */
+            if (s_ime_plen > 0 && s_ime_on && !mask &&
+                !(ch >= 'a' && ch <= 'z') && ch != ' ' &&
+                !(ch >= '1' && ch <= '9') && ch != '\b' && ch != 0x7F &&
+                ch != 0x80 && ch != '\r' && ch != '\n')
+                ime_discard_on_edit();
+
             switch (ch) {
             case '\r':
             case '\n':
+                /* IME Enter: commit the current candidate into the line
+                 * and keep editing — press Enter again to run it. */
+                if (s_ime_plen > 0 && s_ime_ncand > 0) {
+                    pos = ime_commit(s_ime_cidx, buf, pos, maxlen);
+                    shell_redraw_line(buf, pos);
+                    break;
+                }
                 /* Enter — terminate line */
                 if (pos == 0) {
                     /* Stray Enter on an empty line: a '\n' that was
@@ -828,17 +1029,34 @@ static int read_line_impl(char *buf, int maxlen, int mask) {
             case '\b':
             case 0x7F: /* DEL — Backspace */
                 if (pos > 0) {
-                    pos--;
-                    if (pos < (int)strlen(buf)) {
-                        /* Deleting in the middle: shift the tail left
-                         * and redraw (a bare "\b \b" would leave the
-                         * rest of the line out of place). */
-                        for (int k = pos; buf[k] != '\0'; k++)
-                            buf[k] = buf[k + 1];
+                    /* While composing pinyin, the backspace also pops
+                     * one letter off the composition. */
+                    if (s_ime_plen > 0) {
+                        s_ime_plen--;
+                        ime_refresh_cands();
+                        ime_show_status();
+                    }
+                    /* Back up over a whole UTF-8 code point so a
+                     * multi-byte character is never left half-deleted. */
+                    int prev = utf8_prev(buf, pos);
+                    int del  = pos - prev;
+                    if (prev < (int)strlen(buf)) {
+                        /* Deleting in the middle: shift the tail left. */
+                        for (int k = prev; buf[k] != '\0'; k++)
+                            buf[k] = buf[k + del];
+                        pos = prev;
                         shell_redraw_line(buf, pos);
                     } else {
-                        shell_write("\b \b"); /* erase at end of line */
-                        buf[pos] = '\0';
+                        /* Erase at end of line: one narrow column, or
+                         * two for a wide (CJK) character. */
+                        uint32_t cp;
+                        (void)utf8_decode(buf + prev, &cp);
+                        if (utf8_char_width(cp) == 2)
+                            shell_write("\b  \b");
+                        else
+                            shell_write("\b \b");
+                        buf[prev] = '\0';
+                        pos = prev;
                     }
                 }
                 break;
@@ -934,16 +1152,18 @@ static int read_line_impl(char *buf, int maxlen, int mask) {
                 }
                 break;
 
-            case 0x10: /* Left arrow (DLE) — move cursor left */
+            case 0x10: /* Left arrow (DLE) — move cursor left by one
+                        * code point (skips UTF-8 continuation bytes) */
                 if (pos > 0) {
-                    pos--;
+                    pos = utf8_prev(buf, pos);
                     shell_redraw_line(buf, pos);
                 }
                 break;
 
-            case 0x14: /* Right arrow (DC4) — move cursor right */
+            case 0x14: /* Right arrow (DC4) — move cursor right by one
+                        * code point */
                 if (pos < (int)strlen(buf)) {
-                    pos++;
+                    pos = utf8_next(buf, pos, (int)strlen(buf));
                     shell_redraw_line(buf, pos);
                 }
                 break;
@@ -970,12 +1190,14 @@ static int read_line_impl(char *buf, int maxlen, int mask) {
                 buf[pos] = '\0';
                 shell_redraw_line(buf, pos);
                 break;
-            case 0x97: { /* Ctrl-W — delete previous word */
-                int p = pos;
-                while (p > 0 && buf[p - 1] == ' ')
-                    p--;
-                while (p > 0 && buf[p - 1] != ' ')
-                    p--;
+            case KBD_CTRL_SPACE: /* Ctrl+Space — toggle pinyin IME */
+                s_ime_on = !s_ime_on;
+                ime_clear_composition();
+                ime_show_status();
+                shell_redraw_line(buf, pos);
+                break;
+            case 0x97: { /* Ctrl-W — delete previous word (UTF-8 aware) */
+                int p = shell_word_start(buf, pos);
                 for (int k = pos; buf[k] != '\0'; k++)
                     buf[p + (k - pos)] = buf[k];
                 buf[p + ((int)strlen(buf) - pos)] = '\0';
@@ -999,34 +1221,19 @@ static int read_line_impl(char *buf, int maxlen, int mask) {
                     return -1;
                 }
                 break;
-            case 0xE2: { /* Alt-B — move back one word */
-                int p = pos;
-                while (p > 0 && buf[p - 1] == ' ')
-                    p--;
-                while (p > 0 && buf[p - 1] != ' ')
-                    p--;
-                pos = p;
+            case 0xE2: { /* Alt-B — move back one word (UTF-8 aware) */
+                pos = shell_word_start(buf, pos);
                 shell_redraw_line(buf, pos);
                 break;
             }
-            case 0xE6: { /* Alt-F — move forward one word */
-                int l = (int)strlen(buf);
-                int p = pos;
-                while (p < l && buf[p] != ' ')
-                    p++;
-                while (p < l && buf[p] == ' ')
-                    p++;
-                pos = p;
+            case 0xE6: { /* Alt-F — move forward one word (UTF-8 aware) */
+                pos = shell_word_end(buf, pos, (int)strlen(buf));
                 shell_redraw_line(buf, pos);
                 break;
             }
-            case 0xE4: { /* Alt-D — delete word after cursor */
+            case 0xE4: { /* Alt-D — delete word after cursor (UTF-8 aware) */
                 int l = (int)strlen(buf);
-                int p = pos;
-                while (p < l && buf[p] != ' ')
-                    p++;
-                while (p < l && buf[p] == ' ')
-                    p++;
+                int p = shell_word_end(buf, pos, l);
                 for (int k = p; buf[k] != '\0'; k++)
                     buf[pos + (k - p)] = buf[k];
                 buf[pos + (l - p)] = '\0';
@@ -1036,6 +1243,56 @@ static int read_line_impl(char *buf, int maxlen, int mask) {
 
             default:
                 if (ch >= ' ' && ch < 0x7F) {
+                    /* ---- Pinyin IME interception (not for passwords) ---- */
+                    if (s_ime_on && !mask) {
+                        if (s_ime_plen > 0 && ch >= '1' && ch <= '9') {
+                            /* digit 1-9 selects candidate N */
+                            if (s_ime_ncand > ch - '1') {
+                                pos = ime_commit(ch - '1', buf, pos, maxlen);
+                                shell_redraw_line(buf, pos);
+                                break;
+                            }
+                            /* candidate N absent: the digit is literal */
+                            ime_clear_composition();
+                            ime_show_status();
+                        } else if (s_ime_plen > 0 && ch == ' ') {
+                            /* space commits the first candidate */
+                            if (s_ime_ncand > 0) {
+                                pos = ime_commit(0, buf, pos, maxlen);
+                                shell_redraw_line(buf, pos);
+                                break;
+                            }
+                            /* no candidate: the space is literal */
+                            ime_clear_composition();
+                            ime_show_status();
+                        } else if (ch >= 'a' && ch <= 'z') {
+                            /* Only accumulate letters while they stay a
+                             * valid pinyin PREFIX; once the run stops
+                             * matching (English words like "tee" or
+                             * "txt"), the composition is over and the
+                             * letters are plain text. */
+                            if (s_ime_plen < IME_MAX_PINYIN - 1) {
+                                s_ime_py[s_ime_plen]     = (char)ch;
+                                s_ime_py[s_ime_plen + 1] = '\0';
+                                if (ime_prefix(s_ime_py)) {
+                                    s_ime_plen++;
+                                    ime_refresh_cands();
+                                    ime_show_status();
+                                } else {
+                                    ime_clear_composition();
+                                    ime_show_status();
+                                }
+                            }
+                            /* fall through: insert the letter normally */
+                        } else if (s_ime_plen > 0) {
+                            /* other printable: drop the composition, then
+                             * insert the key normally (the pinyin letters
+                             * already in the buffer stay as literal text) */
+                            ime_clear_composition();
+                            ime_show_status();
+                        }
+                    }
+                    /* ---- normal insert ---- */
                     int l = (int)strlen(buf);
                     if (pos < maxlen - 1 && pos <= l) {
                         if (pos < l) {
@@ -1319,7 +1576,11 @@ static int cmd_env(int argc, char *argv[]) {
  * yields "/Disk", "cd ." stays put.  The result never ends in '/' except
  * for the root itself.  Writes into out (LINE_BUF_SIZE). */
 static void path_normalize(const char *in, char *out, size_t outsz) {
-    enum { PN_MAX_DEPTH = 24, PN_SEG_MAX = 64 };
+    /* Segment buffer matches the VFS name limit (256), so a long UTF-8
+     * name (up to 85 CJK chars on the mem volume) is never silently
+     * dropped — the old 64-byte cap cut every ≥64-byte segment and
+     * silently resolved such paths to the PARENT directory. */
+    enum { PN_MAX_DEPTH = 24, PN_SEG_MAX = 256 };
     static char segs[PN_MAX_DEPTH][PN_SEG_MAX];
     int         n = 0;
 
@@ -1344,6 +1605,16 @@ static void path_normalize(const char *in, char *out, size_t outsz) {
             memcpy(segs[n], start, (size_t)len);
             segs[n][len] = '\0';
             n++;
+        } else {
+            /* Too deep or a segment beyond the cap: keep the caller's
+             * bytes (no silent drop) — copy what fits so the path still
+             * resolves to something deterministic. */
+            if (n < PN_MAX_DEPTH) {
+                int clen = (len < PN_SEG_MAX - 1) ? len : PN_SEG_MAX - 1;
+                memcpy(segs[n], start, (size_t)clen);
+                segs[n][clen] = '\0';
+                n++;
+            }
         }
     }
 
@@ -1355,8 +1626,20 @@ static void path_normalize(const char *in, char *out, size_t outsz) {
     }
     for (int i = 0; i < n; i++) {
         size_t sl = strlen(segs[i]);
-        if (o + sl + 2 > outsz) /* '/' + seg + NUL won't fit: truncate */
+        if (o + sl + 2 > outsz) {
+            /* Out of room: fit what we can, cut at a UTF-8 character
+             * boundary (never split a multi-byte name at the edge), and
+             * stop appending. */
+            char tmp[PN_SEG_MAX];
+            fm_strncpy_utf8(tmp, segs[i], (int)(outsz - o));
+            size_t cl = strlen(tmp);
+            if (cl > 0) {
+                out[o++] = '/';
+                memcpy(out + o, tmp, cl);
+                o += cl;
+            }
             break;
+        }
         out[o++] = '/';
         memcpy(out + o, segs[i], sl);
         o += sl;
@@ -1703,8 +1986,28 @@ static int cmd_policy(int argc, char *argv[]) {
  *  underneath.                                                        */
 /* ------------------------------------------------------------------ */
 
+/* UTF-8-safe bounded copy: copies at most cap-1 bytes, then retreats
+ * to a character boundary so a long multi-byte name is never cut in
+ * the middle of a character. */
+static void fm_strncpy_utf8(char *dst, const char *src, int cap) {
+    int len = (int)strlen(src);
+    if (len >= cap)
+        len = cap - 1;
+    int back = 0;
+    while (back < 3 && len - 1 - back >= 0 &&
+           ((unsigned char)src[len - 1 - back] & 0xC0) == 0x80)
+        back++;
+    if (back > 0) {
+        int need = utf8_seq_len(src + (len - 1 - back));
+        if (need == 0 || need > back + 1)
+            len -= back; /* drop the incomplete trailing character */
+    }
+    memcpy(dst, src, (size_t)len);
+    dst[len] = '\0';
+}
+
 /* Enumerate `dir` (an absolute URL) into items[]; returns count. */
-static int fm_enum(const char *dir, char items[][64], int cap) {
+static int fm_enum(const char *dir, char items[][256], int cap) {
     static vfs_enum_batch_t batch; /* ~16.5 KB — keep off the stack */
     vfs_handle_t            e;
     int                     r = fs_enum_begin(dir, &e);
@@ -1720,8 +2023,7 @@ static int fm_enum(const char *dir, char items[][64], int cap) {
         if (batch.batch_count == 0)
             break;
         for (u32 i = 0; i < batch.batch_count && total < cap; i++) {
-            strncpy(items[total], batch.batch[i], 63);
-            items[total][63] = '\0';
+            fm_strncpy_utf8(items[total], batch.batch[i], 256);
             total++;
         }
     }
@@ -1776,7 +2078,7 @@ static int cmd_fm(int argc, char *argv[]) {
     }
 
     for (;;) {
-        static char items[FM_MAX_ITEMS][64];
+        static char items[FM_MAX_ITEMS][256];
         static const char *ptrs[FM_MAX_ITEMS];
         int n = fm_enum(dir, items, FM_MAX_ITEMS);
         if (n < 0) {
@@ -2792,6 +3094,53 @@ static int cmd_ls(int argc, char *argv[]) {
  * a byte-count line so the content length can be verified against the
  * source blob.
  */
+/*
+ * UTF-8 passthrough for cat: emit valid multi-byte sequences verbatim
+ * (a binary file's UTF-8 text is no longer dotted into oblivion), and
+ * replace stray/invalid bytes with '.'.  `pend`/`pend_n` carry an
+ * incomplete sequence tail across 1024-byte read chunks.
+ */
+static void cat_emit_text(const u8 *data, u32 len, u8 *pend, int *pend_n) {
+    u32 i = 0;
+    while (i < len || *pend_n > 0) {
+        int need;
+        if (*pend_n > 0) {
+            need = utf8_seq_len((const char *)pend);
+        } else {
+            u8 c = data[i];
+            need = utf8_seq_len((const char *)&c);
+            if (need <= 0) {
+                /* ASCII printable, or a stray byte */
+                shell_putc((c >= 32 && c < 127) ? (char)c : '.');
+                i++;
+                continue;
+            }
+        }
+        if (need <= 0) { /* invalid lead already parked: flush dots */
+            for (int k = 0; k < *pend_n; k++)
+                shell_putc('.');
+            *pend_n = 0;
+            continue;
+        }
+        while (*pend_n < need && *pend_n < 4 && i < len)
+            pend[(*pend_n)++] = data[i++];
+        if (*pend_n >= need) {
+            uint32_t cp;
+            int      n = utf8_decode((const char *)pend, &cp);
+            if (n == need) {
+                for (int k = 0; k < n; k++)
+                    shell_putc((char)pend[k]);
+            } else {
+                for (int k = 0; k < *pend_n; k++)
+                    shell_putc('.');
+            }
+            *pend_n = 0;
+            continue;
+        }
+        break; /* incomplete sequence: input exhausted, park for next read */
+    }
+}
+
 static int cmd_cat(int argc, char *argv[]) {
     if (argc < 2) {
         shell_write("Usage: cat <file-url>\n");
@@ -2812,7 +3161,9 @@ static int cmd_cat(int argc, char *argv[]) {
         return -1;
     }
     static u8 buf[1024];
-    u32       total = 0;
+    u8        pend[4];
+    int       pend_n = 0;
+    u32       total  = 0;
     for (;;) {
         u32 got = 0;
         r       = fs_read(h, total, buf, sizeof(buf), &got);
@@ -2823,16 +3174,15 @@ static int cmd_cat(int argc, char *argv[]) {
         }
         if (got == 0)
             break;
-        for (u32 i = 0; i < got; i++) {
-            u8 c = buf[i];
-            if (c >= 32 && c < 127)
-                shell_putc((char)c);
-            else
-                shell_putc('.');
-        }
+        cat_emit_text(buf, got, pend, &pend_n);
         total += got;
         if (got < sizeof(buf))
             break; /* EOF */
+    }
+    if (pend_n > 0) { /* flush an unterminated tail as dots */
+        for (int k = 0; k < pend_n; k++)
+            shell_putc('.');
+        pend_n = 0;
     }
     fs_close(h);
     shell_printf("\n== read %d bytes ==\n", (int)total);
@@ -3227,7 +3577,7 @@ static int cmd_mv(int argc, char *argv[]) {
     char dst[LINE_BUF_SIZE];
     if (strcmp(argv[2], "?") == 0) {
         /* v1.3: TUI directory picker for the destination. */
-        static char items[FM_MAX_ITEMS][64];
+        static char items[FM_MAX_ITEMS][256];
         static const char *ptrs[FM_MAX_ITEMS];
         int n = fm_enum(s_cwd, items, FM_MAX_ITEMS);
         if (n <= 0) {
@@ -3389,6 +3739,7 @@ static void shell_main(void *arg) {
     shell_register_command("exit", "Exit the shell", cmd_exit);
     shell_register_command("reboot", "Halt the system", cmd_reboot);
     shell_register_command("shutdown", "Power off the machine", cmd_shutdown);
+    shell_register_command("ime", "Pinyin IME: ime [on|off] (Ctrl+Space)", cmd_ime);
     shell_register_command("kill", "Send a signal: kill <pid> [signum]", cmd_kill);
     shell_register_command("ps", "List running processes", cmd_ps);
     shell_register_command(

@@ -250,7 +250,9 @@ int gui_text_width(const char *s) {
             if ((ch & 0xC0) == 0x80) {
                 cp = (cp << 6) | (ch & 0x3F);
                 if (--left == 0)
-                    w += (cp > 0x7F) ? 16 : 8;
+                    /* Width matches the renderer: 16px only when the
+                     * CJK glyph actually exists (else 8px '?'). */
+                    w += (cp > 0x7F && font_cjk_lookup(cp)) ? 16 : 8;
             } else {
                 left = 0;
             }

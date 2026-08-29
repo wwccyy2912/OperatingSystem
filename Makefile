@@ -104,7 +104,9 @@ USER_C := \
     user/lib/libc/math.c \
     user/lib/libc/threads.c \
     user/lib/libc/wchar.c \
+    user/lib/libc/utf8.c \
     user/lib/libc/wctype.c \
+    user/lib/libime/ime.c \
     user/lib/libos/syscalls.c \
     user/lib/libos/elf_parse.c \
     user/lib/libipc/ipc.c \

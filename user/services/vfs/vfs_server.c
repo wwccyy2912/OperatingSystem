@@ -34,6 +34,7 @@
 #include <stddef.h>
 #include "../lib/libc/stdio.h"
 #include "../lib/libc/string.h"
+#include "../lib/libc/utf8.h"
 #include "../lib/libos/syscalls.h"
 #include "vfs.h"
 #include "../perm/perm.h"
@@ -366,6 +367,19 @@ static int vfs_parse_url(const char *url, char mount[64], char segs[][VFS_SEG_MA
         int   l   = 0;
         while (*p && *p != '/' && l < VFS_SEG_MAX - 1)
             seg[l++] = *p++;
+        /* UTF-8-safe: a segment cut at the 255-byte field edge must not
+         * split a multi-byte character (drop the incomplete tail). */
+        {
+            int back = 0;
+            while (back < 3 && l - 1 - back >= 0 &&
+                   ((unsigned char)seg[l - 1 - back] & 0xC0) == 0x80)
+                back++;
+            if (back > 0) {
+                int need = utf8_seq_len(seg + (l - 1 - back));
+                if (need == 0 || need > back + 1)
+                    l -= back;
+            }
+        }
         seg[l] = '\0';
         while (*p == '/')
             p++;

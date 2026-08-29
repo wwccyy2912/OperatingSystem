@@ -62,12 +62,18 @@
 #define VBDK_SECTOR_SIZE         512
 #define VBDK_MAX_SECTORS         16384                                /* 8 MiB disk geometry  */
 #define VBDK_MAX_INODES          256                                  /* inode table size     */
-#define VBDK_INODE_SIZE          128                                  /* bytes per inode      */
-#define VBDK_NAME_MAX            64                                   /* on-disk name bound   */
-#define VBDK_INODES_PER_SECTOR   (VBDK_SECTOR_SIZE / VBDK_INODE_SIZE) /* 4 */
-#define VBDK_INODE_TABLE_SECTORS (VBDK_MAX_INODES * VBDK_INODE_SIZE / VBDK_SECTOR_SIZE) /* 64 */
+#define VBDK_INODE_SIZE          512                                  /* bytes per inode      */
+#define VBDK_NAME_MAX            256                                  /* on-disk name bound
+                                                                       * (255 usable + NUL),
+                                                                       * matching the mem
+                                                                       * volume so a CJK
+                                                                       * name (up to 85
+                                                                       * chars) behaves the
+                                                                       * same on Disk        */
+#define VBDK_INODES_PER_SECTOR   (VBDK_SECTOR_SIZE / VBDK_INODE_SIZE) /* 1 */
+#define VBDK_INODE_TABLE_SECTORS (VBDK_MAX_INODES * VBDK_INODE_SIZE / VBDK_SECTOR_SIZE) /* 256 */
 #define VBDK_INODE_TABLE_START   1 /* sector               */
-#define VBDK_DATA_START          (VBDK_INODE_TABLE_START + VBDK_INODE_TABLE_SECTORS) /* 65 */
+#define VBDK_DATA_START          (VBDK_INODE_TABLE_START + VBDK_INODE_TABLE_SECTORS) /* 257 */
 #define VBDK_MOUNT_WAIT          200 /* × 1 tick port_get retries */
 
 #define VBDK_VIRTIO_VENDOR 0x1AF4
@@ -93,9 +99,10 @@ typedef struct {
     u8  pad[456];
 } vbdk_sb_t;
 
-/* Inode — 128 bytes, 4 per sector.  flags bit 0 = in_use (persisted,
+/* Inode — 512 bytes, 1 per sector.  flags bit 0 = in_use (persisted,
  * so in-use survives reboot); type is a VFS_ITEM_* value (FILE=0, so
- * a free inode is flags==0, NOT type==0). */
+ * a free inode is flags==0, NOT type==0).  The name field matches the
+ * mem volume's 255-byte limit (VBDK_NAME_MAX=256 incl. NUL). */
 typedef struct {
     u32  flags;     /* bit 0 = in_use */
     u32  type;      /* VFS_ITEM_FILE / VFS_ITEM_DIR */
@@ -107,11 +114,11 @@ typedef struct {
     u64  created;       /* RTC ticks */
     u64  modified;
     char name[VBDK_NAME_MAX];
-    u8   pad[8];
+    u8   pad[200];
 } vbdk_inode_t;
 
 _Static_assert(sizeof(vbdk_sb_t) == VBDK_SECTOR_SIZE, "superblock not 512");
-_Static_assert(sizeof(vbdk_inode_t) == VBDK_INODE_SIZE, "inode not 128");
+_Static_assert(sizeof(vbdk_inode_t) == VBDK_INODE_SIZE, "inode not 512");
 
 /* ====================================================================
  * Volume state (RAM)
@@ -716,11 +723,14 @@ static i32 vbdk_load(void) {
     if (sb.magic != VBDK_MAGIC)
         return ERR_NOENT; /* not formatted */
 
-    /* Geometry sanity — Phase 1 has no migration logic. */
+    /* Geometry sanity — a mismatch means the on-disk format version
+     * differs (e.g. the v2 name-limit bump from 64 to 255 bytes).
+     * Treat it as unformatted: the mount path re-inits a fresh volume
+     * (disk.img is a disposable test artifact, so no migration). */
     if (sb.block_size != VBDK_SECTOR_SIZE || sb.inode_table_start != VBDK_INODE_TABLE_START ||
         sb.inode_table_sectors != VBDK_INODE_TABLE_SECTORS || sb.data_start != VBDK_DATA_START ||
         sb.root_inode != 1)
-        return ERR_INVAL;
+        return ERR_NOENT;
 
     s_vol.uuid_hi = sb.uuid_hi;
     s_vol.uuid_lo = sb.uuid_lo;

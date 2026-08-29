@@ -16,11 +16,31 @@
 #include "fs.h"
 #include "../libos/syscalls.h"
 #include "../libc/string.h"
+#include "../libc/utf8.h"
 
 /* Shared message buffers (see header note) */
 static u8  s_req[VFS_IPC_MAX];
 static u8  s_resp[VFS_IPC_MAX];
 static int s_vfs_port = -1; /* resolved once, cached */
+
+/* UTF-8-safe bounded copy into a fixed field: never cuts a multi-byte
+ * character at the 255-byte field edge. */
+static void fs_strncpy_utf8(char *dst, const char *src, int cap) {
+    int len = (int)strlen(src);
+    if (len >= cap)
+        len = cap - 1;
+    int back = 0;
+    while (back < 3 && len - 1 - back >= 0 &&
+           ((unsigned char)src[len - 1 - back] & 0xC0) == 0x80)
+        back++;
+    if (back > 0) {
+        int need = utf8_seq_len(src + (len - 1 - back));
+        if (need == 0 || need > back + 1)
+            len -= back; /* drop the incomplete trailing character */
+    }
+    memcpy(dst, src, (size_t)len);
+    dst[len] = '\0';
+}
 
 static int fs_port(void) {
     if (s_vfs_port < 0) {
@@ -461,10 +481,10 @@ int fs_move_item(const char      *src,
     vfs_req_move_t *req = (vfs_req_move_t *)s_req;
     memset(req, 0, sizeof(*req));
     req->op = VFS_OP_MOVE;
-    strncpy(req->src, src, sizeof(req->src) - 1);
-    strncpy(req->dst_dir, dst_dir, sizeof(req->dst_dir) - 1);
+    fs_strncpy_utf8(req->src, src, (int)sizeof(req->src));
+    fs_strncpy_utf8(req->dst_dir, dst_dir, (int)sizeof(req->dst_dir));
     if (new_name)
-        strncpy(req->new_name, new_name, sizeof(req->new_name) - 1);
+        fs_strncpy_utf8(req->new_name, new_name, (int)sizeof(req->new_name));
 
     vfs_resp_move_t *resp     = (vfs_resp_move_t *)s_resp;
     int              resp_len = (int)sizeof(*resp);

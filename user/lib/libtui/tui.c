@@ -290,7 +290,7 @@ int tui_printf(const char *fmt, ...) {
  * Region snapshot/restore (v1.2)
  * ==================================================================== */
 
-int tui_region_save(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t *cells) {
+int tui_region_save(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint16_t *cells) {
     if (!cells || w == 0 || h == 0 || (uint64_t)w * h > TUI_MAX_REGION_CELLS)
         return -2; /* ERR_INVAL */
 
@@ -315,11 +315,11 @@ int tui_region_save(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t *cel
     i32 r = *(i32 *)s_resp;
     if (r < 0)
         return r;
-    memcpy(cells, s_resp + 4, (size_t)(w * h));
+    memcpy(cells, s_resp + 4, (size_t)(w * h) * 2); /* u16 code points */
     return 0;
 }
 
-int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *cells) {
+int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint16_t *cells) {
     if (!cells || w == 0 || h == 0 || (uint64_t)w * h > TUI_MAX_REGION_CELLS)
         return -2; /* ERR_INVAL */
 
@@ -329,15 +329,15 @@ int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uin
 
     u32 *req = (u32 *)s_req;
     req[0]   = TUI_OP_RESTORE;
-    req[1]   = 16 + (u32)(w * h);
+    req[1]   = 16 + (u32)(w * h) * 2;
     req[2]   = x;
     req[3]   = y;
     req[4]   = w;
     req[5]   = h;
-    memcpy(s_req + 8 + 16, cells, (size_t)(w * h));
+    memcpy(s_req + 8 + 16, cells, (size_t)(w * h) * 2);
 
     int resp_len = (int)sizeof(s_resp);
-    int ret      = ipc_call(port, s_req, 8 + 16 + (int)(w * h), s_resp, &resp_len);
+    int ret      = ipc_call(port, s_req, 8 + 16 + (int)(w * h) * 2, s_resp, &resp_len);
     if (ret < 0)
         return ret;
     if (resp_len < 4)
@@ -382,7 +382,7 @@ int tui_input_line(int x, int y, const char *prompt, char *buf, int maxlen, int 
      * cover plus the cursor, and restore both before returning. */
     int  plen = prompt ? (int)strlen(prompt) : 0;
     u32  rw   = (u32)(plen + maxlen + 1);
-    u8   saved[TUI_MAX_REGION_CELLS];
+    uint16_t saved[TUI_MAX_REGION_CELLS];
     int  has_saved = 0;
     u32  cx = 0, cy = 0;
     int  have_cursor = 0;
@@ -453,7 +453,7 @@ int tui_confirm(int x, int y, int w, const char *title, const char *msg, const c
         w = 100;
 
     /* Non-destructive overlay: snapshot the dialog rectangle. */
-    u8  saved[TUI_MAX_REGION_CELLS];
+    uint16_t saved[TUI_MAX_REGION_CELLS];
     int has_saved = 0;
     u32 cx = 0, cy = 0;
     int have_cursor = 0;
@@ -517,7 +517,7 @@ int tui_menu(int x, int y, int w, int h, const char *title,
         w = 100;
 
     /* Save the covered region + cursor (non-destructive overlay). */
-    u8  saved[TUI_MAX_REGION_CELLS];
+    uint16_t saved[TUI_MAX_REGION_CELLS];
     int has_saved = 0;
     u32 cx = 0, cy = 0;
     int have_cursor = 0;

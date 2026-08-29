@@ -97,6 +97,25 @@ static i64 sys_debug_log(u64 arg1) {
         p += chunk;
     }
 
+    /* Trim a 512-byte cut back to a UTF-8 character boundary so a
+     * multi-byte character is never split (half a glyph on serial). */
+    {
+        u64 back = 0;
+        while (back < 3 && back < n &&
+               ((unsigned char)buf[n - 1 - back] & 0xC0) == 0x80)
+            back++;
+        if (back > 0) {
+            u64 lead = n - 1 - back;
+            u8  b0   = (unsigned char)buf[lead];
+            int need  = 0;
+            if (b0 >= 0xC2 && b0 <= 0xDF)      need = 2;
+            else if (b0 >= 0xE0 && b0 <= 0xEF) need = 3;
+            else if (b0 >= 0xF0 && b0 <= 0xF4) need = 4;
+            if (need == 0 || (u64)need > back + 1)
+                n = lead; /* drop the incomplete trailing character */
+        }
+    }
+
     if (n == 0)
         return 0;
 

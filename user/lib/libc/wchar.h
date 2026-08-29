@@ -126,6 +126,10 @@ size_t wcrtomb(char *s, wchar_t wc, mbstate_t *ps);
 size_t mbsrtowcs(wchar_t *dest, const char **src, size_t len, mbstate_t *ps);
 size_t wcsrtombs(char *dest, const wchar_t **src, size_t len, mbstate_t *ps);
 
+/* Terminal display width of a wide character: -1 control, 0 combining,
+ * 1 narrow, 2 CJK wide (approximation of the classic wcwidth). */
+int wcwidth(wchar_t wc);
+
 /* ====================================================================
  * Time formatting (C11 §7.29.5.1) — declaration only
  * ==================================================================== */

@@ -27,10 +27,12 @@
 
 #include <libc/stdio.h>
 #include <libc/string.h>
+#include <libc/utf8.h>    /* UTF-8 decoding for the title bar */
 #include <libgui/gui.h>
 #include <libgui/font.h> /* gui_font: 8x16 glyphs for the title text */
 #include <libos/syscalls.h>
 #include <malloc.h> /* malloc / free for window buffers */
+#include "../../lib/font_cjk.h" /* 16x16 CJK glyphs for UTF-8 titles */
 
 /* Keyboard service protocol (mirror of keyboard.c — not shared) */
 #define KBD_OP_READ      1
@@ -222,14 +224,28 @@ static void draw_titlebar(gui_win_t *w, const gui_rect_t *d) {
     /* Title text (skip background: the bar is already filled).
      * Leave room on the right for the title-bar buttons. */
     int xr = w->x + w->w + GUI_BORDER - 1; /* right edge inside border */
-    int max_title = (xr - 42 - tx) / 8;   /* 3 buttons * 14px */
+    int max_px = xr - 42 - tx;             /* 3 buttons * 14px */
     char t[GUI_MAX_TITLE + 2];
-    int  n = (int)strlen(w->title);
-    if (n > (int)sizeof(t) - 3)
-        n = (int)sizeof(t) - 3;
-    if (n > max_title)
-        n = max_title;
-    memcpy(t, w->title, (size_t)n);
+    int  n  = 0;
+    int  px = 0;
+    /* Truncate by DISPLAY width (ASCII 8px, CJK 16px) so a UTF-8 title
+     * is never cut in the middle of a character. */
+    const char *p = w->title;
+    while (*p && n < (int)sizeof(t) - 3) {
+        u32 cp;
+        int len = utf8_decode(p, &cp);
+        if (len <= 0) {
+            cp  = (u32)(u8)*p;
+            len = 1;
+        }
+        int gw = (cp > 0x7F && font_cjk_lookup(cp)) ? 16 : 8;
+        if (px + gw > max_px)
+            break;
+        memcpy(t + n, p, (size_t)len);
+        n += len;
+        px += gw;
+        p += len;
+    }
     t[n++] = ' ';
     t[n++] = '*'; /* focus marker on the focused window */
     t[n]   = '\0';
@@ -242,30 +258,64 @@ static void draw_titlebar(gui_win_t *w, const gui_rect_t *d) {
         if (y1 > d->y + d->h)
             y1 = d->y + d->h;
     }
-    for (int i = 0; i < n; i++) {
-        int gx = tx + i * 8;
-        if (d && (gx + 8 <= d->x || gx >= d->x + d->w))
-            continue; /* glyph fully outside the dirty rect */
-        unsigned char ch = (unsigned char)t[i];
-        if (ch < 0x20 || ch > 0x7E)
-            continue;
-        const u8 *glyph = gui_font[ch - 0x20];
+    int        gx = tx;
+    const char *q = t;
+    while (*q) {
+        u32 cp;
+        int len = utf8_decode(q, &cp);
+        if (len <= 0) {
+            cp  = (u32)(u8)q[0];
+            len = 1;
+        }
+        int gw = 8;
+        const u8 *glyph = NULL;
+        if (cp > 0x7F) {
+            glyph = font_cjk_lookup(cp);
+            gw    = glyph ? 16 : 8;
+            if (!glyph)
+                cp = '?'; /* missing glyph: visible placeholder */
+        }
+        if (cp >= 0x20 && cp <= 0x7E)
+            glyph = gui_font[cp - 0x20];
+        if (!glyph) {
+            gx += gw;
+            q += len;
+            continue; /* control char / unrenderable: skip */
+        }
         /* X clip: only paint glyph columns inside the dirty rect — a
          * partially-covered glyph painted in full would leave its tail
          * on the overlapping window above. */
-        int cx0 = 0, cx1 = 8;
+        int cx0 = 0, cx1 = gw;
         if (d) {
+            if (gx + gw <= d->x || gx >= d->x + d->w) {
+                gx += gw;
+                q += len;
+                continue; /* glyph fully outside the dirty rect */
+            }
             if (gx < d->x)
                 cx0 = d->x - gx;
-            if (gx + 8 > d->x + d->w)
+            if (gx + gw > d->x + d->w)
                 cx1 = d->x + d->w - gx;
         }
+        /* Row-by-row paint (CJK: 16x16 glyph = 2 bytes per row). */
         for (int row = y0; row < y1; row++) {
-            u8 bits = glyph[row - ty];
-            for (int col = cx0; col < cx1; col++)
-                if (bits & (0x80 >> col))
+            int r = row - ty;
+            for (int col = cx0; col < cx1; col++) {
+                int bit;
+                if (gw == 16) {
+                    u8 hi = glyph[r * 2];
+                    u8 lo = glyph[r * 2 + 1];
+                    bit = (col < 8) ? (hi & (0x80 >> col))
+                                    : (lo & (0x80 >> (col - 8)));
+                } else {
+                    bit = glyph[r] & (0x80 >> col);
+                }
+                if (bit)
                     gui_pixel(&s_fb, gx + col, row, GUI_TITLE_FG);
+            }
         }
+        gx += gw;
+        q += len;
     }
 
     /* Title-bar buttons: [min] [max] [close] at the right edge.

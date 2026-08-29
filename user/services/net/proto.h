@@ -43,3 +43,10 @@ int proto_udp_sendto(const u8 dst_ip[4], u16 sport, u16 dport,
 int proto_udp_recv(u8 src[4], u16 *sport, u16 *dport, u8 *data, u32 max);
 
 #endif /* USER_SERVICES_NET_PROTO_H */
+
+/* ---- TCP (phase 5, single-connection) ---- */
+int proto_tcp_listen(u16 port);
+int proto_tcp_accept(u8 peer[4], u16 *peer_port); /* blocking ~6 s */
+int proto_tcp_send(const u8 *data, u32 len);
+int proto_tcp_recv(u8 *data, u32 max, u16 *peer_port); /* blocking */
+int proto_tcp_close(void);

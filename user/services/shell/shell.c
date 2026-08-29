@@ -2305,7 +2305,60 @@ static int cmd_net(int argc, char *argv[]) {
         shell_printf("net: no reply (ret=%d)\n", resp.ret);
         return -1;
     }
-    shell_write("Usage: net mac | arp | ping <ip> | recv | stats\n");
+    if (strcmp(argv[1], "tcp") == 0 && argc >= 3) {
+        /* TCP echo test (server role): net tcp <port>.  Listens on the
+         * given port and waits for a host-side connection (QEMU
+         * hostfwd), receives one segment, echoes it back and closes.
+         */
+        long portn = strtol(argv[2], NULL, 10);
+        if (portn < 16 || portn > 65535) {
+            shell_write("net: bad port\n");
+            return -1;
+        }
+        net_req_t req;
+        memset(&req, 0, sizeof(req));
+        net_resp_t resp;
+        memset(&resp, 0, sizeof(resp));
+        int rl = (int)sizeof(resp);
+
+        req.op = 12; /* NET_OP_TCP_LISTEN */
+        req.len = 2;
+        req.data[0] = (u8)(portn >> 8);
+        req.data[1] = (u8)(portn & 0xFF);
+        if (ipc_call(port, &req, 8 + 2, &resp, &rl) < 0 || resp.ret < 0) {
+            shell_printf("net: tcp listen failed (%d)\n", resp.ret);
+            return -1;
+        }
+        shell_printf("net: tcp listening on %d ...\n", (int)portn);
+        req.op = 13; /* NET_OP_TCP_ACCEPT */
+        req.len = 0;
+        if (ipc_call(port, &req, 8, &resp, &rl) < 0 || resp.ret < 0) {
+            shell_printf("net: tcp accept failed (%d)\n", resp.ret);
+            return -1;
+        }
+        shell_printf("net: tcp accepted %d.%d.%d.%d:%d\n",
+                     resp.data[0], resp.data[1], resp.data[2], resp.data[3],
+                     (resp.data[4] << 8) | resp.data[5]);
+        req.op = 15; /* NET_OP_TCP_RECV */
+        req.len = 0;
+        if (ipc_call(port, &req, 8, &resp, &rl) == 0 && resp.ret >= 0 && resp.len > 0) {
+            shell_printf("net: tcp recv %d bytes: ", resp.len);
+            shell_write((const char *)resp.data);
+            shell_write("\n");
+            /* echo it back */
+            req.op = 14; /* NET_OP_TCP_SEND */
+            req.len = resp.len;
+            memcpy(req.data, resp.data, req.len);
+            (void)ipc_call(port, &req, 8 + req.len, &resp, &rl);
+            req.op = 16; /* NET_OP_TCP_CLOSE */
+            req.len = 0;
+            (void)ipc_call(port, &req, 8, &resp, &rl);
+            return 0;
+        }
+        shell_printf("net: tcp recv failed (%d)\n", resp.ret);
+        return -1;
+    }
+    shell_write("Usage: net mac | arp | ping <ip> | tcp <ip> <port> <msg> | recv | stats\n");
     return -1;
 }
 

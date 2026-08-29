@@ -13,6 +13,7 @@
 
 #include <libc/string.h>
 #include <libc/stdio.h> /* printf */
+#include <libos/syscalls.h> /* get_time */
 
 /* The driver side (implemented in main.c): send a raw Ethernet frame
  * and the NIC MAC. */
@@ -37,6 +38,9 @@ typedef struct {
     u32 ttl; /* ticks remaining */
 } arp_entry_t;
 static arp_entry_t s_arp[ARP_CACHE_MAX];
+
+/* fwd: TCP segment handler (defined below) */
+static void proto_tcp_rx_tcp(const u8 *f, u32 fl);
 
 /* ---- UDP ---- */
 #define UDP_SOCK_MAX  16
@@ -244,6 +248,9 @@ static void icmp_echo_reply(const u8 *src_ip, const u8 *icmp, u32 icmp_len) {
     (void)ip_send_raw(src_ip, IP_PROTO_ICMP, payload, plen);
 }
 
+/* fwd: TCP segment handler (defined below) */
+static void proto_tcp_rx_tcp(const u8 *f, u32 fl);
+
 /* ---- UDP ---- */
 
 static udp_sock_t *udp_find(u16 port) {
@@ -333,6 +340,8 @@ void proto_rx(const u8 *frame, u32 len) {
             udp_queue(src, sport, dport, pl + UDP_HDR_LEN, lplen - UDP_HDR_LEN);
         return;
     }
+    if (proto == IP_PROTO_TCP && lplen >= TCP_HDR_LEN)
+        proto_tcp_rx_tcp(frame, len);
 }
 
 int proto_ip_send(const u8 dst_ip[4], u8 proto, const u8 *payload, u32 len) {
@@ -440,4 +449,268 @@ int proto_udp_recv(u8 src[4], u16 *sport, u16 *dport, u8 *data, u32 max) {
     s_udp_rx_head = (s_udp_rx_head + 1) % UDP_RXQ_MAX;
     s_udp_rx_count--;
     return (int)n;
+}
+
+/* ====================================================================
+ * TCP — minimal single-connection implementation (RFC 793 subset)
+ *
+ * One listening socket; after accept() a single established connection
+ * carries data.  The three-way handshake, sequence/ack accounting and
+ * passive/active close are implemented; retransmission and windowing
+ * are deliberately omitted (QEMU slirp on a local link never drops).
+ * ==================================================================== */
+
+#define TCP_STATE_LISTEN    0
+#define TCP_STATE_SYN_SENT  1
+#define TCP_STATE_ESTAB     2
+#define TCP_STATE_CLOSE_WAIT 3 /* peer FIN'd; we may still send */
+#define TCP_STATE_CLOSED    4
+
+#define TCP_RXQ_MAX 8
+typedef struct {
+    u8   src[4];
+    u16  sport;
+    u16  len;
+    u8   data[1500];
+} tcp_pkt_t;
+
+static u8      s_tcp_state = TCP_STATE_CLOSED;
+static u16     s_tcp_lport;  /* listening / local port */
+static u8      s_tcp_peer[4]; /* established peer */
+static u16     s_tcp_peer_port;
+static u32     s_tcp_iss;   /* initial send seq */
+static u32     s_tcp_snd_nxt; /* next seq to send */
+static u32     s_tcp_rcv_nxt; /* next seq expected from peer */
+static tcp_pkt_t s_tcp_rxq[TCP_RXQ_MAX];
+static u32     s_tcp_rx_head;
+static u32     s_tcp_rx_count;
+
+/* TCP pseudo-header checksum (RFC 793). */
+static u16 tcp_checksum(const u8 *src_ip, const u8 *dst_ip,
+                        const u8 *seg, u32 seg_len) {
+    u8 pseudo[12];
+    memcpy(pseudo, src_ip, 4);
+    memcpy(pseudo + 4, dst_ip, 4);
+    pseudo[8] = 0;
+    pseudo[9] = IP_PROTO_TCP;
+    pseudo[10] = (u8)(seg_len >> 8);
+    pseudo[11] = (u8)(seg_len & 0xFF);
+    /* Checksum over pseudo header + segment. */
+    u32 sum = 0;
+    u32 i = 0;
+    for (; i + 1 < 12; i += 2)
+        sum += ((u16)pseudo[i] << 8) | pseudo[i + 1];
+    for (i = 0; i + 1 < seg_len; i += 2)
+        sum += ((u16)seg[i] << 8) | seg[i + 1];
+    if (seg_len & 1)
+        sum += (u16)seg[seg_len - 1] << 8;
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return (u16)~sum;
+}
+
+/* Build + send a raw TCP segment. */
+static int tcp_send_seg(u8 flags, u32 seq, u32 ack, const u8 *data, u32 len) {
+    u8 seg[TCP_HDR_LEN + 1500];
+    memset(seg, 0, TCP_HDR_LEN);
+    seg[0] = (u8)(s_tcp_lport >> 8);
+    seg[1] = (u8)(s_tcp_lport & 0xFF);
+    seg[2] = (u8)(s_tcp_peer_port >> 8);
+    seg[3] = (u8)(s_tcp_peer_port & 0xFF);
+    seg[4] = (u8)(seq >> 24);
+    seg[5] = (u8)(seq >> 16);
+    seg[6] = (u8)(seq >> 8);
+    seg[7] = (u8)(seq & 0xFF);
+    seg[8] = (u8)(ack >> 24);
+    seg[9] = (u8)(ack >> 16);
+    seg[10] = (u8)(ack >> 8);
+    seg[11] = (u8)(ack & 0xFF);
+    seg[12] = 0x50; /* data offset 5 */
+    seg[13] = flags;
+    seg[14] = 0x10; /* window 4096 */
+    seg[15] = 0x00;
+    seg[16] = 0;
+    seg[17] = 0; /* checksum */
+    seg[18] = 0;
+    seg[19] = 0; /* urgent */
+    if (data && len)
+        memcpy(seg + TCP_HDR_LEN, data, len);
+    u32 total = TCP_HDR_LEN + len;
+    u16 cs = tcp_checksum(s_ip, s_tcp_peer, seg, total);
+    seg[16] = (u8)(cs >> 8);
+    seg[17] = (u8)(cs & 0xFF);
+    return ip_send_raw(s_tcp_peer, IP_PROTO_TCP, seg, total);
+}
+
+int proto_tcp_listen(u16 port) {
+    if (port < 16)
+        return -2;
+    s_tcp_state = TCP_STATE_LISTEN;
+    s_tcp_lport = port;
+    s_tcp_rx_head = 0;
+    s_tcp_rx_count = 0;
+    return 0;
+}
+
+int proto_tcp_close(void) {
+    s_tcp_state = TCP_STATE_CLOSED;
+    s_tcp_rx_head = 0;
+    s_tcp_rx_count = 0;
+    return 0;
+}
+
+/* Block until a connection is established (or ~6 s timeout). */
+int proto_tcp_accept(u8 peer[4], u16 *peer_port) {
+    if (s_tcp_state != TCP_STATE_LISTEN)
+        return -2;
+    extern void net_yield(void);
+    for (int i = 0; i < 6000; i++) { /* ~60 s accept window */
+        net_rx_pump_now();
+        u8 f[1600];
+        u32 fl;
+        while (net_rx_pump(f, &fl)) {
+            if (fl >= 14 + IP_HDR_LEN + TCP_HDR_LEN && f[12] == 0x08 && f[13] == 0x00) {
+                const u8 *ip = f + 14;
+                if (ip[9] == IP_PROTO_TCP) {
+                    const u8 *t = ip + IP_HDR_LEN;
+                    u16 dport = (u16)((t[2] << 8) | t[3]);
+                    u8 flags  = t[13];
+                    u32 seq   = ((u32)t[4] << 24) | ((u32)t[5] << 16) |
+                                ((u32)t[6] << 8) | t[7];
+                    if (dport == s_tcp_lport && (flags & TCP_SYN) && !(flags & TCP_ACK)) {
+                        /* SYN: handshake. */
+                        memcpy(s_tcp_peer, ip + 12, 4);
+                        s_tcp_peer_port = (u16)((t[0] << 8) | t[1]);
+                        s_tcp_rcv_nxt = seq + 1;
+                        s_tcp_iss = (u32)get_time();
+                        if (s_tcp_iss == 0)
+                            s_tcp_iss = 0x1234;
+                        s_tcp_snd_nxt = s_tcp_iss + 1;
+                        s_tcp_state = TCP_STATE_SYN_SENT; /* awaiting ACK */
+                        (void)tcp_send_seg(TCP_SYN | TCP_ACK, s_tcp_iss,
+                                           s_tcp_rcv_nxt, NULL, 0);
+                        /* fall through: the ACK arrives next pump */
+                        proto_tcp_rx_tcp(f, fl);
+                    }
+                }
+            }
+            proto_rx(f, fl);
+        }
+        if (s_tcp_state == TCP_STATE_ESTAB || s_tcp_state == TCP_STATE_CLOSE_WAIT) {
+            memcpy(peer, s_tcp_peer, 4);
+            *peer_port = s_tcp_peer_port;
+            return 0;
+        }
+        net_yield();
+    }
+    s_tcp_state = TCP_STATE_LISTEN;
+    return -7; /* timeout */
+}
+/* Handle an incoming TCP segment (called from proto_rx). */
+static void proto_tcp_rx_tcp(const u8 *f, u32 fl); /* fwd */
+
+static void proto_tcp_rx_tcp(const u8 *f, u32 fl) {
+    const u8 *ip = f + 14;
+    const u8 *t  = ip + IP_HDR_LEN;
+    u16 sport = (u16)((t[0] << 8) | t[1]);
+    u16 dport = (u16)((t[2] << 8) | t[3]);
+    u8 flags  = t[13];
+    u32 seq   = ((u32)t[4] << 24) | ((u32)t[5] << 16) | ((u32)t[6] << 8) | t[7];
+    u32 ack   = ((u32)t[8] << 24) | ((u32)t[9] << 16) | ((u32)t[10] << 8) | t[11];
+    (void)sport;
+
+    if (dport != s_tcp_lport)
+        return;
+
+    if (s_tcp_state == TCP_STATE_SYN_SENT) {
+        /* We sent SYN-ACK; the client completes the handshake with a
+         * plain ACK (0x10) — the normal server-side case.  (A
+         * simultaneous-open SYN-ACK also works.) */
+        if ((flags & TCP_ACK) && !(flags & TCP_SYN)) {
+            s_tcp_rcv_nxt = seq;  /* client's next data seq */
+            s_tcp_snd_nxt = ack;  /* our SYN-ACK was acked */
+            s_tcp_state = TCP_STATE_ESTAB;
+        } else if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
+            s_tcp_rcv_nxt = seq + 1;
+            s_tcp_snd_nxt = ack;
+            s_tcp_state = TCP_STATE_ESTAB;
+            (void)tcp_send_seg(TCP_ACK, s_tcp_snd_nxt, s_tcp_rcv_nxt, NULL, 0);
+        }
+        return;
+    }
+    if (s_tcp_state == TCP_STATE_ESTAB || s_tcp_state == TCP_STATE_CLOSE_WAIT) {
+        /* Data: deliver in order (single connection, no reordering). */
+        if (fl >= 14 + IP_HDR_LEN + TCP_HDR_LEN + 1) {
+            u32 hlen = ((t[12] >> 4) & 0xF) * 4;
+            u32 dlen = fl - (14 + IP_HDR_LEN + hlen);
+            if (dlen > 0 && seq == s_tcp_rcv_nxt && s_tcp_rx_count < TCP_RXQ_MAX) {
+                u32 slot = (s_tcp_rx_head + s_tcp_rx_count) % TCP_RXQ_MAX;
+                memcpy(s_tcp_rxq[slot].src, ip + 12, 4);
+                s_tcp_rxq[slot].sport = sport;
+                s_tcp_rxq[slot].len = (u16)(dlen > 1500 ? 1500 : dlen);
+                memcpy(s_tcp_rxq[slot].data, t + hlen, s_tcp_rxq[slot].len);
+                s_tcp_rx_count++;
+                s_tcp_rcv_nxt = seq + dlen;
+                (void)tcp_send_seg(TCP_ACK, s_tcp_snd_nxt, s_tcp_rcv_nxt, NULL, 0);
+            }
+        }
+        if (flags & TCP_FIN) {
+            s_tcp_rcv_nxt = seq + 1;
+            s_tcp_state = TCP_STATE_CLOSE_WAIT;
+            (void)tcp_send_seg(TCP_ACK, s_tcp_snd_nxt, s_tcp_rcv_nxt, NULL, 0);
+        }
+        return;
+    }
+}
+
+int proto_tcp_send(const u8 *data, u32 len) {
+    if (s_tcp_state != TCP_STATE_ESTAB && s_tcp_state != TCP_STATE_CLOSE_WAIT)
+        return -2;
+    if (len > 1400)
+        len = 1400;
+    int r = tcp_send_seg(TCP_ACK | TCP_PSH, s_tcp_snd_nxt, s_tcp_rcv_nxt,
+                         data, len);
+    if (r == 0)
+        s_tcp_snd_nxt += len;
+    return r;
+}
+
+/* Block for one received segment (~6 s). */
+int proto_tcp_recv(u8 *data, u32 max, u16 *peer_port) {
+    extern void net_yield(void);
+    for (int i = 0; i < 600; i++) {
+        net_rx_pump_now();
+        u8 f[1600];
+        u32 fl;
+        while (net_rx_pump(f, &fl)) {
+            if (fl >= 14 + IP_HDR_LEN + TCP_HDR_LEN && f[12] == 0x08 && f[13] == 0x00) {
+                const u8 *ip = f + 14;
+                if (ip[9] == IP_PROTO_TCP) {
+                    const u8 *t = ip + IP_HDR_LEN;
+                    u16 dport = (u16)((t[2] << 8) | t[3]);
+                    if (dport == s_tcp_lport)
+                        proto_tcp_rx_tcp(f, fl);
+                }
+            }
+            proto_rx(f, fl);
+        }
+        if (s_tcp_rx_count > 0) {
+            tcp_pkt_t *p = &s_tcp_rxq[s_tcp_rx_head];
+            u32 n = p->len;
+            if (n > max)
+                n = max;
+            memcpy(data, p->data, n);
+            if (peer_port)
+                *peer_port = p->sport;
+            s_tcp_rx_head = (s_tcp_rx_head + 1) % TCP_RXQ_MAX;
+            s_tcp_rx_count--;
+            return (int)n;
+        }
+        if (s_tcp_state == TCP_STATE_CLOSE_WAIT && s_tcp_rx_count == 0) {
+            /* Peer closed and drained: report EOF. */
+            return 0;
+        }
+        net_yield();
+    }
+    return -7;
 }

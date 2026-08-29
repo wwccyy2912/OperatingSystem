@@ -573,6 +573,50 @@ static void net_server_loop(int port) {
             }
             break;
         }
+        case NET_OP_TCP_LISTEN: {
+            if (req->len >= 2) {
+                u16 p = (u16)((req->data[0] << 8) | req->data[1]);
+                resp->ret = proto_tcp_listen(p);
+            }
+            break;
+        }
+        case NET_OP_TCP_ACCEPT: {
+            u8 peer[4];
+            u16 pport;
+            int n = proto_tcp_accept(peer, &pport);
+            if (n == 0) {
+                resp->data[0] = peer[0];
+                resp->data[1] = peer[1];
+                resp->data[2] = peer[2];
+                resp->data[3] = peer[3];
+                resp->data[4] = (u8)(pport >> 8);
+                resp->data[5] = (u8)(pport & 0xFF);
+                resp->len = 6;
+                resp->ret = 0;
+            } else {
+                resp->ret = n;
+            }
+            break;
+        }
+        case NET_OP_TCP_SEND: {
+            if (req->len > 0)
+                resp->ret = proto_tcp_send(req->data, req->len);
+            break;
+        }
+        case NET_OP_TCP_RECV: {
+            u16 pport;
+            int n = proto_tcp_recv(resp->data, NET_MTU, &pport);
+            if (n >= 0) {
+                resp->len = (u32)n;
+                resp->ret = 0;
+            } else {
+                resp->ret = n;
+            }
+            break;
+        }
+        case NET_OP_TCP_CLOSE:
+            resp->ret = proto_tcp_close();
+            break;
         default:
             break;
         }

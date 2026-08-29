@@ -41,6 +41,12 @@ enum {
     NET_OP_UDP_SENDTO = 9,  /* { ip[4]; sport; dport; data } */
     NET_OP_UDP_RECV   = 10, /* -> { srcip[4]; sport; dport; data } */
     NET_OP_UDP_UNBIND = 11, /* { port } */
+    /* ---- TCP (phase 5, single-connection) ---- */
+    NET_OP_TCP_LISTEN = 12, /* { port }  listen for one connection */
+    NET_OP_TCP_ACCEPT = 13, /* -> { peer[4]; peerport }  blocking */
+    NET_OP_TCP_SEND   = 14, /* { data }  send on the established conn */
+    NET_OP_TCP_RECV   = 15, /* -> { data }  blocking recv */
+    NET_OP_TCP_CLOSE  = 16, /* close the established connection */
 };
 
 /* ---- request/response envelopes (fit the 4 KiB IPC limit) ---- */
@@ -64,8 +70,17 @@ _Static_assert(sizeof(net_resp_t) <= 4096, "net_resp_t too big");
 #define ETH_TYPE_IPV4 0x0800
 #define ETH_TYPE_ARP  0x0806
 #define IP_PROTO_ICMP 1
+#define IP_PROTO_TCP  6
 #define IP_PROTO_UDP  17
 #define IP_HDR_LEN    20
 #define UDP_HDR_LEN   8
+#define TCP_HDR_LEN   20
+
+/* TCP flag bits (TCP header byte 13). */
+#define TCP_FIN 0x01
+#define TCP_SYN 0x02
+#define TCP_RST 0x04
+#define TCP_PSH 0x08
+#define TCP_ACK 0x10
 
 #endif /* USER_SERVICES_NET_NET_H */

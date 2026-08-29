@@ -56,6 +56,8 @@ typedef struct {
     i32          x, y; /* fb position of the border */
     i32          w, h; /* content size (excludes border+title bar) */
     gui_canvas_t buf;  /* off-screen content buffer (32bpp) */
+    int          maxed; /* maximised (restore rect in rx/ry/rw/rh) */
+    i32          rx, ry, rw, rh;
 } gui_win_t;
 
 static gui_win_t      s_wins[GUI_MAX_WINDOWS];
@@ -212,11 +214,16 @@ static int rect_intersect(gui_rect_t a, gui_rect_t b, gui_rect_t *out) {
 static void draw_titlebar(gui_win_t *w, const gui_rect_t *d) {
     int tx = w->x + GUI_BORDER + 3;
     int ty = w->y + GUI_BORDER;
-    /* Title text (skip background: the bar is already filled). */
+    /* Title text (skip background: the bar is already filled).
+     * Leave room on the right for the title-bar buttons. */
+    int xr = w->x + w->w + GUI_BORDER - 1; /* right edge inside border */
+    int max_title = (xr - 42 - tx) / 8;   /* 3 buttons * 14px */
     char t[GUI_MAX_TITLE + 2];
     int  n = (int)strlen(w->title);
     if (n > (int)sizeof(t) - 3)
         n = (int)sizeof(t) - 3;
+    if (n > max_title)
+        n = max_title;
     memcpy(t, w->title, (size_t)n);
     t[n++] = ' ';
     t[n++] = '*'; /* focus marker on the focused window */
@@ -253,6 +260,45 @@ static void draw_titlebar(gui_win_t *w, const gui_rect_t *d) {
             for (int col = cx0; col < cx1; col++)
                 if (bits & (0x80 >> col))
                     gui_pixel(&s_fb, gx + col, row, GUI_TITLE_FG);
+        }
+    }
+
+    /* Title-bar buttons: [min] [max] [close] at the right edge.
+     * 12x10 px, 2px apart, only the focused window shows them. */
+    if (w->id == s_focus_id) {
+        int by = w->y + GUI_BORDER + 3;
+        int bx = xr - 7; /* close (rightmost) */
+        /* glyphs: close 'x', max '□', min '–' */
+        for (int b = 0; b < 3; b++) {
+            int cx = bx - b * 14;
+            if (d && (cx + 6 <= d->x || cx - 6 >= d->x + d->w))
+                continue;
+            /* button background */
+            for (int yy = 0; yy < 10; yy++)
+                for (int xx = -6; xx <= 6; xx++)
+                    gui_pixel(&s_fb, cx + xx, by + yy,
+                              (b == 0) ? 0x00C04040 : 0x00404040);
+            /* glyph */
+            if (b == 0) { /* close: X */
+                for (int k = -3; k <= 3; k++) {
+                    gui_pixel(&s_fb, cx + k, by + 2 + k, 0x00FFFFFF);
+                    gui_pixel(&s_fb, cx + k, by + 7 - k, 0x00FFFFFF);
+                }
+            } else if (b == 1) { /* max: square outline */
+                for (int xx = -4; xx <= 4; xx++) {
+                    gui_pixel(&s_fb, cx + xx, by + 1, 0x00FFFFFF);
+                    gui_pixel(&s_fb, cx + xx, by + 8, 0x00FFFFFF);
+                }
+                for (int yy = 1; yy <= 8; yy++) {
+                    gui_pixel(&s_fb, cx - 4, by + yy, 0x00FFFFFF);
+                    gui_pixel(&s_fb, cx + 4, by + yy, 0x00FFFFFF);
+                }
+            } else { /* min: horizontal bar */
+                for (int xx = -4; xx <= 4; xx++) {
+                    gui_pixel(&s_fb, cx + xx, by + 4, 0x00FFFFFF);
+                    gui_pixel(&s_fb, cx + xx, by + 5, 0x00FFFFFF);
+                }
+            }
         }
     }
 }
@@ -781,6 +827,22 @@ static void do_text(int token, int msg_len, u64 caller) {
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
 
+/* Title-bar button hit test: 1=close, 2=max, 3=min, 0=none. */
+static int title_button_at(gui_win_t *w, int px, int py) {
+    if (!w)
+        return 0;
+    int by = w->y + GUI_BORDER + 3;
+    if (py < by || py >= by + 10)
+        return 0;
+    int xr = w->x + w->w + GUI_BORDER - 1;
+    for (int b = 0; b < 3; b++) {
+        int cx = xr - 7 - b * 14;
+        if (px >= cx - 6 && px < cx + 6)
+            return b + 1; /* 1 close, 2 max, 3 min */
+    }
+    return 0;
+}
+
 static void do_poll(int token, u64 caller) {
     gui_resp_poll_t *resp = (gui_resp_poll_t *)s_resp;
     resp->ret             = 0;
@@ -1070,9 +1132,56 @@ static void gui_input_main(void *arg) {
                     if (pressed) {
                         int hit = hit_test(s_ptr_x, s_ptr_y);
                         if (hit != 0) {
+                            gui_win_t *hw = win_find(hit);
+                            /* Title-bar buttons take priority over drag
+                             * and focus (close / minimise / maximise). */
+                            if (hw && s_ptr_y >= hw->y &&
+                                s_ptr_y < hw->y + GUI_BORDER + GUI_TITLE_H) {
+                                int btn = title_button_at(hw, s_ptr_x, s_ptr_y);
+                                if (btn != 0) {
+                                    if (btn == 1) { /* close */
+                                        int dx = hw->x, dy = hw->y;
+                                        int dw = hw->w + 2 * GUI_BORDER;
+                                        int dh = hw->h + 2 * GUI_BORDER + GUI_TITLE_H;
+                                        free(hw->buf.buf);
+                                        memset(hw, 0, sizeof(*hw));
+                                        if (s_focus_id == hit)
+                                            s_focus_id = 0;
+                                        gui_dirty_add_nolock(dx, dy, dw, dh);
+                                        changed = 1;
+                                    } else if (btn == 2) { /* maximise */
+                                        int ox = hw->x, oy = hw->y;
+                                        int ow = hw->w + 2 * GUI_BORDER;
+                                        int oh = hw->h + 2 * GUI_BORDER + GUI_TITLE_H;
+                                        if (hw->maxed) {
+                                            hw->x = hw->rx;
+                                            hw->y = hw->ry;
+                                            hw->w = hw->rw;
+                                            hw->h = hw->rh;
+                                            hw->maxed = 0;
+                                        } else {
+                                            hw->rx = hw->x;
+                                            hw->ry = hw->y;
+                                            hw->rw = hw->w;
+                                            hw->rh = hw->h;
+                                            hw->x = 0;
+                                            hw->y = 0;
+                                            hw->w = (i32)s_fb.w - 2 * GUI_BORDER;
+                                            hw->h = (i32)s_fb.h - 2 * GUI_BORDER - GUI_TITLE_H;
+                                            hw->maxed = 1;
+                                        }
+                                        gui_dirty_add_nolock(ox, oy, ow, oh);
+                                        gui_dirty_add_nolock(hw->x, hw->y,
+                                                             hw->w + 2 * GUI_BORDER,
+                                                             hw->h + 2 * GUI_BORDER +
+                                                                 GUI_TITLE_H);
+                                        changed = 1;
+                                    } /* btn 3 (minimise): no taskbar yet */
+                                    goto button_done;
+                                }
+                            }
                             /* Dragging starts when the press lands on
                              * the window's border/title-bar strip. */
-                            gui_win_t *hw = win_find(hit);
                             if (hw && s_ptr_y >= hw->y &&
                                 s_ptr_y < hw->y + GUI_BORDER + GUI_TITLE_H) {
                                 s_drag_id  = hit;
@@ -1103,6 +1212,8 @@ static void gui_input_main(void *arg) {
                         s_press_grab = hit; /* implicit grab for release */
                         ev_push(GUI_EV_BUTTON, 1, s_ptr_x, s_ptr_y, hit);
                     }
+                button_done:
+                    ;
                     if (released) {
                         s_drag_id = 0; /* end the drag */
                         /* Implicit pointer grab: the release is delivered

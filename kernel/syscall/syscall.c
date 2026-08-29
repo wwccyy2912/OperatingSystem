@@ -166,6 +166,20 @@ static i64 sys_cap_create(u64 type, u64 rights, u64 obj_id) {
     if (cap_type == CAP_TYPE_DAC_OVERRIDE)
         return (i64)ERR_DENIED;
 
+    /* Privileged device caps must not be self-mintable by arbitrary
+     * processes: a CAP_TYPE_PCI_DEV cap gates raw config-space access
+     * (SYS_PCI_CFG_READ/WRITE) and a CAP_TYPE_IO_PORT cap gates raw
+     * port I/O — both can rewrite device configs, poke the PIC/PIT or
+     * talk to the PCI config ports.  Every legit user today (net,
+     * keyboard, serial, fs_virtio_blk_driver) is a management-plane
+     * service holding ATOM_SERVICE_MANAGE, so gate creation on that
+     * atom.  A future non-service driver would receive its caps via
+     * the perm-engine grant path instead of self-minting. */
+    if ((cap_type == CAP_TYPE_PCI_DEV || cap_type == CAP_TYPE_IO_PORT) &&
+        cap_lookup_by_atom(proc->cap_table, proc->subject_id,
+                           ATOM_SERVICE_MANAGE, 0) == CAP_NULL)
+        return (i64)ERR_NOCAP;
+
     cap_t handle = cap_create_in_table(proc->cap_table, cap_type, (rights_t)rights, obj_id, 0);
     if (handle == CAP_NULL)
         return (i64)ERR_NOMEM;

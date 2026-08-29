@@ -467,6 +467,17 @@ static void shell_printf(const char *fmt, ...) {
         p++;
         if (*p == '\0')
             break;
+        /* Minimal flag/width support: %0Nd / %0Nx (zero-pad to N). */
+        int zero = 0;
+        int width = 0;
+        if (*p == '0') {
+            zero = 1;
+            p++;
+        }
+        while (*p >= '0' && *p <= '9') {
+            width = width * 10 + (*p - '0');
+            p++;
+        }
         switch (*p) {
         case '%':
             shell_putc('%');
@@ -477,14 +488,26 @@ static void shell_printf(const char *fmt, ...) {
         case 's':
             shell_write(va_arg(ap, const char *));
             break;
-        case 'd':
+        case 'd': {
             shell_itoa(va_arg(ap, int), num);
+            int n = (int)strlen(num);
+            while (zero && width > n) {
+                shell_putc('0');
+                width--;
+            }
             shell_write(num);
             break;
-        case 'x':
+        }
+        case 'x': {
             shell_utoa_hex(va_arg(ap, u32), num);
+            int n = (int)strlen(num);
+            while (zero && width > n) {
+                shell_putc('0');
+                width--;
+            }
             shell_write(num);
             break;
+        }
         default:
             shell_putc('%');
             shell_putc(*p);
@@ -597,19 +620,33 @@ static int shell_complete(char *buf, int *pos, int maxlen) {
         if (nm == 1) {
             int need = common + 1;
             if (tok_start + need < maxlen) {
-                for (int i = 0; i < common; i++)
-                    buf[tok_start + i] = matches[0][i];
-                buf[tok_start + common] = ' ';
-                *pos = tok_start + common + 1;
-                buf[*pos] = '\0';
+                int oldpos = *pos;
+                int tail   = (int)strlen(buf);
+                int shift  = (common - toklen) + 1; /* new token + space */
+                if (tail + shift < maxlen) {
+                    /* Preserve the text after the completed token
+                     * (mid-line completion must not truncate the line). */
+                    memmove(buf + oldpos + shift, buf + oldpos,
+                            (size_t)(tail - oldpos) + 1);
+                    for (int i = 0; i < common; i++)
+                        buf[tok_start + i] = matches[0][i];
+                    buf[tok_start + common] = ' ';
+                    *pos = tok_start + common + 1;
+                }
                 shell_redraw_line(buf, *pos);
                 return 1;
             }
         } else if (nm > 1 && common > toklen) {
-            for (int i = 0; i < common; i++)
-                buf[tok_start + i] = matches[0][i];
-            *pos = tok_start + common;
-            buf[*pos] = '\0';
+            int oldpos = *pos;
+            int tail   = (int)strlen(buf);
+            int shift  = common - toklen;
+            if (tail + shift < maxlen) {
+                memmove(buf + oldpos + shift, buf + oldpos,
+                        (size_t)(tail - oldpos) + 1);
+                for (int i = 0; i < common; i++)
+                    buf[tok_start + i] = matches[0][i];
+                *pos = tok_start + common;
+            }
             shell_redraw_line(buf, *pos);
             return 1;
         } else if (nm > 1) {
@@ -683,10 +720,16 @@ static int shell_complete(char *buf, int *pos, int maxlen) {
 
     if (nm == 1 || (nm > 1 && common > (int)strlen(frag))) {
         if (tok_start + common < maxlen) {
-            for (int i = 0; i < common; i++)
-                buf[tok_start + i] = matches[0][i];
-            *pos = tok_start + common;
-            buf[*pos] = '\0';
+            int oldpos = *pos;
+            int tail   = (int)strlen(buf);
+            int shift  = common - (int)strlen(frag);
+            if (tail + shift < maxlen) {
+                memmove(buf + oldpos + shift, buf + oldpos,
+                        (size_t)(tail - oldpos) + 1);
+                for (int i = 0; i < common; i++)
+                    buf[tok_start + i] = matches[0][i];
+                *pos = tok_start + common;
+            }
             shell_redraw_line(buf, *pos);
         }
         return 1;
@@ -2040,7 +2083,9 @@ static int cmd_net(int argc, char *argv[]) {
             return -1;
         }
         shell_write("net: ARP who-has 10.0.2.2 sent, waiting reply...\n");
-        /* Poll RECV for a reply (up to ~3s). */
+        /* Poll RECV for a reply (up to ~3s).  A frame only counts as
+         * the ARP reply when EtherType is ARP, opcode is REPLY and the
+         * sender IP is the slirp gateway — anything else is noise. */
         for (int i = 0; i < 300; i++) {
             memset(&req, 0, sizeof(req));
             req.op = 3; /* NET_OP_RECV */
@@ -2049,10 +2094,14 @@ static int cmd_net(int argc, char *argv[]) {
                 u8 *f = resp.data;
                 shell_printf("net: RX %d bytes dst %x:%x:%x:%x:%x:%x type %x%x\n",
                              resp.len, f[0], f[1], f[2], f[3], f[4], f[5], f[12], f[13]);
-                if (f[12] == 0x08 && f[13] == 0x06)
-                    shell_printf("net: ARP reply! op=%x%x sender=%x:%x:%x:%x:%x:%x\n",
-                                 f[20], f[21], f[22], f[23], f[24], f[25], f[26], f[27]);
-                return 0;
+                /* ARP reply: ethertype 0x0806, opcode 0x0002, sender
+                 * 10.0.2.2 (f[28..31] = spa in the ARP payload). */
+                if (f[12] == 0x08 && f[13] == 0x06 && f[20] == 0 && f[21] == 2 &&
+                    f[28] == 10 && f[29] == 0 && f[30] == 2 && f[31] == 2) {
+                    shell_printf("net: ARP reply! sender=%x:%x:%x:%x:%x:%x\n",
+                                 f[22], f[23], f[24], f[25], f[26], f[27]);
+                    return 0;
+                }
             }
             (void)sleep(1); /* 10 ms */
         }

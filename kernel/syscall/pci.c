@@ -231,9 +231,29 @@ static bool proc_has_pci_dev_cap(u64 obj_id) {
 }
 
 /*
+ * Management-plane gate: the caller must hold an ATOM_SERVICE_MANAGE
+ * atom cap (the same seed used by SYS_SHM_CREATE / SYS_SET_TIME).
+ * Raw PCI config access is a privileged operation — a self-minted
+ * CAP_TYPE_PCI_DEV cap must not be enough to rewrite BARs or disable
+ * bus mastering on arbitrary devices (the permission model routes
+ * sensitive syscalls through atom gates; see docs/permission_model.md).
+ */
+static bool proc_has_service_manage(void) {
+    process_t *proc = process_current();
+    if (!proc || !proc->cap_table)
+        return false;
+    return cap_lookup_by_atom(proc->cap_table, proc->subject_id,
+                              ATOM_SERVICE_MANAGE, 0) != CAP_NULL;
+}
+
+/*
  * SYS_PCI_CFG_READ: read a 32-bit dword from the config space of the
  * cached device at index `a1` at dword-aligned offset `a2`.
- *   ERR_NOCAP — caller holds no CAP_TYPE_PCI_DEV cap for this device
+ *   ERR_NOCAP — caller holds no CAP_TYPE_PCI_DEV cap for this device,
+ *               or lacks ATOM_SERVICE_MANAGE (management-plane gate:
+ *               raw config access can rewrite BARs / disable bus
+ *               mastering, so it must NOT be reachable via a
+ *               self-minted cap)
  *   ERR_INVAL — index out of range / unaligned or oversized offset
  */
 i64 sc_sys_pci_cfg_read(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
@@ -242,6 +262,8 @@ i64 sc_sys_pci_cfg_read(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     (void)a5;
 
     if (!proc_has_pci_dev_cap(a1))
+        return (i64)ERR_NOCAP;
+    if (!proc_has_service_manage())
         return (i64)ERR_NOCAP;
     if (a1 >= s_device_count)
         return (i64)ERR_INVAL;
@@ -255,13 +277,15 @@ i64 sc_sys_pci_cfg_read(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
 /*
  * SYS_PCI_CFG_WRITE: write a 32-bit dword to the config space of the
  * cached device at index `a1` at dword-aligned offset `a2`.
- * Same capability gate as the read variant.
+ * Same capability + management-plane gate as the read variant.
  */
 i64 sc_sys_pci_cfg_write(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     (void)a4;
     (void)a5;
 
     if (!proc_has_pci_dev_cap(a1))
+        return (i64)ERR_NOCAP;
+    if (!proc_has_service_manage())
         return (i64)ERR_NOCAP;
     if (a1 >= s_device_count)
         return (i64)ERR_INVAL;

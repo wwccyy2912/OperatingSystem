@@ -238,7 +238,10 @@ static int pcnet_start(void) {
     }
 
     csr_write(0, CSR0_STRT); /* start Rx + Tx */
-    csr_write(0, CSR0_INEA); /* enable interrupts */
+    /* NOTE: no INEA / IRQ binding — Rx is delivered by polling the
+     * ring (QEMU's pcnet INTx path is unreliable and a latched RINT
+     * storms the level-sensitive 8259).  The IRQ line stays masked by
+     * the kernel's boot-time PIC mask, so nothing asserts here. */
     return 0;
 }
 
@@ -256,6 +259,13 @@ static int net_send(const u8 *data, u32 len) {
             continue; /* still owned by the NIC */
         u8 *dst = s_pool_va + NET_OFF_TXBUF + i * NET_BUF_SIZE;
         memcpy(dst, data, len);
+        /* IEEE 802.3 minimum frame: pad short frames (e.g. a 42-byte
+         * ARP request) to 60 bytes, or real hardware/switches drop
+         * them as runts. */
+        if (len < 60) {
+            memset(dst + len, 0, 60 - len);
+            len = 60;
+        }
         t->addr   = (u32)(s_pool_phys + NET_OFF_TXBUF + i * NET_BUF_SIZE);
         t->len    = (u16)((4096 - len) | 0xF000); /* BCNT + ONES nibble */
         t->mcnt   = 0;
@@ -267,6 +277,13 @@ static int net_send(const u8 *data, u32 len) {
         while ((t->status & DESC_OWN) && spins < 1000000)
             spins++;
         if (spins >= 1000000) {
+            /* Timeout: the NIC never consumed the descriptor.  Reset
+             * the slot so it does not leak (an OWN=1 TMD would make the
+             * ring permanently short), then report the fault. */
+            t->status = 0;
+            t->len    = (u16)((4096 - NET_BUF_SIZE) | 0xF000);
+            t->mcnt   = 0;
+            s_stat_err++;
             if (s_lock >= 0)
                 (void)mutex_unlock(s_lock);
             return -7; /* ERR_FAULT: NIC never transmitted */
@@ -288,11 +305,23 @@ static void net_service_rx(void) {
         pcnet_desc_t *r = &s_rx_ring[i];
         if (r->status & DESC_OWN)
             continue; /* NIC still owns it: no packet yet */
-        u16 len = (u16)r->mcnt; /* QEMU stores the frame length here */
-        if (len == 0 || len > NET_MTU) {
+        /* Deliver only complete single-descriptor frames: STP+ENP set
+         * and no error bits (ERR|FRAM|OFLO|CRC|BUFF = 0x7C00).
+         * Anything else is a dropped/oversized frame — count + recycle. */
+        u16 st = r->status;
+        if ((st & (DESC_STP | DESC_ENP)) != (DESC_STP | DESC_ENP) ||
+            (st & 0x7C00)) {
+            s_stat_err++;
             r->status = DESC_OWN; /* recycle */
             continue;
         }
+        u32 mcnt = r->mcnt; /* u32: check before truncating */
+        if (mcnt == 0 || mcnt > NET_MTU) {
+            s_stat_err++;
+            r->status = DESC_OWN; /* recycle */
+            continue;
+        }
+        u16 len = (u16)mcnt;
         const u8 *src = s_pool_va + NET_OFF_RXBUF + i * NET_BUF_SIZE;
         if (s_lock >= 0)
             (void)mutex_lock(s_lock);
@@ -346,7 +375,11 @@ static void net_server_loop(int port) {
             resp->len = 6;
             break;
         case NET_OP_SEND:
-            if (req->len > 0 && req->len <= NET_MTU) {
+            /* Reject a length that exceeds the actual message payload:
+             * the request's data[] is bounded by msg_len - 8, and a
+             * lying len would make net_send copy stale bytes. */
+            if (req->len > 0 && req->len <= NET_MTU &&
+                req->len <= (u32)(msg_len - 8)) {
                 resp->ret = net_send(req->data, req->len);
                 resp->len = 0;
             }

@@ -151,8 +151,6 @@ int tui_region_save(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t *cel
  */
 int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *cells);
 
-#endif /* LIBTUI_TUI_H */
-
 /* ====================================================================
  * Interactive components (v1.1): input line, password line, confirm box.
  * These read the keyboard service directly (READ_BLOCK).  They are
@@ -178,3 +176,5 @@ int tui_confirm(int x, int y, int w, const char *title, const char *msg,
  * items[] must stay valid for the call; count > 0. */
 int tui_menu(int x, int y, int w, int h, const char *title,
              const char *const *items, int count, int *scroll_out);
+
+#endif /* LIBTUI_TUI_H */

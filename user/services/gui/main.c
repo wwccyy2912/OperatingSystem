@@ -118,11 +118,13 @@ typedef struct {
 static gui_rect_t s_dirty;
 static int        s_dirty_valid;
 
-static void gui_dirty_add(int x, int y, int w, int h) {
-    if (s_lock >= 0)
-        (void)mutex_lock(s_lock);
+/* Lock-free variant: the caller already holds s_lock (used by the
+ * pointer-input thread while dragging — the kernel mutex is NOT
+ * recursive, so calling gui_dirty_add() there would release the lock
+ * it is still holding). */
+static void gui_dirty_add_nolock(int x, int y, int w, int h) {
     if (w <= 0 || h <= 0)
-        goto out;
+        return;
     if (x < 0) {
         w += x;
         x = 0;
@@ -132,7 +134,7 @@ static void gui_dirty_add(int x, int y, int w, int h) {
         y = 0;
     }
     if (x >= (int)s_fb.w || y >= (int)s_fb.h || w <= 0 || h <= 0)
-        goto out;
+        return;
     if (x + w > (int)s_fb.w)
         w = (int)s_fb.w - x;
     if (y + h > (int)s_fb.h)
@@ -143,7 +145,7 @@ static void gui_dirty_add(int x, int y, int w, int h) {
         s_dirty.w = w;
         s_dirty.h = h;
         s_dirty_valid = 1;
-        goto out;
+        return;
     }
     /* Union into the pending rect. */
     {
@@ -160,7 +162,12 @@ static void gui_dirty_add(int x, int y, int w, int h) {
         s_dirty.w = x1 - s_dirty.x;
         s_dirty.h = y1 - s_dirty.y;
     }
-out:
+}
+
+static void gui_dirty_add(int x, int y, int w, int h) {
+    if (s_lock >= 0)
+        (void)mutex_lock(s_lock);
+    gui_dirty_add_nolock(x, y, w, h);
     if (s_lock >= 0)
         (void)mutex_unlock(s_lock);
 }
@@ -630,7 +637,15 @@ static void do_text(int token, int msg_len, u64 caller) {
     }
     gui_req_t      *req = (gui_req_t *)s_req;
     gui_req_text_t *t   = (gui_req_text_t *)req->data;
-    t->text[sizeof(t->text) - 1] = '\0';
+    /* Text length is implicit: whatever the sender actually put in the
+     * message.  Never strlen() past the received bytes — s_req is a
+     * static buffer that retains the previous request's tail. */
+    int text_len = msg_len - (int)(8 + offsetof(gui_req_text_t, text));
+    if (text_len < 0)
+        text_len = 0;
+    if (text_len > (int)sizeof(t->text) - 1)
+        text_len = (int)sizeof(t->text) - 1;
+    t->text[text_len] = '\0';
 
     if (s_lock >= 0)
         (void)mutex_lock(s_lock);
@@ -647,7 +662,7 @@ static void do_text(int token, int msg_len, u64 caller) {
 
     resp->ret = 0;
     gui_dirty_add(w->x + GUI_BORDER + t->x, w->y + GUI_BORDER + GUI_TITLE_H + t->y,
-                  (int)strlen(t->text) * 8, 16);
+                  text_len * 8, 16);
     gui_composite();
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
@@ -790,17 +805,25 @@ static void gui_server_loop(int port) {
 /* ------------------------------------------------------------------ */
 
 /* Topmost window under (px, py), or 0. */
+/* Hit-test in the SAME order the compositor paints: the focused
+ * window is drawn last (top), everything else in slot order with
+ * later slots on top.  A pointer click must route to the window the
+ * user actually sees at that pixel. */
 static int hit_test(i32 px, i32 py) {
-    int best = 0;
-    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+    gui_win_t *f = win_find(s_focus_id);
+    if (f && f->in_use &&
+        px >= f->x && px < f->x + f->w + 2 * GUI_BORDER &&
+        py >= f->y && py < f->y + f->h + 2 * GUI_BORDER + GUI_TITLE_H)
+        return f->id;
+    for (int i = GUI_MAX_WINDOWS - 1; i >= 0; i--) {
         gui_win_t *w = &s_wins[i];
-        if (!w->in_use)
+        if (!w->in_use || w->id == s_focus_id)
             continue;
         if (px >= w->x && px < w->x + w->w + 2 * GUI_BORDER &&
             py >= w->y && py < w->y + w->h + 2 * GUI_BORDER + GUI_TITLE_H)
-            best = w->id;
+            return w->id;
     }
-    return best;
+    return 0;
 }
 
 static void gui_input_main(void *arg) {
@@ -876,16 +899,18 @@ static void gui_input_main(void *arg) {
                             if (ny < 0)
                                 ny = 0;
                             if (nx != dw->x || ny != dw->y) {
-                                gui_dirty_add(dw->x, dw->y,
-                                              dw->w + 2 * GUI_BORDER,
-                                              dw->h + 2 * GUI_BORDER +
-                                                  GUI_TITLE_H);
+                                /* Caller (input thread) already holds
+                                 * s_lock: use the nolock dirty add. */
+                                gui_dirty_add_nolock(dw->x, dw->y,
+                                                     dw->w + 2 * GUI_BORDER,
+                                                     dw->h + 2 * GUI_BORDER +
+                                                         GUI_TITLE_H);
                                 dw->x = nx;
                                 dw->y = ny;
-                                gui_dirty_add(dw->x, dw->y,
-                                              dw->w + 2 * GUI_BORDER,
-                                              dw->h + 2 * GUI_BORDER +
-                                                  GUI_TITLE_H);
+                                gui_dirty_add_nolock(dw->x, dw->y,
+                                                     dw->w + 2 * GUI_BORDER,
+                                                     dw->h + 2 * GUI_BORDER +
+                                                         GUI_TITLE_H);
                             }
                         }
                     }
@@ -928,10 +953,10 @@ static void gui_input_main(void *arg) {
                                     fh = old->h + 2 * GUI_BORDER + GUI_TITLE_H;
                                 }
                                 if (neu) {
-                                    gui_dirty_add(neu->x, neu->y,
-                                                  neu->w + 2 * GUI_BORDER,
-                                                  neu->h + 2 * GUI_BORDER +
-                                                      GUI_TITLE_H);
+                                    gui_dirty_add_nolock(neu->x, neu->y,
+                                                         neu->w + 2 * GUI_BORDER,
+                                                         neu->h + 2 * GUI_BORDER +
+                                                             GUI_TITLE_H);
                                 }
                                 focus_changed = 1;
                                 s_focus_id    = hit;

@@ -22,6 +22,7 @@ static int s_tui_port = -2; /* -2 = not yet resolved, -1 = failed, >=0 = port */
 /* Request/response buffers */
 static u8 s_req[4096];
 static u8 s_resp[4096];
+static int s_resp_len; /* actual reply bytes from the last tui_call */
 
 /* ====================================================================
  * Internal: port resolution and IPC call
@@ -52,6 +53,7 @@ static int tui_call(u32 op, const void *payload, u32 payload_len) {
     int ret      = ipc_call(port, s_req, 8 + payload_len, s_resp, &resp_len);
     if (ret < 0)
         return ret;
+    s_resp_len = resp_len;
 
     /* Response is at least 4 bytes (ret field) */
     if (resp_len < 4)
@@ -173,8 +175,10 @@ int tui_get_cursor(uint32_t *x, uint32_t *y) {
     int ret = tui_call(TUI_OP_GET_CURSOR, NULL, 0);
     if (ret < 0)
         return ret;
-
-    /* Response contains cursor position in the first 8 bytes after ret */
+    /* Response: ret + x + y (12 bytes).  Guard against a truncated
+     * reply so we never read stale bytes. */
+    if (s_resp_len < 12)
+        return -1;
     if (x)
         *x = ((u32 *)s_resp)[1];
     if (y)
@@ -224,15 +228,15 @@ int tui_printf(const char *fmt, ...) {
         case 'd': {
             int  val = va_arg(ap, int);
             char tmp[12];
+            /* INT_MIN-safe: negate in the unsigned domain. */
+            u32 uv = (val < 0) ? (u32)0 - (u32)val : (u32)val;
             int  neg = (val < 0);
-            if (neg)
-                val = -val;
-            int i = 0;
-            if (val == 0)
+            int  i = 0;
+            if (uv == 0)
                 tmp[i++] = '0';
-            while (val > 0) {
-                tmp[i++] = (char)('0' + (val % 10));
-                val /= 10;
+            while (uv > 0) {
+                tmp[i++] = (char)('0' + (uv % 10));
+                uv /= 10;
             }
             if (neg && len < (int)sizeof(buf) - 1)
                 buf[len++] = '-';

@@ -186,15 +186,18 @@ static kbd_park_t s_park[KBD_PARK_MAX] = {
  * pending flag; i32/u8 word writes are atomic enough here). */
 static volatile i32 s_mouse_dx;      /* accumulated X delta since last read */
 static volatile i32 s_mouse_dy;      /* accumulated Y delta since last read */
+static volatile i32 s_mouse_wheel;   /* accumulated wheel delta */
 static volatile u8  s_mouse_buttons; /* current button state */
 static volatile u8  s_mouse_pending; /* 1 = unread mouse data exists */
 
 /* Mouse packet assembler — IRQ thread only.  Standard 3-byte packet:
  *   byte0: yovf xovf ysig xsig mid right left (bit3 always 1)
  *   byte1: X delta (low 8 bits; bit4 of byte0 is the sign)
- *   byte2: Y delta (low 8 bits; bit5 of byte0 is the sign) */
-static u8 s_mouse_phase; /* 0..2 */
-static u8 s_mouse_pkt[3];
+ *   byte2: Y delta (low 8 bits; bit5 of byte0 is the sign)
+ * In IntelliMouse mode a 4th byte carries the wheel delta. */
+static u8 s_mouse_phase; /* 0..2 (3) */
+static u8 s_mouse_pkt[4];
+static u8 s_mouse_4byte; /* IntelliMouse 4-byte mode enabled */
 
 /* Scancode decode state — touched ONLY by the IRQ thread */
 static u8 s_extended; /* last byte was the 0xE0 prefix */
@@ -431,10 +434,12 @@ static void kbd_decode_byte(u8 sc) {
  * Reads status port 0x64; while bit 0 (output buffer full) is set,
  * read one byte from data port 0x60 and decode it.  Never blocks.
  */
-/* Assemble one 3-byte PS/2 mouse packet from the byte stream. */
+/* Assemble PS/2 mouse packets.  Standard mode is 3 bytes; after the
+ * IntelliMouse enable sequence (200/100/80 sample-rate trick) packets
+ * are 4 bytes with byte 3 = wheel delta (signed). */
 static void mouse_parse(u8 b) {
     s_mouse_pkt[s_mouse_phase++] = b;
-    if (s_mouse_phase < 3)
+    if (s_mouse_phase < (s_mouse_4byte ? 4u : 3u))
         return;
     s_mouse_phase = 0;
 
@@ -451,6 +456,8 @@ static void mouse_parse(u8 b) {
     s_mouse_dx += dx;
     s_mouse_dy += dy;
     s_mouse_buttons = flags & 0x07;
+    if (s_mouse_4byte)
+        s_mouse_wheel += (i32)(signed char)s_mouse_pkt[3];
     s_mouse_pending = 1;
 }
 
@@ -552,16 +559,18 @@ static void kbd_handle_request(int token, u64 caller_subject) {
         kbd_reply(token, 0, NULL, 0);
     } else if (req->op == KBD_OP_MOUSE_READ) {
         /* Non-blocking mouse poll: drain the accumulated deltas and
-         * report { dx, dy, buttons } (3 x i32).  An idle mouse yields
-         * all zeros — the caller treats that as "no movement". */
-        static i32 m[3];
+         * report { dx, dy, buttons, wheel } (4 x i32).  An idle mouse
+         * yields all zeros — the caller treats that as "no movement". */
+        static i32 m[4];
         m[0] = (i32)s_mouse_dx;
         m[1] = (i32)s_mouse_dy;
         m[2] = (i32)s_mouse_buttons;
+        m[3] = (i32)s_mouse_wheel;
         s_mouse_dx = 0;
         s_mouse_dy = 0;
+        s_mouse_wheel = 0;
         s_mouse_pending = 0;
-        kbd_reply(token, 12, (const u8 *)m, 12);
+        kbd_reply(token, 16, (const u8 *)m, 16);
     } else if (req->op == KBD_OP_RELEASE_FOCUS) {
         /* Only the focus holder may release (the kernel-filled caller
          * subject is never 0, so focus free also means no holder). */
@@ -660,6 +669,25 @@ static void mouse_init(void) {
     mouse_wait_input_ready();
     io_write8(KBD_DATA_PORT, 0xF6);
     (void)mouse_wait_output(); /* ACK 0xFA */
+
+    /* IntelliMouse wheel enable: sample rates 200 -> 100 -> 80 switch
+     * the device to 4-byte packets (0xF3 sets the rate). */
+    {
+        static const u8 rates[3] = {200, 100, 80};
+        for (int r = 0; r < 3; r++) {
+            mouse_wait_input_ready();
+            io_write8(KBD_STATUS_PORT, 0xD4);
+            mouse_wait_input_ready();
+            io_write8(KBD_DATA_PORT, 0xF3);
+            (void)mouse_wait_output(); /* ACK */
+            mouse_wait_input_ready();
+            io_write8(KBD_STATUS_PORT, 0xD4);
+            mouse_wait_input_ready();
+            io_write8(KBD_DATA_PORT, rates[r]);
+            (void)mouse_wait_output(); /* ACK */
+        }
+        s_mouse_4byte = 1;
+    }
 
     mouse_wait_input_ready();
     io_write8(KBD_STATUS_PORT, 0xD4);

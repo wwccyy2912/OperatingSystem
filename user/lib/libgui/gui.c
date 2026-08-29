@@ -147,34 +147,131 @@ void gui_rect(gui_canvas_t *c, int x, int y, int w, int h, u32 color) {
     gui_vline(c, x + w - 1, y, h, color);
 }
 
-/* ---- Text (8x16 VGA font, 95 printable ASCII glyphs) ---- */
+/* ---- Text (8x16 VGA font + 16x16 CJK font, UTF-8) ---- */
 
 #include "font.h"
+#include "../../lib/font_cjk.h"
+
+/* Render one code point at *px (advanced by the glyph width). */
+static void gui_text_codepoint(gui_canvas_t *c, int *pxp, int y, u32 cp,
+                               u32 fg, u32 bg) {
+    int px = *pxp;
+    if (cp > 0x7F) {
+        const u8 *glyph = font_cjk_lookup(cp);
+        if (glyph) {
+            /* Double-width: 16x16 glyph, background both halves. */
+            for (int row = 0; row < 16; row++) {
+                u8 hi = glyph[row * 2];
+                u8 lo = glyph[row * 2 + 1];
+                for (int col = 0; col < 8; col++) {
+                    if (hi & (0x80 >> col))
+                        gui_pixel(c, px + col, y + row, fg);
+                    else if (bg != 0)
+                        gui_pixel(c, px + col, y + row, bg);
+                }
+                for (int col = 0; col < 8; col++) {
+                    if (lo & (0x80 >> col))
+                        gui_pixel(c, px + 8 + col, y + row, fg);
+                    else if (bg != 0)
+                        gui_pixel(c, px + 8 + col, y + row, bg);
+                }
+            }
+            *pxp = px + 16;
+            return;
+        }
+        cp = '?'; /* fall back to a visible placeholder */
+    }
+    if (cp < 0x20 || cp > 0x7E) {
+        *pxp = px + 8;
+        return;
+    }
+    const u8 *glyph = gui_font[cp - 0x20];
+    for (int row = 0; row < 16; row++) {
+        u8 bits = glyph[row];
+        for (int col = 0; col < 8; col++) {
+            if (bits & (0x80 >> col)) {
+                gui_pixel(c, px + col, y + row, fg);
+            } else if (bg != 0) {
+                gui_pixel(c, px + col, y + row, bg);
+            }
+        }
+    }
+    *pxp = px + 8;
+}
 
 void gui_text(gui_canvas_t *c, int x, int y, const char *s, u32 fg, u32 bg) {
     if (!c || !c->buf || !s)
         return;
 
+    /* Incremental UTF-8 decoder. */
+    u32 cp = 0;
+    int  left = 0;
+
     int px = x;
     for (const char *p = s; *p; p++) {
         unsigned char ch = (unsigned char)*p;
-        if (ch < 0x20 || ch > 0x7E) {
-            px += 8; /* unsupported glyph: advance */
+        if (left > 0) {
+            if ((ch & 0xC0) == 0x80) {
+                cp = (cp << 6) | (ch & 0x3F);
+                if (--left == 0)
+                    gui_text_codepoint(c, &px, y, cp, fg, bg);
+            } else {
+                left = 0; /* malformed: drop */
+            }
             continue;
         }
-        const u8 *glyph = gui_font[ch - 0x20];
-        for (int row = 0; row < 16; row++) {
-            u8 bits = glyph[row];
-            for (int col = 0; col < 8; col++) {
-                if (bits & (0x80 >> col)) {
-                    gui_pixel(c, px + col, y + row, fg);
-                } else if (bg != 0) {
-                    gui_pixel(c, px + col, y + row, bg);
-                }
-            }
+        if (ch >= 0xC2 && ch <= 0xDF) {
+            cp = ch & 0x1F;
+            left = 1;
+        } else if (ch >= 0xE0 && ch <= 0xEF) {
+            cp = ch & 0x0F;
+            left = 2;
+        } else if (ch >= 0xF0 && ch <= 0xF4) {
+            cp = ch & 0x07;
+            left = 3;
+        } else if (ch < 0x80) {
+            gui_text_codepoint(c, &px, y, ch, fg, bg);
+        } else {
+            gui_text_codepoint(c, &px, y, '?', fg, bg);
         }
-        px += 8;
     }
+}
+
+/* Pixel width of a UTF-8 string (ASCII 8px, CJK 16px). */
+int gui_text_width(const char *s) {
+    if (!s)
+        return 0;
+    int  w = 0;
+    u32  cp = 0;
+    int  left = 0;
+    for (const char *p = s; *p; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (left > 0) {
+            if ((ch & 0xC0) == 0x80) {
+                cp = (cp << 6) | (ch & 0x3F);
+                if (--left == 0)
+                    w += (cp > 0x7F) ? 16 : 8;
+            } else {
+                left = 0;
+            }
+            continue;
+        }
+        if (ch >= 0xC2 && ch <= 0xDF) {
+            cp = ch & 0x1F;
+            left = 1;
+        } else if (ch >= 0xE0 && ch <= 0xEF) {
+            cp = ch & 0x0F;
+            left = 2;
+        } else if (ch >= 0xF0 && ch <= 0xF4) {
+            cp = ch & 0x07;
+            left = 3;
+        } else if (ch >= 0x20 && ch < 0x7F) {
+            w += 8;
+        } else if (ch >= 0x80) {
+            w += 8; /* stray byte placeholder */
+        }
+    }
+    return w;
 }
 
 /* ---- Blit (same-bpp region copy) ---- */

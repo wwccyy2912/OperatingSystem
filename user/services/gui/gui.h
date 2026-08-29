@@ -43,6 +43,7 @@ enum {
     GUI_OP_POINTER = 8, /* -> {x; y; buttons}                        */
     GUI_OP_ACTIVATE = 9,   /* compositor on: take focus, draw        */
     GUI_OP_DEACTIVATE = 10, /* compositor off: restore term screen   */
+    GUI_OP_RESIZE = 11,   /* {id; w; h} — resize a window           */
 };
 
 /* ---- request payloads (data area of gui_req_t) ---- */
@@ -81,6 +82,12 @@ typedef struct {
     char text[256];
 } gui_req_text_t;
 
+typedef struct {
+    i32 id;
+    i32 w;
+    i32 h;
+} gui_req_resize_t;
+
 /* ---- events (drained by GUI_OP_POLL) ---- */
 
 #define GUI_EV_KEY       1 /* code = scancode-derived char/control;
@@ -90,6 +97,8 @@ typedef struct {
                             * win  = window under the pointer (0 = none) */
 #define GUI_EV_BUTTON    3 /* code = 1 left, 2 right, 3 middle; x,y;
                             * win  = window under the pointer (0 = none) */
+#define GUI_EV_WHEEL     4 /* code = wheel delta (signed); x,y;
+                            * win  = window under the pointer */
 
 typedef struct {
     u32 type;

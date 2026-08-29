@@ -56,9 +56,12 @@ void gui_vline(gui_canvas_t *c, int x, int y, int len, u32 color);
 /* Outlined rectangle (1px border). */
 void gui_rect(gui_canvas_t *c, int x, int y, int w, int h, u32 color);
 
-/* Render an ASCII string with the 8x16 VGA font.  bg may be 0 to skip
- * background pixels (transparent text for title bars). */
+/* Render a UTF-8 string (8x16 VGA font + 16x16 CJK font).  bg may be
+ * 0 to skip background pixels (transparent text for title bars). */
 void gui_text(gui_canvas_t *c, int x, int y, const char *s, u32 fg, u32 bg);
+
+/* Pixel width of a UTF-8 string (8px per ASCII char, 16px per CJK). */
+int gui_text_width(const char *s);
 
 /* Copy a w*h region from src at (sx, sy) to dst at (dx, dy).  Source
  * and destination may overlap only when they are the same buffer;

@@ -72,6 +72,8 @@ static u8  s_ptr_buttons;
  * dragged, pointer motion moves the window instead of the hit test;
  * releasing the button ends the drag. */
 static int s_drag_id;    /* window being dragged (0 = none) */
+static int s_press_grab; /* window that received the last button press
+                          * (implicit pointer grab; 0 = none) */
 static int s_drag_offx;  /* pointer offset within the window border */
 static int s_drag_offy;
 
@@ -537,14 +539,111 @@ static void do_move(int token, int msg_len, u64 caller) {
     int ox = w->x, oy = w->y;
     int ow = w->w + 2 * GUI_BORDER;
     int oh = w->h + 2 * GUI_BORDER + GUI_TITLE_H;
-    w->x = a[1];
-    w->y = a[2];
+    /* Clamp so the window can never be pushed fully off-screen (a
+     * lost window cannot be clicked back). */
+    int nx = a[1], ny = a[2];
+    int maxx = (int)s_fb.w - ow;
+    int maxy = (int)s_fb.h - oh;
+    if (nx < 0)
+        nx = 0;
+    if (ny < 0)
+        ny = 0;
+    if (nx > maxx)
+        nx = maxx;
+    if (ny > maxy)
+        ny = maxy;
+    w->x = nx;
+    w->y = ny;
     if (s_lock >= 0)
         (void)mutex_unlock(s_lock);
 
     resp->ret = 0;
     gui_dirty_add(ox, oy, ow, oh); /* old spot */
     gui_dirty_add(w->x, w->y, ow, oh); /* new spot */
+    gui_composite();
+    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+}
+
+/* RESIZE: {id; w; h} — reallocate the content buffer and clamp the
+ * window inside the screen.  Only the owner may resize. */
+static void do_resize(int token, int msg_len, u64 caller) {
+    gui_resp_t *resp = (gui_resp_t *)s_resp;
+    resp->ret        = -4;
+    if (msg_len < (int)(8 + 12)) {
+        (void)ipc_reply(token, resp, (int)sizeof(*resp));
+        return;
+    }
+    gui_req_t        *req = (gui_req_t *)s_req;
+    gui_req_resize_t *r   = (gui_req_resize_t *)req->data;
+    if (r->w < 16 || r->h < 16 || r->w > (i32)s_fb.w - 2 * GUI_BORDER ||
+        r->h > (i32)s_fb.h - 2 * GUI_BORDER - GUI_TITLE_H) {
+        (void)ipc_reply(token, resp, (int)sizeof(*resp));
+        return;
+    }
+
+    if (s_lock >= 0)
+        (void)mutex_lock(s_lock);
+    gui_win_t *w = win_find(r->id);
+    if (!w || (w->owner != 0 && w->owner != caller)) {
+        if (s_lock >= 0)
+            (void)mutex_unlock(s_lock);
+        (void)ipc_reply(token, resp, (int)sizeof(*resp));
+        return;
+    }
+    int ox = w->x, oy = w->y;
+    int ow = w->w + 2 * GUI_BORDER;
+    int oh = w->h + 2 * GUI_BORDER + GUI_TITLE_H;
+
+    /* Allocate the new buffer before touching state. */
+    size_t bytes = (size_t)r->w * r->h * 4;
+    u8    *nbuf  = (u8 *)malloc(bytes);
+    if (!nbuf) {
+        if (s_lock >= 0)
+            (void)mutex_unlock(s_lock);
+        resp->ret = -1;
+        (void)ipc_reply(token, resp, (int)sizeof(*resp));
+        return;
+    }
+    /* Copy the overlapping top-left of the old content. */
+    memset(nbuf, 0, bytes);
+    gui_canvas_t oc = w->buf;
+    int copyw = (r->w < w->w) ? r->w : w->w;
+    int copyh = (r->h < w->h) ? r->h : w->h;
+    for (int yy = 0; yy < copyh; yy++)
+        for (int xx = 0; xx < copyw; xx++) {
+            u32 v = 0;
+            if (oc.buf)
+                v = ((u32 *)oc.buf)[yy * w->w + xx];
+            ((u32 *)nbuf)[yy * r->w + xx] = v;
+        }
+    if (w->buf.buf)
+        free((void *)w->buf.buf);
+    w->buf.buf   = nbuf;
+    w->buf.w     = (u32)r->w;
+    w->buf.h     = (u32)r->h;
+    w->buf.pitch = (u32)r->w * 4;
+    w->buf.bpp   = 32;
+    w->w         = r->w;
+    w->h         = r->h;
+
+    /* Clamp the window back inside the screen. */
+    int maxx = (int)s_fb.w - (w->w + 2 * GUI_BORDER);
+    int maxy = (int)s_fb.h - (w->h + 2 * GUI_BORDER + GUI_TITLE_H);
+    if (w->x > maxx)
+        w->x = maxx;
+    if (w->y > maxy)
+        w->y = maxy;
+    if (w->x < 0)
+        w->x = 0;
+    if (w->y < 0)
+        w->y = 0;
+    if (s_lock >= 0)
+        (void)mutex_unlock(s_lock);
+
+    resp->ret = 0;
+    gui_dirty_add(ox, oy, ow, oh); /* old spot */
+    gui_dirty_add(w->x, w->y, w->w + 2 * GUI_BORDER,
+                  w->h + 2 * GUI_BORDER + GUI_TITLE_H);
     gui_composite();
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
@@ -662,7 +761,7 @@ static void do_text(int token, int msg_len, u64 caller) {
 
     resp->ret = 0;
     gui_dirty_add(w->x + GUI_BORDER + t->x, w->y + GUI_BORDER + GUI_TITLE_H + t->y,
-                  text_len * 8, 16);
+                  gui_text_width(t->text), 16);
     gui_composite();
     (void)ipc_reply(token, resp, (int)sizeof(*resp));
 }
@@ -790,6 +889,7 @@ static void gui_server_loop(int port) {
         case GUI_OP_POINTER:   do_pointer(token); break;
         case GUI_OP_ACTIVATE:  do_activate(token, caller); break;
         case GUI_OP_DEACTIVATE: do_deactivate(token); break;
+        case GUI_OP_RESIZE:    do_resize(token, msg_len, caller); break;
         default: {
             gui_resp_t *resp = (gui_resp_t *)s_resp;
             resp->ret        = -2;
@@ -856,15 +956,22 @@ static void gui_input_main(void *arg) {
             }
         }
 
-        /* Mouse: accumulated deltas + buttons. */
+        /* Mouse: accumulated deltas + buttons + wheel. */
         if (s_kbd_port >= 0) {
-            u32 req[2] = {KBD_OP_MOUSE_READ, 12};
-            u8  resp[4 + 12];
+            u32 req[2] = {KBD_OP_MOUSE_READ, 16};
+            u8  resp[4 + 16];
             int rl = (int)sizeof(resp);
-            if (ipc_call(s_kbd_port, req, 8, resp, &rl) == 0 && rl >= 4 + 12) {
+            if (ipc_call(s_kbd_port, req, 8, resp, &rl) == 0 && rl >= 4 + 16) {
                 i32 dx = ((i32 *)(resp + 4))[0];
                 i32 dy = ((i32 *)(resp + 4))[1];
                 u8  bt = (u8)((i32 *)(resp + 4))[2];
+                i32 wh = ((i32 *)(resp + 4))[3];
+                if (wh != 0) {
+                    /* Wheel: deliver to the window under the pointer. */
+                    ev_push(GUI_EV_WHEEL, (u32)wh, s_ptr_x, s_ptr_y,
+                            hit_test(s_ptr_x, s_ptr_y));
+                    changed = 1;
+                }
                 if (dx != 0 || dy != 0) {
                     int ox, oy;
                     if (s_lock >= 0)
@@ -964,11 +1071,19 @@ static void gui_input_main(void *arg) {
                                 s_focus_id = hit;
                             }
                         }
+                        s_press_grab = hit; /* implicit grab for release */
                         ev_push(GUI_EV_BUTTON, 1, s_ptr_x, s_ptr_y, hit);
                     }
                     if (released) {
                         s_drag_id = 0; /* end the drag */
-                        ev_push(GUI_EV_BUTTON, 0, s_ptr_x, s_ptr_y, hit_test(s_ptr_x, s_ptr_y));
+                        /* Implicit pointer grab: the release is delivered
+                         * to the window that received the press, not the
+                         * window under the pointer now (a drag that ends
+                         * over a neighbour must not click the neighbour). */
+                        int rel_win = s_press_grab ? s_press_grab
+                                                   : hit_test(s_ptr_x, s_ptr_y);
+                        s_press_grab = 0;
+                        ev_push(GUI_EV_BUTTON, 0, s_ptr_x, s_ptr_y, rel_win);
                     }
                     if (s_lock >= 0)
                         (void)mutex_unlock(s_lock);

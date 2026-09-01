@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * elf_boot.c - BOOTSTRAP-ONLY ELF loader for the embedded init blob
  * Copyright (c) 2026 OpSys Project
  *
@@ -13,9 +26,21 @@
  * are spawned via SYS_PROCESS_CREATE with pre-parsed descriptors
  * (kernel/syscall/process_desc.c + kernel/proc_image.h).  The former
  * general-purpose kernel/mm/elf.c was deleted; do NOT grow this file
- * back into a general loader.
+ * back into a general loader. *
+ * ------------------------------------------------------------------
+ * Structure (elf_boot):
+ *   ELF header/program headers -> ElfBootLoad(): for each PT_LOAD,
+ *   copy bytes to the target vaddr and set page permissions.
+ * How it works:
+ *   Validates the ELF magic/class, maps segments via VmmMapRange and
+ *   copies from the blob with copy_string/page-safe helpers.
+ * Purpose:
+ *   Load init and user service ELF images into fresh address spaces.
+ * Caveats:
+ *   Only simple ELF64 static images are supported (no relocations,
+ *   no interpreter); entry must be page-aligned-mapped.
+ * ------------------------------------------------------------------
  */
-
 #include <kernel/elf_boot.h>
 #include <kernel/serial.h>
 #include <kernel/string.h>
@@ -28,52 +53,52 @@
  * and zeroes the BSS tail — the same vmm/direct-map mechanics the
  * general elf.c used, trimmed to the boot path's needs.
  */
-int elf_boot_load(addr_space_t *as, const void *elf_data, u64 elf_size, u64 *entry_out) {
+int ElfBootLoad(addr_space_t *as, const void *elf_data, u64 elf_size, u64 *entry_out) {
     const u8         *data = (const u8 *)elf_data;
     const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)data;
 
     /* ---- Blob must at least hold the ELF header ---- */
     if (elf_size < sizeof(Elf64_Ehdr)) {
-        serial_puts("  ELF: Truncated header\n");
+        SerialPuts("  ELF: Truncated header\n");
         return ERR_INVAL;
     }
 
     /* ---- Validate magic, class (64-bit) and encoding (LE) ---- */
     if (ehdr->e_ident[0] != ELFMAG0 || ehdr->e_ident[1] != ELFMAG1 || ehdr->e_ident[2] != ELFMAG2 ||
         ehdr->e_ident[3] != ELFMAG3) {
-        serial_puts("  ELF: Bad magic\n");
+        SerialPuts("  ELF: Bad magic\n");
         return ERR_INVAL;
     }
     if (ehdr->e_ident[4] != ELFCLASS64 || ehdr->e_ident[5] != ELFDATA2LSB) {
-        serial_puts("  ELF: Not ELFCLASS64/little-endian\n");
+        SerialPuts("  ELF: Not ELFCLASS64/little-endian\n");
         return ERR_INVAL;
     }
 
     /* ---- Entry point must live in the user address space ---- */
     u64 entry = ehdr->e_entry;
     if (entry == 0 || entry >= USER_PTR_MAX) {
-        serial_puts("  ELF: Bad entry point\n");
+        SerialPuts("  ELF: Bad entry point\n");
         return ERR_INVAL;
     }
 
     /* ---- Bounds-check the program header table ---- */
     if (ehdr->e_phnum == 0) {
-        serial_puts("  ELF: No program headers\n");
+        SerialPuts("  ELF: No program headers\n");
         return ERR_INVAL;
     }
     if (ehdr->e_phentsize < sizeof(Elf64_Phdr)) {
-        serial_puts("  ELF: phentsize too small\n");
+        SerialPuts("  ELF: phentsize too small\n");
         return ERR_INVAL;
     }
     /* The loader strides phdrs by sizeof(Elf64_Phdr); the whole table
      * it will read must lie within the blob. */
     u64 phdr_bytes = (u64)ehdr->e_phnum * (u64)sizeof(Elf64_Phdr);
     if (ehdr->e_phoff > elf_size || phdr_bytes > elf_size - ehdr->e_phoff) {
-        serial_puts("  ELF: Program header table out of bounds\n");
+        SerialPuts("  ELF: Program header table out of bounds\n");
         return ERR_INVAL;
     }
 
-    serial_printf("  ELF: entry=0x%x, phnum=%d\n", (u32)entry, ehdr->e_phnum);
+    SerialPrintf("  ELF: entry=0x%x, phnum=%d\n", (u32)entry, ehdr->e_phnum);
 
     /* ---- Iterate program headers (PT_LOAD only) ---- */
     const Elf64_Phdr *phdr = (const Elf64_Phdr *)(data + ehdr->e_phoff);
@@ -89,21 +114,21 @@ int elf_boot_load(addr_space_t *as, const void *elf_data, u64 elf_size, u64 *ent
 
         /* ---- Bounds-check the segment itself ---- */
         if (filesz > elf_size || offset > elf_size - filesz) {
-            serial_printf("  ELF: PT_LOAD [%d] file range out of bounds\n", i);
+            SerialPrintf("  ELF: PT_LOAD [%d] file range out of bounds\n", i);
             return ERR_INVAL;
         }
         /* ELF spec: memsz >= filesz. */
         if (memsz < filesz) {
-            serial_printf("  ELF: PT_LOAD [%d] memsz < filesz\n", i);
+            SerialPrintf("  ELF: PT_LOAD [%d] memsz < filesz\n", i);
             return ERR_INVAL;
         }
         /* [vaddr, vaddr+memsz) must stay in the user address space. */
         if (memsz > USER_PTR_MAX || vaddr > USER_PTR_MAX - memsz) {
-            serial_printf("  ELF: PT_LOAD [%d] vaddr out of user space\n", i);
+            SerialPrintf("  ELF: PT_LOAD [%d] vaddr out of user space\n", i);
             return ERR_INVAL;
         }
 
-        serial_printf_level(SERIAL_LOG_DEBUG,
+        SerialPrintfLevel(SERIAL_LOG_DEBUG,
                             "  ELF: PT_LOAD [%d] vaddr=0x%x filesz=0x%x memsz=0x%x flags=0x%x\n",
                             i,
                             (u32)vaddr,
@@ -124,9 +149,9 @@ int elf_boot_load(addr_space_t *as, const void *elf_data, u64 elf_size, u64 *ent
             pte_flags |= PTE_NO_EXECUTE;
 
         for (u64 pg = page_vaddr; pg < page_end; pg += PAGE_SIZE) {
-            error_t err = vmm_alloc_and_map(as, pg, pte_flags);
+            error_t err = VmmAllocAndMap(as, pg, pte_flags);
             if (err != OK) {
-                serial_printf("  ELF: vmm_alloc_and_map(0x%x) failed: %d\n", (u32)pg, err);
+                SerialPrintf("  ELF: VmmAllocAndMap(0x%x) failed: %d\n", (u32)pg, err);
                 return ERR_NOMEM;
             }
         }
@@ -137,7 +162,7 @@ int elf_boot_load(addr_space_t *as, const void *elf_data, u64 elf_size, u64 *ent
          * direct-mapped identity. */
         u64 copy_offset = 0;
         for (u64 pg = page_vaddr; pg < page_end; pg += PAGE_SIZE) {
-            u64 phys = vmm_virt_to_phys(as, pg);
+            u64 phys = VmmVirtToPhys(as, pg);
             if (!phys)
                 return ERR_NOMEM;
             u8 *dest = (u8 *)(phys + KERNEL_VIRT_BASE);
@@ -172,6 +197,6 @@ int elf_boot_load(addr_space_t *as, const void *elf_data, u64 elf_size, u64 *ent
     }
 
     *entry_out = entry;
-    serial_printf("  ELF: init loaded successfully, entry=0x%x\n", (u32)entry);
+    SerialPrintf("  ELF: init loaded successfully, entry=0x%x\n", (u32)entry);
     return OK;
 }

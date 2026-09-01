@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * framebuffer.h - Linear framebuffer driver
  * Copyright (c) 2026 OpSys Project
  *
@@ -64,7 +77,7 @@ typedef struct {
  * @param mboot_addr  Physical address of Multiboot2 info structure.
  * @return 0 on success, -1 if no framebuffer found.
  */
-int fb_init(u64 mboot_addr);
+int FbInit(u64 mboot_addr);
 
 /**
  * Get framebuffer info.
@@ -76,19 +89,19 @@ const fb_info_t *fb_get_info(void);
  * Get the PHYSICAL address of the framebuffer.
  * @return Physical address, or 0 if not initialized.
  */
-u64 fb_get_phys(void);
+u64 FbGetPhys(void);
 
 /**
  * Check whether the framebuffer is in VGA text mode (0xB8000).
  * @return 1 if VGA text mode, 0 if linear RGB mode.
  */
-int fb_is_vga_text(void);
+int FbIsVgaText(void);
 
 /**
  * Fill a user-facing framebuffer descriptor (SYS_FB_GET_INFO payload).
  * @param out  Output descriptor (kernel memory).
  * @return 0 on success, -1 if the framebuffer is not initialized.
  */
-int fb_get_user_info(fb_user_info_t *out);
+int FbGetUserInfo(fb_user_info_t *out);
 
 #endif /* KERNEL_FRAMEBUFFER_H */

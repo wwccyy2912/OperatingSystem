@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * idt.h - Interrupt Descriptor Table management
  * Copyright (c) 2026 OpSys Project
  */
@@ -43,7 +56,7 @@ typedef struct {
 /**
  * Initialize the IDT with default ISR handlers.
  */
-void idt_init(void);
+void IdtInit(void);
 
 /**
  * Register a custom handler for a specific interrupt vector.
@@ -51,30 +64,30 @@ void idt_init(void);
  * @param handler Function pointer to handler.
  * @param dpl     Descriptor privilege level (0 or 3).
  */
-void idt_register_handler(u8 vector, void (*handler)(void), u8 dpl);
+void IdtRegisterHandler(u8 vector, void (*handler)(void), u8 dpl);
 
 /**
  * Enable or disable interrupts.
  */
-void idt_enable_interrupts(void);
-void idt_disable_interrupts(void);
+void IdtEnableInterrupts(void);
+void IdtDisableInterrupts(void);
 
 /**
  * Enable (unmask) a hardware IRQ line on the PIC.
  * @param irq  IRQ number (0-15).
  */
-void irq_enable(u8 irq);
+void IrqEnable(u8 irq);
 
 /**
  * Disable (mask) a hardware IRQ line on the PIC.
  * @param irq  IRQ number (0-15).
  */
-void irq_disable(u8 irq);
+void IrqDisable(u8 irq);
 
 /**
  * Initialize the PIT (8253/8254) channel 0 at the given frequency.
  * @param freq  Desired tick frequency in Hz (e.g. 100).
  */
-void pit_init(u32 freq);
+void PitInit(u32 freq);
 
 #endif /* KERNEL_IDT_H */

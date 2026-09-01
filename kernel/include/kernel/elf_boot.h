@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * elf_boot.h - ELF64 definitions for the BOOTSTRAP-ONLY init loader
  * Copyright (c) 2026 OpSys Project
  *
@@ -85,6 +98,6 @@ typedef struct {
  * @return OK on success, ERR_INVAL on malformed ELF, ERR_NOMEM on
  *         allocation failure.
  */
-int elf_boot_load(addr_space_t *as, const void *elf_data, u64 elf_size, u64 *entry_out);
+int ElfBootLoad(addr_space_t *as, const void *elf_data, u64 elf_size, u64 *entry_out);
 
 #endif /* KERNEL_ELF_BOOT_H */

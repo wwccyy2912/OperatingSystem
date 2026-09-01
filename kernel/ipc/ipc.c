@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * ipc.c - Inter-Process Communication
  * Copyright (c) 2026 OpSys Project
  *
@@ -26,6 +39,37 @@
  * sched_reschedule / sched_sleep while holding s_ipc_lock -- blocking
  * with IF=0 is a guaranteed deadlock.  Every block path releases the
  * lock first, then yields, then re-acquires on wakeup.
+ *
+ * ------------------------------------------------------------------
+ * Structure (IPC):
+ *
+ *   sender (IpcSend/IpcCall)            receiver (IpcRecvFrom)
+ *       |  send/call                          |  recv
+ *       v                                     v
+ *   +------------+  pending queue  +---------------------+
+ *   |  port      | <=============> | wait_queue          |
+ *   +------------+  (blocked msgs) +---------------------+
+ *       |  call: parked on s_reply_wait[port], token handed to recv
+ *       v
+ *   IpcReply(token) copies resp, wakes the caller (owner frees msg)
+ *
+ * How it works:
+ *   Senders and receivers rendezvous on a port.  If a receiver is
+ *   already blocked, the message is bounced through a kernel buffer
+ *   and copied into the receiver's user space under ITS CR3; otherwise
+ *   the sender blocks with its message parked on the port's pending
+ *   queue.  Calls park on a reply-wait list and give the receiver an
+ *   opaque reply token (pool slot + generation).
+ * Purpose:
+ *   Synchronous port-based messaging between threads with call/reply
+ *   for RPC, plus a name registry (IpcRegisterPort/IpcGetPort) for
+ *   well-known services.
+ * Caveats:
+ *   The blocked thread owns its pending message and is the only one
+ *   that frees it.  Never yield/sleep while holding s_ipc_lock (IF=0
+ *   deadlock); reply tokens carry a generation so stale tokens are
+ *   rejected instead of replying to the wrong caller.
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/ipc.h>
@@ -37,7 +81,7 @@
 #include <kernel/process.h> /* process_current(): sender subject (P0) */
 
 extern thread_t *thread_current(void);
-extern void      sched_enqueue(thread_t *t);
+extern void      SchedEnqueue(thread_t *t);
 
 
 #define PENDING_POOL_SIZE  128
@@ -57,7 +101,7 @@ typedef struct ipc_pending_msg {
     u32          resp_len;
     error_t      err; /* OK, or ERR_NOENT when the port died */
     bool         is_call;
-    bool         replied; /* ipc_reply() already delivered */
+    bool         replied; /* IpcReply() already delivered */
     bool         in_use;
     u16          generation; /* bumped on every alloc: makes stale
                               * tokens (slot reused by another call)
@@ -98,7 +142,7 @@ static u32 s_port_registry_count;
 #define IPC_TOKEN_GEN_SHIFT 16
 #define IPC_TOKEN_SLOT_MASK 0xFFFFu
 
-static u32 token_of(ipc_pending_msg_t *m) {
+static u32 TokenOf(ipc_pending_msg_t *m) {
     u32 slot = (u32)(m - s_pending_pool) + 1;
     return ((u32)m->generation << IPC_TOKEN_GEN_SHIFT) | slot;
 }
@@ -137,7 +181,7 @@ static ipc_pending_msg_t *pending_alloc(void) {
     return m;
 }
 
-static void pending_free(ipc_pending_msg_t *m) {
+static void PendingFree(ipc_pending_msg_t *m) {
     if (!m)
         return;
     m->in_use     = false;
@@ -153,11 +197,11 @@ static port_entry_t *port_lookup(port_t p) {
 }
 
 /* Wake a thread only if it is still blocked (avoids double-insert into
- * the CFS tree -- sched_enqueue() sets state=READY unconditionally). */
-static void wake_thread(thread_t *t) {
+ * the CFS tree -- SchedEnqueue() sets state=READY unconditionally). */
+static void WakeThread(thread_t *t) {
     if (t && t->state == THREAD_STATE_BLOCKED) {
         t->state = THREAD_STATE_READY;
-        sched_enqueue(t);
+        SchedEnqueue(t);
         /* A woken thread is no longer blocked on any port. */
         t->blocked_port = PORT_NULL;
     }
@@ -166,7 +210,7 @@ static void wake_thread(thread_t *t) {
 /* P0 地基: resolve the current thread's process subject (0 = System/
  * no process).  The kernel fills sender_subject from this at enqueue
  * time — a user message cannot forge it. */
-static subject_id_t ipc_sender_subject(void) {
+static subject_id_t IpcSenderSubject(void) {
     process_t *proc = process_current();
     return proc ? proc->subject_id : 0;
 }
@@ -184,7 +228,7 @@ static subject_id_t ipc_sender_subject(void) {
  * receiver's addr_space for the copy.  This is safe: the kernel-half is
  * mapped in every PML4 (so our own stack/heap stay valid) and IF=0 while
  * s_ipc_lock is held (no timer IRQ can fire mid-switch). */
-static void deliver_to_waiter(port_entry_t *p,
+static void DeliverToWaiter(port_entry_t *p,
                               thread_t     *recv,
                               const void   *msg,
                               u32           len,
@@ -194,10 +238,10 @@ static void deliver_to_waiter(port_entry_t *p,
     if (rs->buf) {
         u32           n     = (len < *rs->len_ptr) ? len : *rs->len_ptr;
         addr_space_t *saved = thread_current()->addr_space;
-        vmm_switch_addr_space(recv->addr_space);
+        VmmSwitchAddrSpace(recv->addr_space);
         memcpy(rs->buf, msg, n);
         *rs->len_ptr = len;
-        vmm_switch_addr_space(saved);
+        VmmSwitchAddrSpace(saved);
     }
     if (token != 0)
         rs->token = token;
@@ -211,14 +255,14 @@ static void deliver_to_waiter(port_entry_t *p,
         }
         pp = &(*pp)->next;
     }
-    wake_thread(recv);
+    WakeThread(recv);
 }
 
 /* Link m into the port's pending queue and block the current thread.
  * Caller holds s_ipc_lock; the lock is released before yielding and
  * re-acquired before returning.  On return m->err carries the outcome
  * and the caller still owns m (must pending_free it). */
-static error_t block_with_pending(port_t port, ipc_pending_msg_t *m, const void *msg, u32 len) {
+static error_t BlockWithPending(port_t port, ipc_pending_msg_t *m, const void *msg, u32 len) {
     thread_t *cur = thread_current();
     m->msg_len    = len;
     if (msg && len > 0)
@@ -227,17 +271,17 @@ static error_t block_with_pending(port_t port, ipc_pending_msg_t *m, const void 
     s_pending_head[port - 1] = m;
     /* Lock held (IF=0): the state change + ready-tree dequeue are
      * atomic w.r.t. the timer IRQ.  A BLOCKED thread must not stay in
-     * the ready tree or reschedule() can force-pick it as `next`. */
+     * the ready tree or Reschedule() can force-pick it as `next`. */
     cur->state        = THREAD_STATE_BLOCKED;
     cur->blocked_port = port;
-    sched_dequeue(cur);
-    spin_unlock(&s_ipc_lock);
-    thread_yield();
-    spin_lock(&s_ipc_lock);
+    SchedDequeue(cur);
+    SpinUnlock(&s_ipc_lock);
+    ThreadYield();
+    SpinLock(&s_ipc_lock);
     return m->err;
 }
 
-void ipc_init(void) {
+void IpcInit(void) {
     /* All static data is BSS-zeroed on first boot; build the free list */
     for (i32 i = PENDING_POOL_SIZE - 1; i >= 0; i--) {
         s_pending_pool[i].next = s_free_list;
@@ -245,8 +289,8 @@ void ipc_init(void) {
     }
 }
 
-port_t ipc_port_create(void) {
-    spin_lock(&s_ipc_lock);
+port_t IpcPortCreate(void) {
+    SpinLock(&s_ipc_lock);
     thread_t *cur = thread_current();
     for (u32 i = 0; i < MAX_PORTS; i++) {
         if (!s_port_table[i].in_use) {
@@ -256,19 +300,19 @@ port_t ipc_port_create(void) {
             p->owner_pid    = cur->pid;
             p->wait_queue   = NULL;
             p->in_use       = true;
-            spin_unlock(&s_ipc_lock);
+            SpinUnlock(&s_ipc_lock);
             return p->port_id;
         }
     }
-    spin_unlock(&s_ipc_lock);
+    SpinUnlock(&s_ipc_lock);
     return (port_t)ERR_NOMEM;
 }
 
-void ipc_port_destroy(port_t port) {
-    spin_lock(&s_ipc_lock);
+void IpcPortDestroy(port_t port) {
+    SpinLock(&s_ipc_lock);
     port_entry_t *p = port_lookup(port);
     if (!p) {
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return;
     }
 
@@ -277,7 +321,7 @@ void ipc_port_destroy(port_t port) {
     while (t) {
         thread_t *n        = t->next;
         s_recv[t->tid].err = ERR_NOENT;
-        wake_thread(t);
+        WakeThread(t);
         t = n;
     }
     p->wait_queue = NULL;
@@ -290,7 +334,7 @@ void ipc_port_destroy(port_t port) {
         *pp                  = m->next;
         m->next              = NULL;
         m->err               = ERR_NOENT;
-        wake_thread(thread_get(m->sender_tid));
+        WakeThread(thread_get(m->sender_tid));
     }
 
     /* 3. Call messages awaiting reply: same treatment */
@@ -300,11 +344,11 @@ void ipc_port_destroy(port_t port) {
         *pp                  = m->next;
         m->next              = NULL;
         m->err               = ERR_NOENT;
-        wake_thread(thread_get(m->sender_tid));
+        WakeThread(thread_get(m->sender_tid));
     }
 
     p->in_use = false;
-    spin_unlock(&s_ipc_lock);
+    SpinUnlock(&s_ipc_lock);
 }
 
 /*
@@ -315,16 +359,16 @@ void ipc_port_destroy(port_t port) {
  *   2. Drop registry names whose port belonged to the dying process,
  *      so a restarted service can re-register its well-known name
  *      (without this the name leaks and restart fails with ERR_BUSY).
- * Called from process_reap() (process.c) with the process already
+ * Called from ProcessReap() (process.c) with the process already
  * marked ZOMBIE; its threads are all dead.
  */
-void ipc_cleanup_process(pid_t pid) {
+void IpcCleanupProcess(pid_t pid) {
     for (u32 i = 0; i < MAX_PORTS; i++) {
         if (s_port_table[i].in_use && s_port_table[i].owner_pid == pid)
-            ipc_port_destroy((port_t)(i + 1));
+            IpcPortDestroy((port_t)(i + 1));
     }
 
-    spin_lock(&s_ipc_lock);
+    SpinLock(&s_ipc_lock);
     for (u32 i = 0; i < s_port_registry_count;) {
         port_entry_t *p = port_lookup(s_port_registry[i].port);
         if (!p || p->owner_pid == pid) {
@@ -337,17 +381,17 @@ void ipc_cleanup_process(pid_t pid) {
             i++;
         }
     }
-    spin_unlock(&s_ipc_lock);
+    SpinUnlock(&s_ipc_lock);
 }
 
-error_t ipc_send(port_t port, const void *msg, u32 len) {    spin_lock(&s_ipc_lock);
+error_t IpcSend(port_t port, const void *msg, u32 len) {    SpinLock(&s_ipc_lock);
     port_entry_t *p = port_lookup(port);
     if (!p) {
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return ERR_NOENT;
     }
     if (len > MAX_MSG_SIZE) {
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return ERR_INVAL;
     }
 
@@ -358,45 +402,45 @@ error_t ipc_send(port_t port, const void *msg, u32 len) {    spin_lock(&s_ipc_lo
          * not live in our (sender's) user pages. */
         ipc_pending_msg_t *m = pending_alloc();
         if (!m) {
-            spin_unlock(&s_ipc_lock);
+            SpinUnlock(&s_ipc_lock);
             return ERR_NOMEM;
         }
         m->msg_len        = len;
-        m->sender_subject = ipc_sender_subject();
+        m->sender_subject = IpcSenderSubject();
         if (msg && len > 0)
             memcpy(m->msg_data, msg, len);
-        deliver_to_waiter(p, recv, m->msg_data, len, 0, m->sender_subject);
-        pending_free(m);
-        spin_unlock(&s_ipc_lock);
+        DeliverToWaiter(p, recv, m->msg_data, len, 0, m->sender_subject);
+        PendingFree(m);
+        SpinUnlock(&s_ipc_lock);
         return OK;
     }
 
     ipc_pending_msg_t *m = pending_alloc();
     if (!m) {
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return ERR_NOMEM;
     }
     m->sender_tid     = thread_current()->tid;
-    m->sender_subject = ipc_sender_subject();
+    m->sender_subject = IpcSenderSubject();
     m->port           = port;
     m->is_call        = false;
     m->replied        = false;
     m->err            = OK;
     m->resp_len       = 0;
 
-    error_t err = block_with_pending(port, m, msg, len);
+    error_t err = BlockWithPending(port, m, msg, len);
     /* Woken: delivered (OK) or port destroyed (ERR_NOENT).  We own m. */
-    pending_free(m);
-    spin_unlock(&s_ipc_lock);
+    PendingFree(m);
+    SpinUnlock(&s_ipc_lock);
     return err;
 }
 
 error_t
-ipc_recv_from(port_t port, void *buf, u32 *len, u32 *tok_ptr, subject_id_t *sender_subject) {
-    spin_lock(&s_ipc_lock);
+IpcRecvFrom(port_t port, void *buf, u32 *len, u32 *tok_ptr, subject_id_t *sender_subject) {
+    SpinLock(&s_ipc_lock);
     port_entry_t *p = port_lookup(port);
     if (!p) {
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return ERR_NOENT;
     }
     if (tok_ptr)
@@ -421,12 +465,12 @@ ipc_recv_from(port_t port, void *buf, u32 *len, u32 *tok_ptr, subject_id_t *send
             m->next                = s_reply_wait[port - 1];
             s_reply_wait[port - 1] = m;
             if (tok_ptr)
-                *tok_ptr = token_of(m);
+                *tok_ptr = TokenOf(m);
         } else {
-            wake_thread(thread_get(m->sender_tid));
+            WakeThread(thread_get(m->sender_tid));
             /* sender frees m after it wakes */
         }
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return OK;
     }
 
@@ -435,15 +479,15 @@ ipc_recv_from(port_t port, void *buf, u32 *len, u32 *tok_ptr, subject_id_t *send
     s_recv[cur->tid] = (recv_slot_t){buf, len, 0, 0, OK};
     /* Lock held (IF=0): state change + ready-tree dequeue are atomic
      * w.r.t. the timer IRQ.  A BLOCKED thread must not stay in the
-     * ready tree or reschedule() can force-pick it as `next`. */
+     * ready tree or Reschedule() can force-pick it as `next`. */
     cur->state        = THREAD_STATE_BLOCKED;
     cur->blocked_port = port;
     cur->next         = p->wait_queue;
     p->wait_queue     = cur;
-    sched_dequeue(cur);
-    spin_unlock(&s_ipc_lock);
-    thread_yield();
-    spin_lock(&s_ipc_lock);
+    SchedDequeue(cur);
+    SpinUnlock(&s_ipc_lock);
+    ThreadYield();
+    SpinLock(&s_ipc_lock);
     recv_slot_t rs   = s_recv[cur->tid];
     s_recv[cur->tid] = (recv_slot_t){NULL, NULL, 0, 0, OK};
     if (tok_ptr)
@@ -451,35 +495,35 @@ ipc_recv_from(port_t port, void *buf, u32 *len, u32 *tok_ptr, subject_id_t *send
     if (sender_subject)
         *sender_subject = rs.sender_subject;
     error_t err = rs.err;
-    spin_unlock(&s_ipc_lock);
+    SpinUnlock(&s_ipc_lock);
     return err;
 }
 
-error_t ipc_recv(port_t port, void *buf, u32 *len, u32 *tok_ptr) {
+error_t IpcRecv(port_t port, void *buf, u32 *len, u32 *tok_ptr) {
     /* Existing 4-arg semantics unchanged; subject out-param = NULL. */
-    return ipc_recv_from(port, buf, len, tok_ptr, NULL);
+    return IpcRecvFrom(port, buf, len, tok_ptr, NULL);
 }
 
-error_t ipc_call(port_t port, const void *req, u32 req_len, void *resp, u32 *resp_len) {
-    spin_lock(&s_ipc_lock);
+error_t IpcCall(port_t port, const void *req, u32 req_len, void *resp, u32 *resp_len) {
+    SpinLock(&s_ipc_lock);
     port_entry_t *p = port_lookup(port);
     if (!p) {
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return ERR_NOENT;
     }
     if (req_len > MAX_MSG_SIZE) {
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return ERR_INVAL;
     }
 
     thread_t          *cur = thread_current();
     ipc_pending_msg_t *m   = pending_alloc();
     if (!m) {
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return ERR_NOMEM;
     }
     m->sender_tid     = cur->tid;
-    m->sender_subject = ipc_sender_subject();
+    m->sender_subject = IpcSenderSubject();
     m->port           = port;
     m->is_call        = true;
     m->replied        = false;
@@ -495,7 +539,7 @@ error_t ipc_call(port_t port, const void *req, u32 req_len, void *resp, u32 *res
         m->msg_len = req_len;
         if (req && req_len > 0)
             memcpy(m->msg_data, req, req_len);
-        deliver_to_waiter(p, recv, m->msg_data, req_len, token_of(m), m->sender_subject);
+        DeliverToWaiter(p, recv, m->msg_data, req_len, TokenOf(m), m->sender_subject);
         m->next                = s_reply_wait[port - 1];
         s_reply_wait[port - 1] = m;
     } else {
@@ -507,38 +551,38 @@ error_t ipc_call(port_t port, const void *req, u32 req_len, void *resp, u32 *res
     }
     /* Lock held (IF=0): state change + ready-tree dequeue are atomic
      * w.r.t. the timer IRQ.  A BLOCKED thread must not stay in the
-     * ready tree or reschedule() can force-pick it as `next`. */
+     * ready tree or Reschedule() can force-pick it as `next`. */
     cur->state        = THREAD_STATE_BLOCKED;
     cur->blocked_port = port;
-    sched_dequeue(cur);
-    spin_unlock(&s_ipc_lock);
-    thread_yield();
-    spin_lock(&s_ipc_lock);
+    SchedDequeue(cur);
+    SpinUnlock(&s_ipc_lock);
+    ThreadYield();
+    SpinLock(&s_ipc_lock);
     error_t err = m->err;
     if (err == OK && resp) {
         memcpy(resp, m->resp_data, m->resp_len);
         *resp_len = m->resp_len;
     }
     /* We own m; free it.  (ipc_reply only copies + wakes.) */
-    pending_free(m);
-    spin_unlock(&s_ipc_lock);
+    PendingFree(m);
+    SpinUnlock(&s_ipc_lock);
     return err;
 }
 
-error_t ipc_reply(u32 token, const void *msg, u32 len) {
-    spin_lock(&s_ipc_lock);
+error_t IpcReply(u32 token, const void *msg, u32 len) {
+    SpinLock(&s_ipc_lock);
     if (len > MAX_MSG_SIZE) {
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return ERR_INVAL;
     }
 
     ipc_pending_msg_t *m = token_to_msg(token);
     if (!m) {
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return ERR_NOENT;
     }
     if (!m->is_call || m->replied) {
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return ERR_BUSY;
     }
 
@@ -557,8 +601,8 @@ error_t ipc_reply(u32 token, const void *msg, u32 len) {
         pp = &(*pp)->next;
     }
 
-    wake_thread(thread_get(m->sender_tid));
-    spin_unlock(&s_ipc_lock);
+    WakeThread(thread_get(m->sender_tid));
+    SpinUnlock(&s_ipc_lock);
     return OK;
 }
 
@@ -568,17 +612,17 @@ error_t ipc_reply(u32 token, const void *msg, u32 len) {
  * whatever IPC structure holds it and records ERR_INTERRUPTED so the
  * woken syscall returns an error instead of re-blocking.
  *
- * Ownership rule preserved: the blocked thread's ipc_call() is the
+ * Ownership rule preserved: the blocked thread's IpcCall() is the
  * only code that frees its pending message -- it does so after waking,
- * seeing the recorded error.  A late ipc_reply() for a freed slot
+ * seeing the recorded error.  A late IpcReply() for a freed slot
  * fails token validation (in_use + generation), so it can never touch
  * a reused slot.  Caller must NOT hold s_ipc_lock.
  */
-void ipc_abort_wait(thread_t *t) {
+void IpcAbortWait(thread_t *t) {
     if (!t || t->blocked_port == PORT_NULL)
         return;
 
-    spin_lock(&s_ipc_lock);
+    SpinLock(&s_ipc_lock);
 
     port_t port = t->blocked_port;
 
@@ -598,11 +642,11 @@ void ipc_abort_wait(thread_t *t) {
     }
 
     if (s_recv[t->tid].buf != NULL) {
-        /* Recv-wait: fail the slot so ipc_recv() returns an error */
+        /* Recv-wait: fail the slot so IpcRecv() returns an error */
         s_recv[t->tid].err = ERR_INTERRUPTED;
     } else {
         /* Call-wait: unlink the sender's pending message from its list
-   and record the error; ipc_call() frees it after waking. */
+   and record the error; IpcCall() frees it after waking. */
         bool                found    = false;
         ipc_pending_msg_t **lists[2] = {
             &s_pending_head[port - 1],
@@ -625,36 +669,36 @@ void ipc_abort_wait(thread_t *t) {
     }
 
     t->blocked_port = PORT_NULL;
-    spin_unlock(&s_ipc_lock);
+    SpinUnlock(&s_ipc_lock);
 }
 
-port_t ipc_get_port(const char *name) {
-    spin_lock(&s_ipc_lock);
+port_t IpcGetPort(const char *name) {
+    SpinLock(&s_ipc_lock);
     for (u32 i = 0; i < s_port_registry_count; i++) {
         if (strcmp(s_port_registry[i].name, name) == 0) {
             port_t port = s_port_registry[i].port;
-            spin_unlock(&s_ipc_lock);
+            SpinUnlock(&s_ipc_lock);
             return port;
         }
     }
-    spin_unlock(&s_ipc_lock);
+    SpinUnlock(&s_ipc_lock);
     return (port_t)ERR_NOENT;
 }
 
-error_t ipc_register_port(const char *name, port_t port) {
-    spin_lock(&s_ipc_lock);
+error_t IpcRegisterPort(const char *name, port_t port) {
+    SpinLock(&s_ipc_lock);
     for (u32 i = 0; i < s_port_registry_count; i++) {
         if (strcmp(s_port_registry[i].name, name) == 0) {
-            spin_unlock(&s_ipc_lock);
+            SpinUnlock(&s_ipc_lock);
             return ERR_BUSY;
         }
     }
     if (s_port_registry_count >= PORT_REGISTRY_SIZE) {
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return ERR_OVERFLOW;
     }
     if (!port_lookup(port)) {
-        spin_unlock(&s_ipc_lock);
+        SpinUnlock(&s_ipc_lock);
         return ERR_NOENT;
     }
     u32   idx = s_port_registry_count;
@@ -667,6 +711,6 @@ error_t ipc_register_port(const char *name, port_t port) {
     dst[i]                    = '\0';
     s_port_registry[idx].port = port;
     s_port_registry_count++;
-    spin_unlock(&s_ipc_lock);
+    SpinUnlock(&s_ipc_lock);
     return OK;
 }

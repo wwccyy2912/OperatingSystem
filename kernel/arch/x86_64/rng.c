@@ -1,9 +1,22 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * rng.c - Boot-time PRNG and ASLR address helpers
  * Copyright (c) 2026 OpSys Project
  *
  * xorshift64* PRNG (Marsaglia): state 64-bit, zero state forbidden.
- * Seeded from hardware timing entropy gathered in rng_init():
+ * Seeded from hardware timing entropy gathered in RngInit():
  *   - rdtsc            CPU cycle counter (varies with boot timing)
  *   - PIT channel 0    free-running 1.19 MHz countdown (phase varies)
  *   - CMOS RTC         wall-clock time
@@ -12,9 +25,21 @@
  * The ASLR helpers (design item ⑭, option B) return randomized user
  * virtual addresses for thread stacks, the init boot stack and the
  * per-process heap base.  Region constants live in rng.h so the
- * layout is auditable in one place.
+ * layout is auditable in one place. *
+ * ------------------------------------------------------------------
+ * Structure (rng):
+ *   rdtsc -> mix (xorshift/MultiplicativeHash) -> boot entropy pool
+ *   -> AslrBootStack/AslrElfBase/AslrHeapBase/AslrStackBase.
+ * How it works:
+ *   Seeds from the TSC at boot; the PRNG drives kernel-address ASLR
+ *   and the stack-protector canary randomisation.
+ * Purpose:
+ *   Address-space layout randomisation and canary entropy.
+ * Caveats:
+ *   rdtsc is a timing source, not a CSPRNG — enough for boot ASLR,
+ *   not for cryptographic keys.
+ * ------------------------------------------------------------------
  */
-
 #include <kernel/rng.h>
 #include <kernel/io.h>
 #include <kernel/rtc.h>
@@ -26,7 +51,7 @@ static u64 s_rng_state;
 /*  Entropy gathering                                                  */
 /* ------------------------------------------------------------------ */
 
-static inline u64 rng_rdtsc(void) {
+static inline u64 RngRdtsc(void) {
     u32 lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((u64)hi << 32) | (u64)lo;
@@ -38,21 +63,21 @@ static inline u64 rng_rdtsc(void) {
  * 16-bit value.  Works in any PIT mode; at rng_init time the channel
  * is still running at the BIOS-default ~1.19 MHz rate.
  */
-static inline u16 rng_pit_counter(void) {
-    io_outb(0x43, 0x00);        /* latch channel 0 */
-    u16 lo = (u16)io_inb(0x40); /* low byte first */
-    u16 hi = (u16)io_inb(0x40);
+static inline u16 RngPitCounter(void) {
+    IoOutb(0x43, 0x00);        /* latch channel 0 */
+    u16 lo = (u16)IoInb(0x40); /* low byte first */
+    u16 hi = (u16)IoInb(0x40);
     return (u16)(lo | (hi << 8));
 }
 
-static u64 rng_gather_entropy(void) {
-    u64 e = rng_rdtsc();
+static u64 RngGatherEntropy(void) {
+    u64 e = RngRdtsc();
 
-    e ^= (u64)rng_pit_counter() << 16;
-    e ^= (u64)rng_pit_counter() << 48; /* second sample: counter moved */
+    e ^= (u64)RngPitCounter() << 16;
+    e ^= (u64)RngPitCounter() << 48; /* second sample: counter moved */
 
     rtc_time_t t;
-    rtc_read(&t);
+    RtcRead(&t);
     e ^= (u64)t.year << 0;
     e ^= (u64)t.month << 16;
     e ^= (u64)t.day << 24;
@@ -70,17 +95,17 @@ static u64 rng_gather_entropy(void) {
 /*  Public API                                                         */
 /* ------------------------------------------------------------------ */
 
-void rng_init(void) {
+void RngInit(void) {
     if (s_rng_state != 0)
         return; /* already seeded */
 
-    u64 seed = rng_gather_entropy();
+    u64 seed = RngGatherEntropy();
     if (seed == 0)
         seed = 0x9E3779B97F4A7C15ULL; /* splitmix golden ratio, fallback */
     s_rng_state = seed;
 }
 
-void rng_mix(u64 entropy) {
+void RngMix(u64 entropy) {
     /* Fold without risk of landing on the forbidden zero state. */
     if (entropy == 0)
         return;
@@ -89,7 +114,7 @@ void rng_mix(u64 entropy) {
         s_rng_state = 0x9E3779B97F4A7C15ULL;
 }
 
-u64 rng_u64(void) {
+u64 RngU64(void) {
     /* xorshift64* — good statistical quality, trivial to implement. */
     u64 x = s_rng_state;
     x ^= x >> 12;
@@ -99,39 +124,39 @@ u64 rng_u64(void) {
     return x * 0x2545F4914F6CDD1DULL;
 }
 
-u64 rng_range(u64 limit) {
+u64 RngRange(u64 limit) {
     if (limit == 0)
         return 0;
-    return rng_u64() % limit;
+    return RngU64() % limit;
 }
 
 /* ------------------------------------------------------------------ */
 /*  ASLR address helpers (design item ⑭, option B)                    */
 /* ------------------------------------------------------------------ */
 
-u64 aslr_stack_base(void) {
+u64 AslrStackBase(void) {
     /* One ASLR_STACK_BLOCK (MAX_THREADS * USER_STACK_PAGES pages,
      * 32 MB at MAX_THREADS=2048) per possible thread; pick a random
      * block. */
     u64 region = ASLR_STACK_END - ASLR_STACK_BASE;
     u64 blocks = region / ASLR_STACK_BLOCK;
-    return ASLR_STACK_BASE + rng_range(blocks) * ASLR_STACK_BLOCK;
+    return ASLR_STACK_BASE + RngRange(blocks) * ASLR_STACK_BLOCK;
 }
 
-u64 aslr_boot_stack(void) {
+u64 AslrBootStack(void) {
     u64 region = ASLR_BOOT_STACK_END - ASLR_BOOT_STACK_BASE;
     u64 pages  = region / PAGE_SIZE;
-    return ASLR_BOOT_STACK_BASE + rng_range(pages) * PAGE_SIZE;
+    return ASLR_BOOT_STACK_BASE + RngRange(pages) * PAGE_SIZE;
 }
 
-u64 aslr_heap_base(void) {
+u64 AslrHeapBase(void) {
     u64 region = ASLR_HEAP_BASE_MAX - ASLR_HEAP_BASE_MIN;
     u64 slots  = region / ASLR_HEAP_ALIGN;
-    return ASLR_HEAP_BASE_MIN + rng_range(slots) * ASLR_HEAP_ALIGN;
+    return ASLR_HEAP_BASE_MIN + RngRange(slots) * ASLR_HEAP_ALIGN;
 }
 
-u64 aslr_elf_base(void) {
+u64 AslrElfBase(void) {
     u64 region = ASLR_ELF_BASE_MAX - ASLR_ELF_BASE_MIN;
     u64 pages  = region / PAGE_SIZE;
-    return ASLR_ELF_BASE_MIN + rng_range(pages) * PAGE_SIZE;
+    return ASLR_ELF_BASE_MIN + RngRange(pages) * PAGE_SIZE;
 }

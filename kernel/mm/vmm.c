@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * vmm.c - Virtual Memory Manager
  * Copyright (c) 2026 OpSys Project
  *
@@ -7,6 +20,37 @@
  * 2 MB huge pages (PML4[256] → same PDP as PML4[0]). All page table
  * pages (allocated from PMM in low physical memory) are accessed via
  * phys_to_virt() which adds KERNEL_VIRT_BASE.
+ *
+ * ------------------------------------------------------------------
+ * Structure (vmm):
+ *   Virtual address: [ user 0 .. USER_PTR_MAX ) | kernel half PML4[256..511]
+ *   Page walk: CR3 -> PML4 -> PDP -> PD -> PT -> 4 KB PTE (512 entries
+ *   each); table pages live in low physical memory, reached via
+ *   phys_to_virt() (+ KERNEL_VIRT_BASE). s_kernel_as / vmm_kernel_cr3
+ *   adopt the boot PML4; each process has an addr_space_t {pml4_phys,
+ *   stack_base}.
+ *
+ * How it works:
+ *   VmmInit() reads CR3. walk_page_table() walks the four levels and
+ *   allocates intermediate tables from PMM on demand (allocate=true).
+ *   VmmMap / VmmMapRange / VmmAllocAndMap fill leaf PTEs; VmmUnmap
+ *   clears them (invlpg) and frees empty tables bottom-up. New address
+ *   spaces copy PML4[256..511], so all processes share the higher-half
+ *   direct map; VmmSwitchAddrSpace() reloads CR3 (short-circuited).
+ *
+ * Purpose:
+ *   Backs every user mapping (ELF segments, thread stacks, heap growth,
+ *   SYS_MAP_MEMORY, shm) and provides VmmValidateUserRange() /
+ *   VmmVirtToPhys() for syscall safety. Kernel memory lives in the
+ *   shared higher half — there is no kernel heap: kernel allocations
+ *   are PMM pages accessed through the direct map.
+ *
+ * Caveats:
+ *   VmmMap refuses to overwrite a present PTE (ERR_BUSY) — unmap first.
+ *   Intermediate entries always carry PTE_USER; only the leaf PTE's U/S
+ *   bit controls access. VmmUnmap on a not-present leaf frees dead
+ *   pre-built hierarchies but never a PT page with live leaves.
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/vmm.h>
@@ -25,16 +69,16 @@ u64 vmm_kernel_cr3;
 
 /* ---- Helpers ---- */
 
-static inline u64 pml4_index(u64 virt) {
+static inline u64 pml4Index(u64 virt) {
     return (virt >> 39) & 0x1FF;
 }
-static inline u64 pdp_index(u64 virt) {
+static inline u64 pdpIndex(u64 virt) {
     return (virt >> 30) & 0x1FF;
 }
-static inline u64 pd_index(u64 virt) {
+static inline u64 pdIndex(u64 virt) {
     return (virt >> 21) & 0x1FF;
 }
-static inline u64 pt_index(u64 virt) {
+static inline u64 PtIndex(u64 virt) {
     return (virt >> 12) & 0x1FF;
 }
 
@@ -48,12 +92,12 @@ static inline u64 pt_index(u64 virt) {
 static inline void *phys_to_virt(u64 phys) {
     return (void *)(phys + KERNEL_VIRT_BASE);
 }
-static inline u64 virt_to_phys(void *virt) {
+static inline u64 VirtToPhys(void *virt) {
     return (u64)virt - KERNEL_VIRT_BASE;
 }
 
 /* Zero a 4 KB page (512 u64 entries). */
-static inline void zero_page(void *addr) {
+static inline void ZeroPage(void *addr) {
     u64 *p = (u64 *)addr;
     for (int i = 0; i < 512; i++) {
         p[i] = 0;
@@ -61,7 +105,7 @@ static inline void zero_page(void *addr) {
 }
 
 /* Return true if every entry in a page table page is not present. */
-static inline bool page_table_empty(const u64 *table) {
+static inline bool PageTableEmpty(const u64 *table) {
     for (int i = 0; i < 512; i++) {
         if (table[i] & PTE_PRESENT) {
             return false;
@@ -92,45 +136,45 @@ static u64 *walk_page_table(addr_space_t *as, u64 virt, bool allocate) {
     u64 *pml4 = (u64 *)phys_to_virt(as->pml4_phys);
 
     /* PML4 -> PDP */
-    u64 idx = pml4_index(virt);
+    u64 idx = pml4Index(virt);
     if (!(pml4[idx] & PTE_PRESENT)) {
         if (!allocate)
             return NULL;
-        u64 page = pmm_alloc_page();
+        u64 page = PmmAllocPage();
         if (!page)
             return NULL;
-        zero_page(phys_to_virt(page));
+        ZeroPage(phys_to_virt(page));
         pml4[idx] = page | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
     }
     u64 *pdp = (u64 *)phys_to_virt(pml4[idx] & ~0xFFFULL);
 
     /* PDP -> PD */
-    idx = pdp_index(virt);
+    idx = pdpIndex(virt);
     if (!(pdp[idx] & PTE_PRESENT)) {
         if (!allocate)
             return NULL;
-        u64 page = pmm_alloc_page();
+        u64 page = PmmAllocPage();
         if (!page)
             return NULL;
-        zero_page(phys_to_virt(page));
+        ZeroPage(phys_to_virt(page));
         pdp[idx] = page | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
     }
     u64 *pd = (u64 *)phys_to_virt(pdp[idx] & ~0xFFFULL);
 
     /* PD -> PT */
-    idx = pd_index(virt);
+    idx = pdIndex(virt);
     if (!(pd[idx] & PTE_PRESENT)) {
         if (!allocate)
             return NULL;
-        u64 page = pmm_alloc_page();
+        u64 page = PmmAllocPage();
         if (!page)
             return NULL;
-        zero_page(phys_to_virt(page));
+        ZeroPage(phys_to_virt(page));
         pd[idx] = page | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
     }
     u64 *pt = (u64 *)phys_to_virt(pd[idx] & ~0xFFFULL);
 
-    return &pt[pt_index(virt)];
+    return &pt[PtIndex(virt)];
 }
 
 /* ---- Public API ---- */
@@ -140,15 +184,15 @@ static u64 *walk_page_table(addr_space_t *as, u64 virt, bool allocate) {
  * Handles 1 GB huge pages (PDPE.PS) and 2 MB huge pages (PDE.PS).
  * If need_write, the mapping must also be writable (PTE_WRITABLE).
  */
-static bool page_is_mapped(addr_space_t *as, u64 vaddr, bool need_write) {
+static bool PageIsMapped(addr_space_t *as, u64 vaddr, bool need_write) {
     u64 *pml4 = (u64 *)phys_to_virt(as->pml4_phys);
 
-    u64 idx = pml4_index(vaddr);
+    u64 idx = pml4Index(vaddr);
     if (!(pml4[idx] & PTE_PRESENT))
         return false;
 
     u64 *pdp = (u64 *)phys_to_virt(pml4[idx] & ~0xFFFULL);
-    idx      = pdp_index(vaddr);
+    idx      = pdpIndex(vaddr);
     if (!(pdp[idx] & PTE_PRESENT))
         return false;
 
@@ -158,7 +202,7 @@ static bool page_is_mapped(addr_space_t *as, u64 vaddr, bool need_write) {
     }
 
     u64 *pd = (u64 *)phys_to_virt(pdp[idx] & ~0xFFFULL);
-    idx     = pd_index(vaddr);
+    idx     = pdIndex(vaddr);
     if (!(pd[idx] & PTE_PRESENT))
         return false;
 
@@ -168,13 +212,13 @@ static bool page_is_mapped(addr_space_t *as, u64 vaddr, bool need_write) {
     }
 
     u64 *pt = (u64 *)phys_to_virt(pd[idx] & ~0xFFFULL);
-    idx     = pt_index(vaddr);
+    idx     = PtIndex(vaddr);
     if (!(pt[idx] & PTE_PRESENT))
         return false;
     return !need_write || (pt[idx] & PTE_WRITABLE) != 0;
 }
 
-bool vmm_validate_user_range(addr_space_t *as, u64 ptr, u64 size, bool need_write) {
+bool VmmValidateUserRange(addr_space_t *as, u64 ptr, u64 size, bool need_write) {
     if (ptr == 0 || size == 0)
         return false;
     if (ptr + size < ptr) /* overflow */
@@ -190,7 +234,7 @@ bool vmm_validate_user_range(addr_space_t *as, u64 ptr, u64 size, bool need_writ
     u64 start = ptr & ~(u64)(PAGE_SIZE - 1);
     u64 end   = (ptr + size - 1) & ~(u64)(PAGE_SIZE - 1);
     for (u64 vaddr = start; vaddr <= end; vaddr += PAGE_SIZE) {
-        if (!page_is_mapped(as, vaddr, need_write))
+        if (!PageIsMapped(as, vaddr, need_write))
             return false;
     }
     return true;
@@ -204,15 +248,15 @@ bool vmm_validate_user_range(addr_space_t *as, u64 ptr, u64 size, bool need_writ
  * Race-freedom: syscalls run with IF=0 (0x80 interrupt gate, see
  * syscall_entry.S), so no timer IRQ can preempt between this check and
  * the caller's subsequent copy — the mapping cannot change mid-syscall. */
-bool vmm_validate_user_ptr(u64 ptr, u64 size, bool need_write) {
+bool VmmValidateUserPtr(u64 ptr, u64 size, bool need_write) {
     process_t *proc = process_current();
     if (!proc || !proc->addr_space)
         return false;
-    return vmm_validate_user_range(proc->addr_space, ptr, size, need_write);
+    return VmmValidateUserRange(proc->addr_space, ptr, size, need_write);
 }
 
-void vmm_init(void) {
-    serial_puts("VMM: Initializing...\n");
+void VmmInit(void) {
+    SerialPuts("VMM: Initializing...\n");
 
     /* The boot loader set up page tables; read CR3 to find the PML4. */
     u64 cr3;
@@ -222,8 +266,8 @@ void vmm_init(void) {
     vmm_kernel_cr3        = cr3;
     s_initialized         = true;
 
-    serial_printf("VMM: Kernel PML4 at 0x%x\n", (u32)cr3);
-    serial_puts("VMM: Initialized\n");
+    SerialPrintf("VMM: Kernel PML4 at 0x%x\n", (u32)cr3);
+    SerialPuts("VMM: Initialized\n");
 }
 
 addr_space_t *vmm_create_addr_space(void) {
@@ -231,12 +275,12 @@ addr_space_t *vmm_create_addr_space(void) {
         return NULL;
 
     /* Allocate a fresh PML4 page from PMM. */
-    u64 pml4_phys = pmm_alloc_page();
+    u64 pml4_phys = PmmAllocPage();
     if (!pml4_phys)
         return NULL;
 
     u64 *new_pml4 = (u64 *)phys_to_virt(pml4_phys);
-    zero_page(new_pml4);
+    ZeroPage(new_pml4);
 
     /* Copy kernel-half entries (256-511) so the new process inherits
      * kernel mappings (higher-half + identity-mapped low memory). */
@@ -249,28 +293,28 @@ addr_space_t *vmm_create_addr_space(void) {
      * The struct is tiny (8 bytes) but without a general-purpose
      * allocator we reserve a full page; the pointer IS the page
      * address so pmm_free_page works in destroy. */
-    u64 as_page = pmm_alloc_page();
+    u64 as_page = PmmAllocPage();
     if (!as_page) {
-        pmm_free_page(pml4_phys);
+        PmmFreePage(pml4_phys);
         return NULL;
     }
-    zero_page(phys_to_virt(as_page));
+    ZeroPage(phys_to_virt(as_page));
 
     addr_space_t *as = (addr_space_t *)phys_to_virt(as_page);
     as->pml4_phys    = pml4_phys;
 
     /* ASLR: randomize the thread-stack region base for this address
-     * space (design item ⑭).  thread_create_user() maps thread TID's
+     * space (design item ⑭).  ThreadCreateUser() maps thread TID's
      * stack at stack_base + tid*PAGE_SIZE. */
-    as->stack_base = aslr_stack_base();
+    as->stack_base = AslrStackBase();
 
-    serial_printf("VMM: Created addr space, PML4 at 0x%x, stack_base=0x%x\n",
+    SerialPrintf("VMM: Created addr space, PML4 at 0x%x, stack_base=0x%x\n",
                   (u32)pml4_phys,
                   (u32)as->stack_base);
     return as;
 }
 
-void vmm_destroy_addr_space(addr_space_t *as) {
+void VmmDestroyAddrSpace(addr_space_t *as) {
     if (!as || as == &s_kernel_as) {
         return;
     }
@@ -289,7 +333,7 @@ void vmm_destroy_addr_space(addr_space_t *as) {
 
             /* 1 GB huge page */
             if (pdp[pdp_i] & PTE_HUGE) {
-                pmm_free_page(pdp[pdp_i] & ~0xFFFULL);
+                PmmFreePage(pdp[pdp_i] & ~0xFFFULL);
                 continue;
             }
 
@@ -300,29 +344,29 @@ void vmm_destroy_addr_space(addr_space_t *as) {
 
                 /* 2 MB huge page */
                 if (pd[pd_i] & PTE_HUGE) {
-                    pmm_free_page(pd[pd_i] & ~0xFFFULL);
+                    PmmFreePage(pd[pd_i] & ~0xFFFULL);
                     continue;
                 }
 
                 u64 *pt = (u64 *)phys_to_virt(pd[pd_i] & ~0xFFFULL);
                 for (int pt_i = 0; pt_i < 512; pt_i++) {
                     if (pt[pt_i] & PTE_PRESENT) {
-                        pmm_free_page(pt[pt_i] & ~0xFFFULL);
+                        PmmFreePage(pt[pt_i] & ~0xFFFULL);
                     }
                 }
-                pmm_free_page(virt_to_phys(pt));
+                PmmFreePage(VirtToPhys(pt));
             }
-            pmm_free_page(virt_to_phys(pd));
+            PmmFreePage(VirtToPhys(pd));
         }
-        pmm_free_page(virt_to_phys(pdp));
+        PmmFreePage(VirtToPhys(pdp));
     }
 
     /* Free the PML4 page and the page holding the struct. */
-    pmm_free_page(as->pml4_phys);
-    pmm_free_page(virt_to_phys(as));
+    PmmFreePage(as->pml4_phys);
+    PmmFreePage(VirtToPhys(as));
 }
 
-error_t vmm_map(addr_space_t *as, u64 virt, u64 phys, u64 flags) {
+error_t VmmMap(addr_space_t *as, u64 virt, u64 phys, u64 flags) {
     if (!as)
         return ERR_INVAL;
     /* Defense in depth: never touch the kernel-half page tables
@@ -340,7 +384,7 @@ error_t vmm_map(addr_space_t *as, u64 virt, u64 phys, u64 flags) {
      * previously-mapped physical page here, which is unsafe: the page may
      * still be referenced elsewhere (aliased into another address space,
      * or the caller may still hold a pointer to it).  Callers must
-     * explicitly vmm_unmap() first.  No legitimate call site re-maps an
+     * explicitly VmmUnmap() first.  No legitimate call site re-maps an
      * already-mapped VA (ELF segments, thread stacks, heap growth and the
      * init stack all map fresh VAs). */
     if (*pte & PTE_PRESENT)
@@ -350,7 +394,7 @@ error_t vmm_map(addr_space_t *as, u64 virt, u64 phys, u64 flags) {
     return OK;
 }
 
-error_t vmm_unmap(addr_space_t *as, u64 virt) {
+error_t VmmUnmap(addr_space_t *as, u64 virt) {
     if (!as)
         return ERR_INVAL;
     /* Defense in depth: mirror vmm_map — never touch the kernel-half
@@ -362,13 +406,13 @@ error_t vmm_unmap(addr_space_t *as, u64 virt) {
     u64  idx;
 
     /* PML4 -> PDP */
-    idx = pml4_index(virt);
+    idx = pml4Index(virt);
     if (!(pml4[idx] & PTE_PRESENT))
         return ERR_NOENT;
     u64 *pdp = (u64 *)phys_to_virt(pml4[idx] & ~0xFFFULL);
 
     /* PDP -> PD */
-    idx = pdp_index(virt);
+    idx = pdpIndex(virt);
     if (!(pdp[idx] & PTE_PRESENT))
         return ERR_NOENT;
     if (pdp[idx] & PTE_HUGE) {
@@ -379,7 +423,7 @@ error_t vmm_unmap(addr_space_t *as, u64 virt) {
     u64 *pd = (u64 *)phys_to_virt(pdp[idx] & ~0xFFFULL);
 
     /* PD -> PT */
-    idx = pd_index(virt);
+    idx = pdIndex(virt);
     if (!(pd[idx] & PTE_PRESENT))
         return ERR_NOENT;
     if (pd[idx] & PTE_HUGE) {
@@ -390,7 +434,7 @@ error_t vmm_unmap(addr_space_t *as, u64 virt) {
     u64 *pt = (u64 *)phys_to_virt(pd[idx] & ~0xFFFULL);
 
     /* Clear the final PTE and invalidate TLB. */
-    idx = pt_index(virt);
+    idx = PtIndex(virt);
     if (!(pt[idx] & PTE_PRESENT)) {
         /* Leaf not mapped.  SYS_VSPACE_ALLOC pre-builds whole PML4E/PDPTE/
          * PDE/PT hierarchies with leaf PTEs left not-present (vspace.c), so
@@ -401,17 +445,17 @@ error_t vmm_unmap(addr_space_t *as, u64 virt) {
          * pages in the same 2 MB window) the PT is shared -- never free it.
          * Return OK in both cases so vmm_unmap_range keeps walking
          * subsequent pages instead of aborting mid-range on ERR_NOENT. */
-        if (page_table_empty(pt)) {
-            pd[pd_index(virt)] = 0;
-            pmm_free_page(virt_to_phys(pt));
+        if (PageTableEmpty(pt)) {
+            pd[pdIndex(virt)] = 0;
+            PmmFreePage(VirtToPhys(pt));
 
-            if (page_table_empty(pd)) {
-                pdp[pdp_index(virt)] = 0;
-                pmm_free_page(virt_to_phys(pd));
+            if (PageTableEmpty(pd)) {
+                pdp[pdpIndex(virt)] = 0;
+                PmmFreePage(VirtToPhys(pd));
 
-                if (page_table_empty(pdp)) {
-                    pml4[pml4_index(virt)] = 0;
-                    pmm_free_page(virt_to_phys(pdp));
+                if (PageTableEmpty(pdp)) {
+                    pml4[pml4Index(virt)] = 0;
+                    PmmFreePage(VirtToPhys(pdp));
                 }
             }
         }
@@ -421,17 +465,17 @@ error_t vmm_unmap(addr_space_t *as, u64 virt) {
     __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
 
     /* Walk back up and free empty page tables. */
-    if (page_table_empty(pt)) {
-        pd[pd_index(virt)] = 0;
-        pmm_free_page(virt_to_phys(pt));
+    if (PageTableEmpty(pt)) {
+        pd[pdIndex(virt)] = 0;
+        PmmFreePage(VirtToPhys(pt));
 
-        if (page_table_empty(pd)) {
-            pdp[pdp_index(virt)] = 0;
-            pmm_free_page(virt_to_phys(pd));
+        if (PageTableEmpty(pd)) {
+            pdp[pdpIndex(virt)] = 0;
+            PmmFreePage(VirtToPhys(pd));
 
-            if (page_table_empty(pdp)) {
-                pml4[pml4_index(virt)] = 0;
-                pmm_free_page(virt_to_phys(pdp));
+            if (PageTableEmpty(pdp)) {
+                pml4[pml4Index(virt)] = 0;
+                PmmFreePage(VirtToPhys(pdp));
             }
         }
     }
@@ -439,7 +483,7 @@ error_t vmm_unmap(addr_space_t *as, u64 virt) {
     return OK;
 }
 
-u64 vmm_virt_to_phys(addr_space_t *as, u64 virt) {
+u64 VmmVirtToPhys(addr_space_t *as, u64 virt) {
     if (!as)
         return 0;
 
@@ -455,7 +499,7 @@ addr_space_t *vmm_get_kernel_addr_space(void) {
     return &s_kernel_as;
 }
 
-void vmm_switch_addr_space(addr_space_t *as) {
+void VmmSwitchAddrSpace(addr_space_t *as) {
     if (!as)
         return;
     /* Short-circuit: if CR3 already points at this address space, do
@@ -473,35 +517,35 @@ void vmm_switch_addr_space(addr_space_t *as) {
     __asm__ volatile("mov %0, %%cr3" : : "r"(as->pml4_phys) : "memory");
 }
 
-error_t vmm_map_range(addr_space_t *as, u64 virt, u64 phys, u64 page_count, u64 flags) {
+error_t VmmMapRange(addr_space_t *as, u64 virt, u64 phys, u64 page_count, u64 flags) {
     for (u64 i = 0; i < page_count; i++) {
-        error_t err = vmm_map(as, virt + i * PAGE_SIZE, phys + i * PAGE_SIZE, flags);
+        error_t err = VmmMap(as, virt + i * PAGE_SIZE, phys + i * PAGE_SIZE, flags);
         if (err != OK)
             return err;
     }
     return OK;
 }
 
-error_t vmm_unmap_range(addr_space_t *as, u64 virt, u64 page_count) {
+error_t VmmUnmapRange(addr_space_t *as, u64 virt, u64 page_count) {
     for (u64 i = 0; i < page_count; i++) {
-        error_t err = vmm_unmap(as, virt + i * PAGE_SIZE);
+        error_t err = VmmUnmap(as, virt + i * PAGE_SIZE);
         if (err != OK)
             return err;
     }
     return OK;
 }
 
-error_t vmm_alloc_and_map(addr_space_t *as, u64 virt, u64 flags) {
-    u64 page = pmm_alloc_page();
+error_t VmmAllocAndMap(addr_space_t *as, u64 virt, u64 flags) {
+    u64 page = PmmAllocPage();
     if (!page)
         return ERR_NOMEM;
 
-    zero_page(phys_to_virt(page));
-    error_t err = vmm_map(as, virt, page, flags);
+    ZeroPage(phys_to_virt(page));
+    error_t err = VmmMap(as, virt, page, flags);
     if (err != OK) {
         /* vmm_map failed (e.g. VA already mapped -> ERR_BUSY): the page
          * was allocated but never inserted, so return it to the pool. */
-        pmm_free_page(page);
+        PmmFreePage(page);
         return err;
     }
     return OK;

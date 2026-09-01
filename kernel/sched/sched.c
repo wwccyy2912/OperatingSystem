@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * sched.c - CFS (Completely Fair Scheduler) with red-black tree
  * Copyright (c) 2026 OpSys Project
  *
@@ -13,6 +26,32 @@
  * vruntime_increment = delta * (NICE_0_LOAD / weight)
  *
  * Nice 0 (priority 10) is the baseline weight.
+ *
+ * ------------------------------------------------------------------
+ * Structure (scheduler):
+ *   ready: s_ready_tree  -- RB tree keyed by vruntime;
+ *          leftmost (rb_min) is always the next thread
+ *   run:   s_current[0] (= g_current_thread) -- running thread
+ *   sleep: s_sleep_list -- sleepers sorted by wake_tick (ascending)
+ *   flow:  PIT IRQ0 -> SchedTick() -> Reschedule()          (preempt)
+ *          yield/block -> SchedReschedule() -> Reschedule() (handover)
+ * How it works:
+ *   Per tick the running thread's vruntime grows by a precomputed step
+ *   (NICE_0_LOAD / weight, clamped >= 1): higher priority -> higher
+ *   weight -> slower vruntime growth -> more CPU.  Reschedule() picks
+ *   the leftmost thread and switches with IF=0, interrupt-atomically:
+ *   FpuSwitch() (fxsave/fxrstor), SchedSetKernelGs() (GS-base wrmsr)
+ *   and context_switch() (TSS.RSP0 updated to next's kstack_top).
+ * Purpose:
+ *   Weighted-fair CPU sharing: run the lowest-vruntime ready thread,
+ *   with O(log n) enqueue/dequeue and O(1) next-thread selection.
+ * Caveats:
+ *   - Idle (tid 0) never enters the ready tree; the idle fallback
+ *     only fires when the current thread is BLOCKED/FINISHED.
+ *   - SchedEnqueue() is idempotent (in_tree guard); SchedSleep()
+ *     links the sleep list and dequeues atomically under cli so the
+ *     timer IRQ never sees a thread on both structures at once.
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/sched.h>
@@ -39,7 +78,7 @@ static u8 s_fpu_state[MAX_THREADS][512] __attribute__((aligned(16)));
 
 /* Seed tid's FPU slot to the x86 hardware defaults (see thread.c
  * alloc_thread — fresh AND recycled slots).  Safe before any fxsave. */
-void fpu_state_init(tid_t tid) {
+void FpuStateInit(tid_t tid) {
     if (tid < 0 || tid >= MAX_THREADS)
         return;
     u8 *slot = s_fpu_state[tid];
@@ -58,10 +97,10 @@ void fpu_state_init(tid_t tid) {
  * Eager strategy: fxsave/fxrstor on EVERY switch.  The kernel itself
  * is built with -mno-sse/-mno-sse2/-mno-mmx, so kernel code never
  * touches FPU/SSE state; CR4.OSFXSR is set in boot.asm (bits 9-10).
- * Every thread slot is pre-seeded to x86 defaults by fpu_state_init(),
+ * Every thread slot is pre-seeded to x86 defaults by FpuStateInit(),
  * so fxrstor is always valid — including the very first switch into a
  * fresh thread and switches involving idle (tid 0). */
-static inline void fpu_switch(thread_t *prev, thread_t *next) {
+static inline void FpuSwitch(thread_t *prev, thread_t *next) {
     __asm__ volatile("fxsave %0" : "=m"(s_fpu_state[prev->tid]) : : "memory");
     __asm__ volatile("fxrstor %0" :: "m"(s_fpu_state[next->tid]) : "memory");
 }
@@ -101,25 +140,25 @@ static u64 s_ticks;
 
 /*
  * Sleepers are kept on a singly-linked list sorted by wake_tick
- * (absolute, ascending).  Each tick, wake_sleepers() only inspects the
+ * (absolute, ascending).  Each tick, WakeSleepers() only inspects the
  * list HEAD: pop + re-enqueue every entry whose deadline has passed.
  * Amortized O(1) per tick instead of scanning all MAX_THREADS.
  *
  * Invariants (enforced to prevent CFS double-inserts):
- *  - sched_sleep() inserts a thread into the list, sets it BLOCKED and
+ *  - SchedSleep() inserts a thread into the list, sets it BLOCKED and
  *    dequeues it from the ready tree while interrupts are disabled, so
  *    the timer IRQ can never observe a thread that is simultaneously on
  *    this list and in the ready tree.
- *  - wake_sleepers() only re-enqueues entries whose state is still
+ *  - WakeSleepers() only re-enqueues entries whose state is still
  *    BLOCKED: a sleeper woken early by another path (all wake paths
  *    match state == BLOCKED, and a sleeping thread IS BLOCKED) is
  *    already READY and in the ready tree.
- *  - sched_enqueue() is idempotent (no-op when the node is in_tree).
+ *  - SchedEnqueue() is idempotent (no-op when the node is in_tree).
  */
 static thread_t *s_sleep_list;
 
 /* Forward declarations */
-static void wake_sleepers(void);
+static void WakeSleepers(void);
 
 /* ------------------------------------------------------------------ */
 /*  Init                                                              */
@@ -143,15 +182,15 @@ static void wake_sleepers(void);
 #define MSR_GS_BASE          0xC0000101u
 #define MSR_KERNEL_GS_BASE   0xC0000102u
 
-static inline void sched_set_kernel_gs(thread_t *t) {
+static inline void SchedSetKernelGs(thread_t *t) {
     u64 p = (u64)(uintptr_t)t;
     __asm__ volatile("wrmsr" :: "c"(MSR_GS_BASE), "a"(0u), "d"(0u) : "memory");
     __asm__ volatile("wrmsr" :: "c"(MSR_KERNEL_GS_BASE),
                      "a"((u32)p), "d"((u32)(p >> 32)) : "memory");
 }
 
-void sched_init(void) {
-    rb_init(&s_ready_tree);
+void SchedInit(void) {
+    RbInit(&s_ready_tree);
     for (int i = 0; i < MAX_CPUS; i++)
         s_current[i] = NULL;
     for (int p = 0; p < 32; p++) {
@@ -164,28 +203,28 @@ void sched_init(void) {
 /*  Enqueue / Dequeue                                                 */
 /* ------------------------------------------------------------------ */
 
-void sched_enqueue(thread_t *t) {
+void SchedEnqueue(thread_t *t) {
     if (!t)
         return;
 
     /* Idempotency guard: a thread can be woken twice (e.g. by a wake
-     * path and then by wake_sleepers() while it was on the sleep list).
-     * rb_insert() has NO in_tree check and would re-link a node that is
+     * path and then by WakeSleepers() while it was on the sleep list).
+     * RbInsert() has NO in_tree check and would re-link a node that is
      * already linked in the tree, creating a self-cycle that makes
-     * rb_insert_fixup() spin forever.  Symmetric with rb_remove(). */
+     * RbInsertFixup() spin forever.  Symmetric with RbRemove(). */
     if (t->rb.in_tree)
         return;
 
     t->state  = THREAD_STATE_READY;
     t->rb.key = t->vruntime;
-    rb_insert(&s_ready_tree, &t->rb);
+    RbInsert(&s_ready_tree, &t->rb);
 }
 
-void sched_dequeue(thread_t *t) {
+void SchedDequeue(thread_t *t) {
     if (!t)
         return;
 
-    rb_remove(&s_ready_tree, &t->rb);
+    RbRemove(&s_ready_tree, &t->rb);
 }
 
 /* ------------------------------------------------------------------ */
@@ -212,13 +251,13 @@ static thread_t *pick_next(void) {
  *
  * Does NOT advance s_ticks: the time base belongs exclusively to the
  * PIT IRQ0 (sched_tick).  Blocking/yield paths (join, wait, sleep,
- * exit, yield) call sched_reschedule() purely to hand over the CPU;
- * if they called this via sched_tick(), every blocking operation
+ * exit, yield) call SchedReschedule() purely to hand over the CPU;
+ * if they called this via SchedTick(), every blocking operation
  * would advance the clock, inflating the tick rate far beyond the
  * PIT's 100 Hz (observed ~1500-2000 ticks/s) and making sleep()/
  * get_time() load-dependent instead of wall-clock based.
  */
-static void reschedule(int resume_if) {
+static void Reschedule(int resume_if) {
     thread_t *cur = s_current[0];
     if (!cur)
         return;
@@ -253,11 +292,11 @@ static void reschedule(int resume_if) {
             idle->state      = THREAD_STATE_RUNNING;
             s_current[0]     = idle;
             g_current_thread = idle;
-            sched_set_kernel_gs(idle);
-            gdt_set_tss_rsp0(idle->kstack_top);
+            SchedSetKernelGs(idle);
+            GdtSetTssRsp0(idle->kstack_top);
             /* Enter context_switch with IF=0 (see comment below). */
             __asm__ volatile("cli" ::: "memory");
-            fpu_switch(cur, idle);
+            FpuSwitch(cur, idle);
             context_switch(cur, idle, resume_if);
             __asm__ volatile("" ::: "memory");
         }
@@ -270,25 +309,25 @@ static void reschedule(int resume_if) {
      * current and someone is woken, we switch to the woken thread and
      * leave idle out of the tree. */
     if (cur->tid != 0 && (cur->state == THREAD_STATE_RUNNING || cur->state == THREAD_STATE_READY)) {
-        sched_dequeue(cur);
-        sched_enqueue(cur);
+        SchedDequeue(cur);
+        SchedEnqueue(cur);
     }
 
     /* Switch to next */
-    sched_dequeue(next);
+    SchedDequeue(next);
     next->state      = THREAD_STATE_RUNNING;
     s_current[0]     = next;
     g_current_thread = next;
-    sched_set_kernel_gs(next);
+    SchedSetKernelGs(next);
 
     if (cur != next) {
-        gdt_set_tss_rsp0(next->kstack_top);
+        GdtSetTssRsp0(next->kstack_top);
         /* Enter context_switch with IF=0: the whole save/restore is
          * interrupt-atomic (see context_switch.S).  cli must precede
          * the call — an IRQ at the call/entry boundary would nest a
          * context_switch into a half-prepared state. */
         __asm__ volatile("cli" ::: "memory");
-        fpu_switch(cur, next);
+        FpuSwitch(cur, next);
         context_switch(cur, next, resume_if);
     }
 
@@ -299,29 +338,29 @@ static void reschedule(int resume_if) {
 /*
  * Timer tick — called ONLY from the PIT IRQ0 handler (idt.c).  This is
  * the single source of truth for the time base: s_ticks advances at
- * the PIT rate (100 Hz) and wake_sleepers() runs on the same cadence.
+ * the PIT rate (100 Hz) and WakeSleepers() runs on the same cadence.
  */
-void sched_tick(void) {
+void SchedTick(void) {
     s_ticks++;
-    wake_sleepers();
-    reschedule(0); /* preempted: prev resumes via the ISR iretq (IF=0) */
+    WakeSleepers();
+    Reschedule(0); /* preempted: prev resumes via the ISR iretq (IF=0) */
 }
 
 /*
  * Explicit reschedule from a blocking/yield path: join, process_wait,
- * sched_sleep, thread_exit, thread_yield.  Pure context switch — the
+ * sched_sleep, ThreadExit, thread_yield.  Pure context switch — the
  * clock (s_ticks) must NOT advance here, otherwise every blocking
  * operation becomes a "tick" and time drifts with system load.
  */
-void sched_reschedule(void) {
-    reschedule(1); /* voluntary: prev resumes at its continuation (IF=1) */
+void SchedReschedule(void) {
+    Reschedule(1); /* voluntary: prev resumes at its continuation (IF=1) */
 }
 
 /* ------------------------------------------------------------------ */
 /*  Direct switch                                                     */
 /* ------------------------------------------------------------------ */
 
-void sched_switch_to(thread_t *t) {
+void SchedSwitchTo(thread_t *t) {
     if (!t)
         return;
 
@@ -329,18 +368,18 @@ void sched_switch_to(thread_t *t) {
     if (cur == t)
         return;
 
-    sched_dequeue(t);
+    SchedDequeue(t);
 
     t->state         = THREAD_STATE_RUNNING;
     s_current[0]     = t;
     g_current_thread = t;
-    sched_set_kernel_gs(t);
+    SchedSetKernelGs(t);
 
     if (cur) {
-        gdt_set_tss_rsp0(t->kstack_top);
+        GdtSetTssRsp0(t->kstack_top);
         /* Interrupt-atomic switch (see context_switch.S). */
         __asm__ volatile("cli" ::: "memory");
-        fpu_switch(cur, t);
+        FpuSwitch(cur, t);
         context_switch(cur, t, 1); /* direct switch: prev resumes with IF=1 */
     }
 }
@@ -349,17 +388,17 @@ void sched_switch_to(thread_t *t) {
 /*  Current-thread accessor (no context switch)                        */
 /* ------------------------------------------------------------------ */
 
-void sched_set_current(thread_t *t) {
+void SchedSetCurrent(thread_t *t) {
     /* The running thread must never sit in the ready tree: once its
      * vruntime grows in place, its rb.key is a stale snapshot that
      * keeps rb_min() returning this thread forever (init-thread
-     * starvation).  sched_dequeue() is a no-op for a thread that is
+     * starvation).  SchedDequeue() is a no-op for a thread that is
      * not in the tree (rb_remove guards on in_tree). */
-    sched_dequeue(t);
+    SchedDequeue(t);
 
     s_current[0]     = t;
     g_current_thread = t;
-    sched_set_kernel_gs(t);
+    SchedSetKernelGs(t);
 }
 
 /* ------------------------------------------------------------------ */
@@ -370,11 +409,11 @@ thread_t *sched_get_current(void) {
     return s_current[0];
 }
 
-u32 sched_get_thread_count(void) {
+u32 SchedGetThreadCount(void) {
     return (u32)(s_ready_tree.count + (s_current[0] ? 1 : 0));
 }
 
-u64 sched_get_ticks(void) {
+u64 SchedGetTicks(void) {
     return s_ticks;
 }
 
@@ -382,7 +421,7 @@ u64 sched_get_ticks(void) {
 /*  Sleep (blocking timeout)                                           */
 /* ------------------------------------------------------------------ */
 
-void sched_sleep(u64 ticks) {
+void SchedSleep(u64 ticks) {
     thread_t *cur = s_current[0];
     if (!cur)
         return;
@@ -393,10 +432,10 @@ void sched_sleep(u64 ticks) {
     /*
      * Critical section: the sleep-list insert, the state change and the
      * ready-tree dequeue must be atomic w.r.t. the timer IRQ.
-     * wake_sleepers() runs from sched_tick() (PIT IRQ0 context); if it
+     * WakeSleepers() runs from SchedTick() (PIT IRQ0 context); if it
      * observed this thread between the list insert and the dequeue, it
      * would re-enqueue a thread that is STILL linked in the ready tree ->
-     * double insert -> rb_insert() self-cycle -> infinite loop (the
+     * double insert -> RbInsert() self-cycle -> infinite loop (the
      * `sleep 1` hang).  cli/sti suffices: on this single-CPU kernel the
      * PIT IRQ is the only preemption source.
      */
@@ -411,32 +450,32 @@ void sched_sleep(u64 ticks) {
     *pp             = cur;
 
     cur->state = THREAD_STATE_BLOCKED;
-    sched_dequeue(cur);
+    SchedDequeue(cur);
 
     __asm__ volatile("sti" ::: "memory");
 
     /* Pure reschedule — the clock (s_ticks) must not advance here.
-     * The wakeup is done by wake_sleepers() on the next PIT tick. */
-    sched_reschedule();
+     * The wakeup is done by WakeSleepers() on the next PIT tick. */
+    SchedReschedule();
 }
 
 /*
  * Unlink a thread from the sleep list.  Called when a blocked sleeper
- * is woken early by a path other than wake_sleepers() (e.g. a dying
+ * is woken early by a path other than WakeSleepers() (e.g. a dying
  * process force-waking its threads): between the wake and the sleep
  * deadline the thread must never sit simultaneously on the sleep list
  * and in the ready tree.
  *
  * Must be called with interrupts disabled (syscall/interrupt context,
- * IF=0), the same requirement as sched_sleep: wake_sleepers() runs
+ * IF=0), the same requirement as sched_sleep: WakeSleepers() runs
  * from the PIT IRQ and must not observe a half-unlinked entry.
  */
-void sched_unsleep(thread_t *t) {
+void SchedUnsleep(thread_t *t) {
     if (!t)
         return;
 
     /* wake_tick != 0 is the "on sleep list" sentinel: sched_sleep sets
-     * it to s_ticks + ticks (>= 1) before inserting, wake_sleepers()
+     * it to s_ticks + ticks (>= 1) before inserting, WakeSleepers()
      * clears it when popping, alloc_thread zeroes it at creation. */
     thread_t **pp = &s_sleep_list;
     while (*pp && *pp != t)
@@ -457,7 +496,7 @@ void sched_unsleep(thread_t *t) {
  * passed.  The list is sorted by wake_tick, so only the head chain
  * needs inspection -- amortized O(1) per tick.
  */
-static void wake_sleepers(void) {
+static void WakeSleepers(void) {
     while (s_sleep_list && s_sleep_list->wake_tick <= s_ticks) {
         thread_t *t   = s_sleep_list;
         s_sleep_list  = t->sleep_next;
@@ -474,6 +513,6 @@ static void wake_sleepers(void) {
             continue;
 
         t->state = THREAD_STATE_READY;
-        sched_enqueue(t);
+        SchedEnqueue(t);
     }
 }

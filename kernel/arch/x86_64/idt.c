@@ -1,10 +1,43 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * idt.c - Interrupt Descriptor Table for x86_64
  * Copyright (c) 2026 OpSys Project
  *
  * 256 IDT entries with ISR stubs for all vectors.
  * PIC remapping: IRQ 0-15 → vectors 32-47.
  * Individual ISR stubs defined as naked functions with inline asm.
+ *
+ * ------------------------------------------------------------------
+ * Structure (idt):
+ *   IdtInit(): idt[256] 16B gates — trap v<32 | interrupt 32..255 |
+ *   DPL=3 gate @0x80 (syscall_entry_stub); IST1/IST2 for #DF/NMI;
+ *   lidt; PicRemap IRQ 0-15 -> 32-47, mask all, unmask 0/2/4; MSRs
+ *   EFER.SCE/STAR/LSTAR/SFMASK -> syscall_entry_fast.
+ * How it works:
+ *   CPU -> isr_stub_N (push err+vec) -> isr_common_stub (push 15
+ *   GPRs, rdi=frame) -> isr_handler: EOI first, signals, SchedTick
+ *   (IRQ0), IrqHandle (dev IRQs); v<32 -> dump + Panic (user #PF ->
+ *   SIGSEGV); registered handlers for software interrupts.
+ * Purpose:
+ *   One table + one C dispatcher for all interrupts/exceptions and
+ *   both syscall entries (INT 0x80 and SYSCALL).
+ * Caveats:
+ *   Stubs are naked asm with a hand-rolled stack layout (see
+ *   interrupt_frame_t); EOI must precede any schedule/exit path.
+ *   Vector 0x80 and the SYSCALL MSR path are separate entries.
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/idt.h>
@@ -84,7 +117,7 @@ static idt_ptr_t   idt_ptr;
 /* IDT entry setup                                                    */
 /* ------------------------------------------------------------------ */
 
-static void idt_set_entry(idt_entry_t *entry, u64 handler, u8 type_attr, u8 ist) {
+static void IdtSetEntry(idt_entry_t *entry, u64 handler, u8 type_attr, u8 ist) {
     entry->offset_low  = handler & 0xFFFF;
     entry->offset_mid  = (handler >> 16) & 0xFFFF;
     entry->offset_high = (handler >> 32) & 0xFFFFFFFF;
@@ -369,57 +402,57 @@ static const isr_stub_fn isr_stub_table[IDT_ENTRIES] = {
 /* PIC initialization (8259A)                                         */
 /* ------------------------------------------------------------------ */
 
-static void pic_remap(void) {
+static void PicRemap(void) {
     /* Save current masks */
-    u8 master_mask = io_inb(PIC_MASTER_DATA);
-    u8 slave_mask  = io_inb(PIC_SLAVE_DATA);
+    u8 master_mask = IoInb(PIC_MASTER_DATA);
+    u8 slave_mask  = IoInb(PIC_SLAVE_DATA);
 
     /* ICW1: begin initialization, ICW4 needed */
-    io_outb(PIC_MASTER_CMD, 0x11);
-    io_outb(PIC_SLAVE_CMD, 0x11);
+    IoOutb(PIC_MASTER_CMD, 0x11);
+    IoOutb(PIC_SLAVE_CMD, 0x11);
 
     /* ICW2: vector offset */
-    io_outb(PIC_MASTER_DATA, IRQ_VECTOR_BASE);    /* IRQ 0-7 → 32-39 */
-    io_outb(PIC_SLAVE_DATA, IRQ_VECTOR_BASE + 8); /* IRQ 8-15 → 40-47 */
+    IoOutb(PIC_MASTER_DATA, IRQ_VECTOR_BASE);    /* IRQ 0-7 → 32-39 */
+    IoOutb(PIC_SLAVE_DATA, IRQ_VECTOR_BASE + 8); /* IRQ 8-15 → 40-47 */
 
     /* ICW3: cascade */
-    io_outb(PIC_MASTER_DATA, 0x04); /* Slave on IRQ2 */
-    io_outb(PIC_SLAVE_DATA, 0x02);  /* Cascade identity */
+    IoOutb(PIC_MASTER_DATA, 0x04); /* Slave on IRQ2 */
+    IoOutb(PIC_SLAVE_DATA, 0x02);  /* Cascade identity */
 
     /* ICW4: 8086 mode */
-    io_outb(PIC_MASTER_DATA, 0x01);
-    io_outb(PIC_SLAVE_DATA, 0x01);
+    IoOutb(PIC_MASTER_DATA, 0x01);
+    IoOutb(PIC_SLAVE_DATA, 0x01);
 
     /* Restore masks */
-    io_outb(PIC_MASTER_DATA, master_mask);
-    io_outb(PIC_SLAVE_DATA, slave_mask);
+    IoOutb(PIC_MASTER_DATA, master_mask);
+    IoOutb(PIC_SLAVE_DATA, slave_mask);
 }
 
-static void pic_mask_all(void) {
-    io_outb(PIC_MASTER_DATA, 0xFF);
-    io_outb(PIC_SLAVE_DATA, 0xFF);
+static void PicMaskAll(void) {
+    IoOutb(PIC_MASTER_DATA, 0xFF);
+    IoOutb(PIC_SLAVE_DATA, 0xFF);
 }
 
-static void pic_unmask_irq(u8 irq) {
+static void PicUnmaskIrq(u8 irq) {
     u16 port  = (irq < 8) ? PIC_MASTER_DATA : PIC_SLAVE_DATA;
     u8  shift = irq % 8;
-    u8  mask  = io_inb(port);
+    u8  mask  = IoInb(port);
     mask &= ~(1 << shift);
-    io_outb(port, mask);
+    IoOutb(port, mask);
 }
 
-static void pic_mask_irq(u8 irq) {
+static void PicMaskIrq(u8 irq) {
     u16 port  = (irq < 8) ? PIC_MASTER_DATA : PIC_SLAVE_DATA;
     u8  shift = irq % 8;
-    u8  mask  = io_inb(port);
+    u8  mask  = IoInb(port);
     mask |= (1 << shift);
-    io_outb(port, mask);
+    IoOutb(port, mask);
 }
 
-static void pic_send_eoi(u8 irq) {
+static void PicSendEoi(u8 irq) {
     if (irq >= 8)
-        io_outb(PIC_SLAVE_CMD, PIC_EOI);
-    io_outb(PIC_MASTER_CMD, PIC_EOI);
+        IoOutb(PIC_SLAVE_CMD, PIC_EOI);
+    IoOutb(PIC_MASTER_CMD, PIC_EOI);
 }
 
 /* ------------------------------------------------------------------ */
@@ -453,21 +486,21 @@ static const char *const s_exception_names[32] = {
 };
 
 /* Read CR2 (faulting address for #PF) */
-static inline u64 read_cr2(void) {
+static inline u64 ReadCr2(void) {
     u64 val;
     __asm__ volatile("mov %%cr2, %0" : "=r"(val));
     return val;
 }
 
 /* Read CR3 (page table base) */
-static inline u64 read_cr3(void) {
+static inline u64 ReadCr3(void) {
     u64 val;
     __asm__ volatile("mov %%cr3, %0" : "=r"(val));
     return val;
 }
 
 /* Read CR0 */
-static inline u64 read_cr0(void) {
+static inline u64 ReadCr0(void) {
     u64 val;
     __asm__ volatile("mov %%cr0, %0" : "=r"(val));
     return val;
@@ -485,25 +518,25 @@ void isr_handler(interrupt_frame_t *frame) {
          * signal checkpoint below may terminate the thread (thread_exit
          * never returns) and sched_tick may switch away, so the PIC
          * must not be left holding this IRQ in-service. */
-        pic_send_eoi(irq);
+        PicSendEoi(irq);
 
         /* Signal delivery checkpoint: pending signals are delivered on
          * user-mode IRQ returns (no-op for kernel frames).  Runs before
-         * sched_tick() so delivery is not deferred across a context
+         * SchedTick() so delivery is not deferred across a context
          * switch. */
-        signal_check_interrupt(frame);
+        SignalCheckInterrupt(frame);
 
         /* Timer (IRQ0): kernel-owned, always ticks the scheduler */
         if (irq == 0)
-            sched_tick();
+            SchedTick();
 
         /* Forward bound device IRQs to the userspace owner */
-        bool forwarded = irq_handle(irq);
+        bool forwarded = IrqHandle(irq);
 
         /* Legacy kernel fallback for unbound IRQ4: drain serial RX FIFO */
         if (irq == 4 && !forwarded) {
-            while (io_inb(SERIAL_COM1_BASE + 5) & 0x01)
-                (void)io_inb(SERIAL_COM1_BASE);
+            while (IoInb(SERIAL_COM1_BASE + 5) & 0x01)
+                (void)IoInb(SERIAL_COM1_BASE);
         }
 
         return;
@@ -520,43 +553,43 @@ void isr_handler(interrupt_frame_t *frame) {
         const char *name = (vector < 32 && s_exception_names[vector]) ? s_exception_names[vector]
                                                                       : "Unknown";
 
-        serial_printf("\n====== CPU EXCEPTION ======\n");
-        serial_printf("  %s (vector=%u, error=0x%x)\n", name, (u32)vector, (u32)err_code);
-        serial_printf("  RIP  = %p\n", frame->rip);
-        serial_printf("  CS   = 0x%x\n", frame->cs);
-        serial_printf("  RFLAGS = 0x%x\n", frame->rflags);
-        serial_printf("  RSP  = %p\n", frame->rsp);
-        serial_printf("  SS   = 0x%x\n", frame->ss);
-        serial_printf("  RAX  = %p\n", frame->rax);
-        serial_printf("  RBX  = %p\n", frame->rbx);
-        serial_printf("  RCX  = %p\n", frame->rcx);
-        serial_printf("  RDX  = %p\n", frame->rdx);
-        serial_printf("  RSI  = %p\n", frame->rsi);
-        serial_printf("  RDI  = %p\n", frame->rdi);
-        serial_printf("  RBP  = %p\n", frame->rbp);
+        SerialPrintf("\n====== CPU EXCEPTION ======\n");
+        SerialPrintf("  %s (vector=%u, error=0x%x)\n", name, (u32)vector, (u32)err_code);
+        SerialPrintf("  RIP  = %p\n", frame->rip);
+        SerialPrintf("  CS   = 0x%x\n", frame->cs);
+        SerialPrintf("  RFLAGS = 0x%x\n", frame->rflags);
+        SerialPrintf("  RSP  = %p\n", frame->rsp);
+        SerialPrintf("  SS   = 0x%x\n", frame->ss);
+        SerialPrintf("  RAX  = %p\n", frame->rax);
+        SerialPrintf("  RBX  = %p\n", frame->rbx);
+        SerialPrintf("  RCX  = %p\n", frame->rcx);
+        SerialPrintf("  RDX  = %p\n", frame->rdx);
+        SerialPrintf("  RSI  = %p\n", frame->rsi);
+        SerialPrintf("  RDI  = %p\n", frame->rdi);
+        SerialPrintf("  RBP  = %p\n", frame->rbp);
 
         if (vector == 14) {
             /*
              * User-mode page fault: deliver SIGSEGV (default action =
              * terminate the process) instead of halting the whole
              * system.  The faulting instruction cannot be resumed, so
-             * the process must die: signal_kill_process() marks every
+             * the process must die: SignalKillProcess() marks every
              * thread force_exit (waking blocked ones) and
-             * thread_exit() finishes this one.  Never returns.
+             * ThreadExit() finishes this one.  Never returns.
              */
             if ((frame->cs & 3) == 3) {
-                serial_printf("\nUser-mode #PF at %p -> SIGSEGV\n", read_cr2());
+                SerialPrintf("\nUser-mode #PF at %p -> SIGSEGV\n", ReadCr2());
                 process_t *proc = process_current();
                 if (proc)
-                    signal_kill_process(proc, 128 + SIGSEGV);
-                thread_exit(128 + SIGSEGV);
+                    SignalKillProcess(proc, 128 + SIGSEGV);
+                ThreadExit(128 + SIGSEGV);
                 /* unreachable */
             }
 
             /* Kernel-mode fault: existing crash dump below */
-            serial_printf("  CR2  = %p (faulting address)\n", read_cr2());
-            serial_printf("  CR3  = %p (page table base)\n", read_cr3());
-            serial_printf("  Error: %s %s %s\n",
+            SerialPrintf("  CR2  = %p (faulting address)\n", ReadCr2());
+            SerialPrintf("  CR3  = %p (page table base)\n", ReadCr3());
+            SerialPrintf("  Error: %s %s %s\n",
                           (err_code & 1) ? "PRESENT" : "NOT-PRESENT",
                           (err_code & 2) ? "WRITE" : "READ",
                           (err_code & 4) ? "USER" : "SUPERVISOR");
@@ -568,15 +601,15 @@ void isr_handler(interrupt_frame_t *frame) {
                 __asm__ volatile("mov %%rsp, %0" : "=r"(ksp));
                 const char *state_names[] = {"READY", "RUNNING", "BLOCKED", "ZOMBIE", "FINISHED"};
                 int         sidx          = (th->state >= 0 && th->state <= 4) ? th->state : 0;
-                serial_printf(
+                SerialPrintf(
                     "  Thread: TID=%d PID=%d state=%s\n", th->tid, th->pid, state_names[sidx]);
-                serial_printf(
+                SerialPrintf(
                     "  Kernel RSP=%p kstack=[%p-%p]\n", ksp, th->kstack_base, th->kstack_top);
-                serial_printf("  Saved RIP=%p RSP=%p\n", th->rip, th->rsp);
+                SerialPrintf("  Saved RIP=%p RSP=%p\n", th->rip, th->rsp);
             }
         }
 
-        serial_printf("===========================\n");
+        SerialPrintf("===========================\n");
         panic("Unhandled CPU exception %s (vector=%u, error=0x%x) in kernel mode",
               name,
               (u32)vector,
@@ -586,7 +619,7 @@ void isr_handler(interrupt_frame_t *frame) {
     /* Signal delivery checkpoint for any other return-to-user path
      * (e.g. a software interrupt with a registered handler).  No-op
      * for kernel frames and when no signal is pending. */
-    signal_check_interrupt(frame);
+    SignalCheckInterrupt(frame);
 
     /* Unknown vector with registered handler */
     if (isr_handlers[vector])
@@ -597,45 +630,45 @@ void isr_handler(interrupt_frame_t *frame) {
 /* Public API                                                         */
 /* ------------------------------------------------------------------ */
 
-void idt_register_handler(u8 vector, void (*handler)(void), u8 dpl) {
+void IdtRegisterHandler(u8 vector, void (*handler)(void), u8 dpl) {
     isr_handlers[vector] = handler;
 
     /* Update the IDT gate entry with the new DPL */
     u8 type_attr = (dpl == 3) ? GATE_INTERRUPT_USER : GATE_INTERRUPT_KERNEL;
 
-    idt_set_entry(&idt[vector], (u64)isr_stub_table[vector], type_attr, 0);
+    IdtSetEntry(&idt[vector], (u64)isr_stub_table[vector], type_attr, 0);
 }
 
-void idt_enable_interrupts(void) {
+void IdtEnableInterrupts(void) {
     __asm__ volatile("sti");
 }
 
-void idt_disable_interrupts(void) {
+void IdtDisableInterrupts(void) {
     __asm__ volatile("cli");
 }
 
-void irq_enable(u8 irq) {
+void IrqEnable(u8 irq) {
     /* PIC: unmask the IRQ line so the interrupt is delivered */
-    pic_unmask_irq(irq);
+    PicUnmaskIrq(irq);
 
-    /* Device-level enable for COM1: serial_init() leaves the 16550
+    /* Device-level enable for COM1: SerialInit() leaves the 16550
      * interrupt-enable register at 0, so the UART would never assert
      * IRQ4 on received data.  Set the received-data-available bit. */
     if (irq == 4) {
-        u8 ier = io_inb(SERIAL_COM1_BASE + 1);
-        io_outb(SERIAL_COM1_BASE + 1, ier | 0x01);
+        u8 ier = IoInb(SERIAL_COM1_BASE + 1);
+        IoOutb(SERIAL_COM1_BASE + 1, ier | 0x01);
     }
 }
 
-void irq_disable(u8 irq) {
+void IrqDisable(u8 irq) {
     /* Device-level disable for COM1 (mirror of irq_enable) */
     if (irq == 4) {
-        u8 ier = io_inb(SERIAL_COM1_BASE + 1);
-        io_outb(SERIAL_COM1_BASE + 1, ier & ~0x01);
+        u8 ier = IoInb(SERIAL_COM1_BASE + 1);
+        IoOutb(SERIAL_COM1_BASE + 1, ier & ~0x01);
     }
 
     /* PIC: mask the IRQ line */
-    pic_mask_irq(irq);
+    PicMaskIrq(irq);
 }
 
 /* ------------------------------------------------------------------ */
@@ -646,22 +679,22 @@ void irq_disable(u8 irq) {
 #define PIT_CMD_REG       0x43
 #define PIT_BASE_FREQ     1193182 /* PIT oscillator frequency (Hz) */
 
-void pit_init(u32 freq) {
+void PitInit(u32 freq) {
     u32 divisor = PIT_BASE_FREQ / freq;
     if (divisor == 0)
         divisor = 1;
 
     /* Command byte: channel 0, lobyte/hibyte, rate generator (mode 2) */
-    io_outb(PIT_CMD_REG, 0x36);
+    IoOutb(PIT_CMD_REG, 0x36);
 
     /* Send divisor (low byte first, then high byte) */
-    io_outb(PIT_CHANNEL0_DATA, (u8)(divisor & 0xFF));
-    io_outb(PIT_CHANNEL0_DATA, (u8)((divisor >> 8) & 0xFF));
+    IoOutb(PIT_CHANNEL0_DATA, (u8)(divisor & 0xFF));
+    IoOutb(PIT_CHANNEL0_DATA, (u8)((divisor >> 8) & 0xFF));
 
-    serial_printf("PIT: Channel 0 at %u Hz (divisor=%u)\n", freq, divisor);
+    SerialPrintf("PIT: Channel 0 at %u Hz (divisor=%u)\n", freq, divisor);
 }
 
-void idt_init(void) {
+void IdtInit(void) {
     /* Clear IDT and handler table */
     memset(idt, 0, sizeof(idt));
     memset(isr_handlers, 0, sizeof(isr_handlers));
@@ -692,7 +725,7 @@ void idt_init(void) {
         if (i == 2) /* NMI → IST2 */
             ist = IST_STACK_2;
 
-        idt_set_entry(&idt[i], stub_addr, type_attr, ist);
+        IdtSetEntry(&idt[i], stub_addr, type_attr, ist);
     }
 
     /* Build IDT pointer */
@@ -703,13 +736,13 @@ void idt_init(void) {
     __asm__ volatile("lidt (%0)" : : "r"(&idt_ptr) : "memory");
 
     /* Remap PIC: IRQ 0-15 → vectors 32-47 */
-    pic_remap();
+    PicRemap();
 
     /* Mask all IRQs, then unmask only what we need */
-    pic_mask_all();
-    pic_unmask_irq(0); /* Timer (IRQ0) */
-    pic_unmask_irq(2); /* Cascade (IRQ2) for slave PIC */
-    pic_unmask_irq(4); /* Serial (IRQ4) */
+    PicMaskAll();
+    PicUnmaskIrq(0); /* Timer (IRQ0) */
+    PicUnmaskIrq(2); /* Cascade (IRQ2) for slave PIC */
+    PicUnmaskIrq(4); /* Serial (IRQ4) */
 
     /* ---- Fast syscall path (v0.7): enable the SYSCALL/SYSRET pair ----
      * MSRs (Intel SDM Vol.3 §5.8):
@@ -746,6 +779,6 @@ void idt_init(void) {
         __asm__ volatile("wrmsr"
                          :: "c"(0xC0000084u), "a"(0x700u), "d"(0u) /* IF|TF|DF */
                          : "memory");
-        serial_puts("  SYSCALL fast path enabled (LSTAR=syscall_entry_fast)\n");
+        SerialPuts("  SYSCALL fast path enabled (LSTAR=syscall_entry_fast)\n");
     }
 }

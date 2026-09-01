@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * rbtree.h - Red-black tree for CFS scheduler
  * Copyright (c) 2026 OpSys Project
  *
@@ -35,13 +48,13 @@ typedef struct rb_root {
 } rb_root_t;
 
 /* Initialize an empty tree */
-static inline void rb_init(rb_root_t *root) {
+static inline void RbInit(rb_root_t *root) {
     root->node  = NULL;
     root->count = 0;
 }
 
 /* Initialize a node (call before first insert) */
-static inline void rb_init_node(rb_node_t *n) {
+static inline void RbInitNode(rb_node_t *n) {
     n->left = n->right = n->parent = NULL;
     n->color                       = RB_RED;
     n->key                         = 0;
@@ -49,10 +62,10 @@ static inline void rb_init_node(rb_node_t *n) {
 }
 
 /* Insert a node into the tree. Returns 0 on success. */
-int rb_insert(rb_root_t *root, rb_node_t *node);
+int RbInsert(rb_root_t *root, rb_node_t *node);
 
 /* Remove a node from the tree. */
-void rb_remove(rb_root_t *root, rb_node_t *node);
+void RbRemove(rb_root_t *root, rb_node_t *node);
 
 /* Find the node with the minimum key (leftmost). */
 rb_node_t *rb_min(rb_root_t *root);
@@ -61,7 +74,7 @@ rb_node_t *rb_min(rb_root_t *root);
 rb_node_t *rb_max(rb_root_t *root);
 
 /* Check if the tree is empty. */
-static inline bool rb_empty(rb_root_t *root) {
+static inline bool RbEmpty(rb_root_t *root) {
     return root->node == NULL;
 }
 

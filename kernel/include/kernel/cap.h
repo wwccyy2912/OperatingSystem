@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * cap.h - Capability system
  * Copyright (c) 2026 OpSys Project
  *
@@ -50,8 +63,8 @@ typedef struct {
 
 /* Per-process capability table.
  *
- * Dynamically allocated via pmm_alloc_pages() on cap_table_create() and
- * freed on cap_table_destroy().  The gen[] array holds per-slot
+ * Dynamically allocated via PmmAllocPages() on cap_table_create() and
+ * freed on CapTableDestroy().  The gen[] array holds per-slot
  * generation counters (formerly a global s_gen_counters[] array that
  * cost 1 MB of BSS).  sizeof(cap_table_t) ≈ 73 KB → 19 pages. */
 typedef struct {
@@ -64,7 +77,7 @@ typedef struct {
 /**
  * Initialize the capability system.
  */
-void cap_init(void);
+void CapInit(void);
 
 /**
  * Create a new empty capability table for a process.
@@ -77,7 +90,7 @@ cap_table_t *cap_table_create(pid_t pid);
  * Destroy a capability table.
  * @param table  Table to destroy.
  */
-void cap_table_destroy(cap_table_t *table);
+void CapTableDestroy(cap_table_t *table);
 
 /**
  * Create a new capability and add it to a table.
@@ -88,7 +101,7 @@ void cap_table_destroy(cap_table_t *table);
  * @param obj_ptr Object pointer (kernel-internal).
  * @return Handle, or 0 on failure.
  */
-cap_t cap_create_in_table(
+cap_t CapCreateInTable(
     cap_table_t *table, cap_type_t type, rights_t rights, u64 obj_id, u64 obj_ptr);
 
 /**
@@ -107,7 +120,7 @@ cap_t cap_create_in_table(
  * @param out          Receives the new handle on success.
  * @return OK, or ERR_INVAL (bad table/out) / ERR_NOMEM (table full).
  */
-int cap_create_atom(cap_table_t *table,
+int CapCreateAtom(cap_table_t *table,
                     subject_id_t subject,
                     atom_id_t    atom,
                     rights_t     rights,
@@ -127,7 +140,7 @@ int cap_create_atom(cap_table_t *table,
  * @return OK, or the same errors cap_revoke returns (ERR_INVAL for a
  *         bad table/index, ERR_NOENT for missing/stale/expired).
  */
-int cap_consume(cap_table_t *table, cap_t handle);
+int CapConsume(cap_table_t *table, cap_t handle);
 
 /**
  * P1 地基: issue an atom capability to EVERY process holding a subject.
@@ -147,7 +160,7 @@ int cap_consume(cap_table_t *table, cap_t handle);
  * @return OK, ERR_NOENT (no live process holds the subject),
  *         ERR_INVAL (bad atom/rights), or ERR_NOMEM (table full).
  */
-int cap_grant_to_subject(subject_id_t subject,
+int CapGrantToSubject(subject_id_t subject,
                          atom_id_t    atom,
                          rights_t     rights,
                          u64          expiry_ticks,
@@ -158,14 +171,14 @@ int cap_grant_to_subject(subject_id_t subject,
 /**
  * Revoke every capability held by a subject matching an atom
  * (optionally restricted to a scope) across ALL kernel cap tables
- * (P0 地基).  Same per-entry cleanup as cap_revoke (gen bump,
+ * (P0 地基).  Same per-entry cleanup as CapRevoke(gen bump,
  * memset, count--).  Holds the cap lock for the whole scan.
  * @param subj       Holding subject whose caps are revoked.
  * @param atom       Atom to match.
  * @param scope_hash 0 = match any scope, else exact scope match.
  * @return Number of entries revoked (>= 0).
  */
-int cap_revoke_by_atom(subject_id_t subj, atom_id_t atom, u64 scope_hash);
+int CapRevokeByAtom(subject_id_t subj, atom_id_t atom, u64 scope_hash);
 
 /**
  * Grant a capability to another process's table.
@@ -175,7 +188,7 @@ int cap_revoke_by_atom(subject_id_t subj, atom_id_t atom, u64 scope_hash);
  * @param rights     Rights to grant (subset of original).
  * @return New handle in destination, or 0 on failure.
  */
-cap_t cap_grant(cap_table_t *src_table, cap_table_t *dst_table, cap_t handle, rights_t rights);
+cap_t CapGrant(cap_table_t *src_table, cap_table_t *dst_table, cap_t handle, rights_t rights);
 
 /**
  * Revoke a capability from a table.
@@ -183,7 +196,7 @@ cap_t cap_grant(cap_table_t *src_table, cap_table_t *dst_table, cap_t handle, ri
  * @param handle  Capability handle to revoke.
  * @return OK or error.
  */
-error_t cap_revoke(cap_table_t *table, cap_t handle);
+error_t CapRevoke(cap_table_t *table, cap_t handle);
 
 /**
  * Look up a capability in a table and validate rights.
@@ -222,7 +235,7 @@ cap_entry_t *cap_lookup(cap_table_t *table, cap_t handle, rights_t need);
  * @param scope_hash 0 = any scope, else exact scope match.
  * @return Handle of the matched entry, or CAP_NULL (0) if none.
  */
-cap_t cap_lookup_by_atom(cap_table_t *table, subject_id_t subject, atom_id_t atom, u64 scope_hash);
+cap_t CapLookupByAtom(cap_table_t *table, subject_id_t subject, atom_id_t atom, u64 scope_hash);
 
 /**
  * Get the capability table for a given PID.
@@ -238,6 +251,6 @@ cap_table_t *cap_get_table(pid_t pid);
  * @param type   Capability type to look for.
  * @return true if at least one entry of the type exists.
  */
-bool cap_has_type(cap_table_t *table, cap_type_t type);
+bool CapHasType(cap_table_t *table, cap_type_t type);
 
 #endif /* KERNEL_CAP_H */

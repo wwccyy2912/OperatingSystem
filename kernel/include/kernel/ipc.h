@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * ipc.h - Inter-Process Communication
  * Copyright (c) 2026 OpSys Project
  *
@@ -41,27 +54,27 @@ typedef struct {
 /**
  * Initialize the IPC subsystem.
  */
-void ipc_init(void);
+void IpcInit(void);
 
 /**
  * Create a new IPC port owned by the current thread.
  * @return Port ID, or negative error code.
  */
-port_t ipc_port_create(void);
+port_t IpcPortCreate(void);
 
 /**
  * Destroy an IPC port.
  * @param port  Port to destroy.
  */
-void ipc_port_destroy(port_t port);
+void IpcPortDestroy(port_t port);
 
 /**
  * Tear down every IPC resource owned by a dying process: destroy its
  * ports (waking all blocked peers with ERR_NOENT) and drop its
- * registry names.  Called from process_reap().
+ * registry names.  Called from ProcessReap().
  * @param pid  PID of the dying process.
  */
-void ipc_cleanup_process(pid_t pid);
+void IpcCleanupProcess(pid_t pid);
 
 /**
  * Send a message to a port (blocking if port has no receiver).
@@ -70,7 +83,7 @@ void ipc_cleanup_process(pid_t pid);
  * @param len   Message length in bytes.
  * @return OK or error.
  */
-error_t ipc_send(port_t port, const void *msg, u32 len);
+error_t IpcSend(port_t port, const void *msg, u32 len);
 
 /**
  * Receive a message from a port (blocking).
@@ -78,17 +91,17 @@ error_t ipc_send(port_t port, const void *msg, u32 len);
  * @param buf     Buffer to receive into.
  * @param len     In: buffer size, Out: actual message size.
  * @param tok_ptr Out: reply token if the message was a call (0 otherwise).
- *                The token must be passed to ipc_reply() unchanged.
+ *                The token must be passed to IpcReply() unchanged.
  * @return OK or error.
  */
-error_t ipc_recv(port_t port, void *buf, u32 *len, u32 *tok_ptr);
+error_t IpcRecv(port_t port, void *buf, u32 *len, u32 *tok_ptr);
 
 /**
  * Receive with sender identity (P0 地基, docs permission_model.md §三).
- * Identical to ipc_recv() — including the existing 4-arg semantics —
+ * Identical to IpcRecv() — including the existing 4-arg semantics —
  * PLUS: when sender_subject != NULL, the kernel-filled, unforgeable
  * subject of the sender's process is written to it.  sender_subject
- * == NULL is tolerated and behaves exactly like ipc_recv().
+ * == NULL is tolerated and behaves exactly like IpcRecv().
  * @param port            Source port.
  * @param buf             Buffer to receive into.
  * @param len             In: buffer size, Out: actual message size.
@@ -96,7 +109,7 @@ error_t ipc_recv(port_t port, void *buf, u32 *len, u32 *tok_ptr);
  * @param sender_subject  Out: sender's process subject (may be NULL).
  * @return OK or error.
  */
-error_t ipc_recv_from(port_t port, void *buf, u32 *len, u32 *tok_ptr, subject_id_t *sender_subject);
+error_t IpcRecvFrom(port_t port, void *buf, u32 *len, u32 *tok_ptr, subject_id_t *sender_subject);
 
 /**
  * Synchronous call: send request and wait for response.
@@ -107,27 +120,27 @@ error_t ipc_recv_from(port_t port, void *buf, u32 *len, u32 *tok_ptr, subject_id
  * @param resp_len In: buffer size, Out: response size.
  * @return OK or error.
  */
-error_t ipc_call(port_t port, const void *req, u32 req_len, void *resp, u32 *resp_len);
+error_t IpcCall(port_t port, const void *req, u32 req_len, void *resp, u32 *resp_len);
 
 /**
  * Reply to a pending call (send response to caller).
- * The token is an opaque handle returned by ipc_recv() for call
+ * The token is an opaque handle returned by IpcRecv() for call
  * messages.  It uniquely identifies one pending caller, so concurrent
  * callers to the same port no longer share a single active-call slot.
- * @param token  Reply token from ipc_recv() (must be non-zero).
+ * @param token  Reply token from IpcRecv() (must be non-zero).
  * @param msg    Response data.
  * @param len    Response length.
  * @return OK, ERR_NOENT (bad/stale token), ERR_BUSY (already replied),
  *         or ERR_INVAL.
  */
-error_t ipc_reply(u32 token, const void *msg, u32 len);
+error_t IpcReply(u32 token, const void *msg, u32 len);
 
 /**
  * Get or create a well-known port by name.
  * @param name  Port name string.
  * @return Port ID, or negative error.
  */
-port_t ipc_get_port(const char *name);
+port_t IpcGetPort(const char *name);
 
 /**
  * Register a well-known port name.
@@ -135,7 +148,7 @@ port_t ipc_get_port(const char *name);
  * @param port  Port ID to associate.
  * @return OK or error.
  */
-error_t ipc_register_port(const char *name, port_t port);
+error_t IpcRegisterPort(const char *name, port_t port);
 
 /**
  * Abort a thread's IPC wait (called from the signal kill path when
@@ -143,12 +156,12 @@ error_t ipc_register_port(const char *name, port_t port);
  * whatever IPC structure holds it (the port recv FIFO queue, or the
  * pending/reply-wait list holding its call message) and records
  * ERR_INTERRUPTED so the woken syscall returns an error instead of
- * re-blocking.  The blocked thread's ipc_call() remains the only code
- * that frees its pending message.  A late ipc_reply() for a freed
+ * re-blocking.  The blocked thread's IpcCall() remains the only code
+ * that frees its pending message.  A late IpcReply() for a freed
  * slot fails token validation (in_use + generation), so it can never
  * touch a reused slot.
- * @param t  Thread blocked in ipc_recv()/ipc_call() (no-op otherwise).
+ * @param t  Thread blocked in IpcRecv()/IpcCall() (no-op otherwise).
  */
-void ipc_abort_wait(thread_t *t);
+void IpcAbortWait(thread_t *t);
 
 #endif /* KERNEL_IPC_H */

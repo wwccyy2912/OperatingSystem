@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * serial.h - Serial port (COM1) debug driver
  * Copyright (c) 2026 OpSys Project
  */
@@ -14,7 +27,7 @@
 
 /*
  * Log levels for gated serial output (higher = more verbose).
- * serial_puts_level()/serial_printf_level() emit only when the given
+ * SerialPutsLevel()/SerialPrintfLevel() emit only when the given
  * level is <= the current threshold, so verbose diagnostics can be
  * silenced at runtime without touching call sites.  Critical paths
  * (exceptions, stack smash, reboot) use the ungated functions below
@@ -29,20 +42,20 @@
  * Set the current log level threshold.
  * @param level  One of SERIAL_LOG_*; messages above it are suppressed.
  */
-void serial_set_log_level(u8 level);
+void SerialSetLogLevel(u8 level);
 
 /**
  * Get the current log level threshold.
  * @return One of SERIAL_LOG_*.
  */
-u8 serial_get_log_level(void);
+u8 SerialGetLogLevel(void);
 
 /**
  * Write a string to serial if level <= current threshold.
  * @param level  Log level of this message.
  * @param str    The string to send.
  */
-void serial_puts_level(u8 level, const char *str);
+void SerialPutsLevel(u8 level, const char *str);
 
 /**
  * Write formatted output to serial if level <= current threshold.
@@ -50,30 +63,30 @@ void serial_puts_level(u8 level, const char *str);
  * @param fmt    Format string (same specifiers as serial_printf).
  * @param ...    Variable arguments.
  */
-void serial_printf_level(u8 level, const char *fmt, ...);
+void SerialPrintfLevel(u8 level, const char *fmt, ...);
 
 /**
  * Initialize the COM1 serial port for 115200 8N1.
  */
-void serial_init(void);
+void SerialInit(void);
 
 /**
  * Read a single character from serial (blocking).
  * @return The character read.
  */
-char serial_getchar(void);
+char SerialGetchar(void);
 
 /**
  * Write a single character to serial.
  * @param c  The character to send.
  */
-void serial_putchar(char c);
+void SerialPutchar(char c);
 
 /**
  * Write a null-terminated string to serial.
  * @param str  The string to send.
  */
-void serial_puts(const char *str);
+void SerialPuts(const char *str);
 
 /**
  * Write formatted output to serial (minimal printf).
@@ -81,7 +94,7 @@ void serial_puts(const char *str);
  * @param fmt  Format string.
  * @param ...  Variable arguments.
  */
-void serial_printf(const char *fmt, ...);
+void SerialPrintf(const char *fmt, ...);
 
 /**
  * Formatted output core (consumes a va_list).  Public so panic() can
@@ -89,6 +102,6 @@ void serial_printf(const char *fmt, ...);
  * @param fmt  Format string (same specifiers as serial_printf).
  * @param ap   Initialized va_list; consumed.
  */
-void serial_vprintf(const char *fmt, va_list ap);
+void SerialVprintf(const char *fmt, va_list ap);
 
 #endif /* KERNEL_SERIAL_H */

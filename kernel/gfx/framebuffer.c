@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * framebuffer.c - Linear framebuffer driver
  * Copyright (c) 2026 OpSys Project
  *
@@ -10,6 +23,26 @@
  * framebuffer is owned by the user-space term service, which maps it via
  * SYS_FB_MAP and draws with its own font (user/services/term/font.h).
  * The kernel keeps only init + query + screen-clear on boot.
+ *
+ * ------------------------------------------------------------------
+ * Structure (framebuffer):
+ *   FbInit(mboot_addr): multiboot2 tag 8 -> phys addr, pitch, width,
+ *   height, bpp, fb_type. phys 0xB8000 + 80x25 -> VGA text, else
+ *   linear; s_fb.addr = phys + KERNEL_VIRT_BASE (fb_phys_to_virt).
+ *   Query API: fb_get_info / FbGetPhys / FbGetUserInfo / FbIsVgaText.
+ * How it works:
+ *   Boot maps the framebuffer once and clears it (FbClearScreen):
+ *   VGA text cells (attr<<8|ch), linear BGR pixels at pitch stride.
+ *   FbGetPhys() hands the physical address to the user-space term,
+ *   which maps it via SYS_FB_MAP and does all drawing.
+ * Purpose:
+ *   Detect + map the boot framebuffer and answer geometry queries;
+ *   drawing is user-space owned per P0 (docs/kernel_roadmap.md).
+ * Caveats:
+ *   GRUB may lie about fb_type, so 0xB8000 with 80x25 wins as VGA
+ *   text. VGA text reports logical 9x20 pixels; 24bpp is BGR, 32bpp
+ *   ARGB. No drawing primitives remain in the kernel.
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/framebuffer.h>
@@ -23,7 +56,7 @@
  * ==================================================================== */
 
 static fb_info_t s_fb;          /* Framebuffer info */
-static bool      s_initialized; /* fb_init() called successfully */
+static bool      s_initialized; /* FbInit() called successfully */
 static bool      s_vga_text;    /* True if VGA text mode (type 1) */
 
 /* Convert physical address to kernel virtual address. */
@@ -34,7 +67,7 @@ static inline void *fb_phys_to_virt(u64 phys) {
 /* Clear the whole screen to dark blue (boot-time background).
  * VGA text mode: fill cells with space + dark-blue attribute.
  * Linear mode: fill with 0x00082860 (BGR order for 24bpp). */
-static void fb_clear_screen(void) {
+static void FbClearScreen(void) {
     if (s_vga_text) {
         volatile u16 *buf   = (volatile u16 *)s_fb.addr;
         u32           cells = (s_fb.width / 9) * (s_fb.height / 20);
@@ -62,11 +95,11 @@ static void fb_clear_screen(void) {
  * Initialization
  * ==================================================================== */
 
-int fb_init(u64 mboot_addr) {
+int FbInit(u64 mboot_addr) {
     /* Find the framebuffer tag (type 8) */
     mboot2_tag_t *tag = mboot2_find_tag(mboot_addr, 8);
     if (!tag) {
-        serial_puts("  FB: no framebuffer tag found\n");
+        SerialPuts("  FB: no framebuffer tag found\n");
         return -1;
     }
 
@@ -83,7 +116,7 @@ int fb_init(u64 mboot_addr) {
     u8  fb_type = *(u8 *)(data + 29);  /* offset 29: 0=text, 1=VGA text, 2=linear */
 
     /* Debug: dump tag header for validation */
-    serial_printf_level(SERIAL_LOG_DEBUG,
+    SerialPrintfLevel(SERIAL_LOG_DEBUG,
                         "  FB tag dump: type=%u sz=%u addr=0x%x pit=%u w=%u h=%u "
                         "bpp=%u fbtype=%u\n",
                         *(u32 *)(data + 0),
@@ -96,7 +129,7 @@ int fb_init(u64 mboot_addr) {
                         fb_type);
 
     if (fb_phys == 0 || width == 0 || height == 0) {
-        serial_puts("  FB: invalid framebuffer info\n");
+        SerialPuts("  FB: invalid framebuffer info\n");
         return -1;
     }
 
@@ -129,15 +162,15 @@ int fb_init(u64 mboot_addr) {
     s_fb.bpp      = bpp;
     s_initialized = true;
 
-    serial_printf(
+    SerialPrintf(
         "  FB: %ux%u %ubpp @ phys 0x%x (pitch=%u)", width, height, bpp, (u32)fb_phys, pitch);
     if (s_vga_text)
-        serial_puts(" (VGA text mode)\n");
+        SerialPuts(" (VGA text mode)\n");
     else
-        serial_puts(" (linear framebuffer)\n");
+        SerialPuts(" (linear framebuffer)\n");
 
-    fb_clear_screen();
-    serial_puts("  FB: initialized\n");
+    FbClearScreen();
+    SerialPuts("  FB: initialized\n");
     return 0;
 }
 
@@ -145,7 +178,7 @@ const fb_info_t *fb_get_info(void) {
     return s_initialized ? &s_fb : NULL;
 }
 
-u64 fb_get_phys(void) {
+u64 FbGetPhys(void) {
     if (!s_initialized)
         return 0;
     /* s_fb.addr is the kernel virtual mapping (phys + KERNEL_VIRT_BASE);
@@ -154,14 +187,14 @@ u64 fb_get_phys(void) {
     return s_fb.addr - KERNEL_VIRT_BASE;
 }
 
-int fb_is_vga_text(void) {
+int FbIsVgaText(void) {
     return s_initialized && s_vga_text;
 }
 
-int fb_get_user_info(fb_user_info_t *out) {
+int FbGetUserInfo(fb_user_info_t *out) {
     if (!s_initialized || !out)
         return -1;
-    out->phys_addr = fb_get_phys();
+    out->phys_addr = FbGetPhys();
     out->width     = s_fb.width;
     out->height    = s_fb.height;
     out->pitch     = s_fb.pitch;

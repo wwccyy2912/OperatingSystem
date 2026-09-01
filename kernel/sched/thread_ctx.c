@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * thread_ctx.c - SYS_THREAD_SET_CTX: overwrite a thread's saved context
  * Copyright (c) 2026 OpSys Project
  *
@@ -11,9 +24,21 @@
  * ucontext-style frame before handing it back to the scheduler.
  *
  * This file implements only the primitive plus validation; the trampoline
- * itself lives in user space and is out of scope here.
+ * itself lives in user space and is out of scope here. *
+ * ------------------------------------------------------------------
+ * Structure (thread_ctx):
+ *   thread_ctx_t { rbx,rbp,r12..r15,rsp,rip,rflags } — the save order
+ *   matches context_switch.S exactly.
+ * How it works:
+ *   ThreadContextSave/ThreadContextRestore move the GPR block; the
+ *   asm switch writes/reads the same layout at the TCB.
+ * Purpose:
+ *   ABI contract between C scheduling code and the asm switcher.
+ * Caveats:
+ *   Changing the struct order without updating context_switch.S
+ *   corrupts every context switch.
+ * ------------------------------------------------------------------
  */
-
 #include <kernel/thread_ctx.h>
 #include <kernel/thread.h>
 #include <kernel/process.h>
@@ -82,7 +107,7 @@ i64 sc_sys_thread_set_ctx(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
      * present-but-unwritable page is fine).  This mirrors validate_user_ptr
      * in syscall.c, which wraps vmm_validate_user_range the same way, and
      * prevents an unmapped window from #PF-ing the kernel on the memcpy. */
-    if (!vmm_validate_user_range(proc->addr_space, ctx_ptr, sizeof(thread_ctx_t), false))
+    if (!VmmValidateUserRange(proc->addr_space, ctx_ptr, sizeof(thread_ctx_t), false))
         return (i64)ERR_FAULT;
 
     /* Copy into a kernel-local struct, then overwrite the target's

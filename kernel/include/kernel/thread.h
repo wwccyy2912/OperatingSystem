@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * thread.h - Thread management
  * Copyright (c) 2026 OpSys Project
  */
@@ -72,7 +85,7 @@ typedef struct thread {
     tid_t joiner_tid; /* TID of thread waiting to join (-1 = none) */
 
     /* Force-kill support: set by process_kill() on blocked threads.
-     * The syscall-return hook (syscall_return_check) calls thread_exit()
+     * The syscall-return hook (syscall_return_check) calls ThreadExit()
      * with exit_code when it sees this flag on the current thread. */
     bool force_exit;
 
@@ -80,8 +93,8 @@ typedef struct thread {
      * wake_tick == 0 means "not sleeping".  Threads are inserted into
      * s_sleep_list (sched.c) sorted by wake_tick ascending, so each
      * tick only the list head needs inspecting (O(1) amortized) rather
-     * than scanning every thread.  Only sched_sleep() inserts and only
-     * wake_sleepers() removes; IPC/mutex/notify waiters live in their
+     * than scanning every thread.  Only SchedSleep() inserts and only
+     * WakeSleepers() removes; IPC/mutex/notify waiters live in their
      * own structures and are never on this list. */
     u64            wake_tick;  /* Absolute tick to wake (0 = not sleeping) */
     struct thread *sleep_next; /* Next entry in the sorted sleep list */
@@ -90,10 +103,10 @@ typedef struct thread {
     u64 user_rsp;
 
     /* Physical page backing the per-thread user stack.  Recorded by
-     * thread_create_user() so free_thread() can unmap the mapping
+     * ThreadCreateUser() so FreeThread() can unmap the mapping
      * (as->stack_base + tid*PAGE_SIZE) and release the page before the
      * slot is recycled — without this, a recycled TID would re-collide
-     * with the stale PTE and vmm_map() would fail with ERR_BUSY. */
+     * with the stale PTE and VmmMap() would fail with ERR_BUSY. */
     u64 user_stack_phys;
 
     /* CFS scheduler: virtual runtime and RB tree node */
@@ -104,7 +117,7 @@ typedef struct thread {
 /**
  * Initialize the thread subsystem.
  */
-void thread_init(void);
+void ThreadInit(void);
 
 /**
  * Seed a thread's FPU/SSE state slot to the x86 hardware defaults
@@ -112,7 +125,7 @@ void thread_init(void);
  * keeps fpu_switch's fxrstor always valid.
  * @param tid Thread whose slot to seed.
  */
-void fpu_state_init(tid_t tid);
+void FpuStateInit(tid_t tid);
 
 /**
  * Create a new kernel thread.
@@ -121,7 +134,7 @@ void fpu_state_init(tid_t tid);
  * @param priority Initial priority (0-31).
  * @return Thread ID, or negative error code.
  */
-tid_t thread_create_kernel(void (*entry)(void *), void *arg, int priority);
+tid_t ThreadCreateKernel(void (*entry)(void *), void *arg, int priority);
 
 /**
  * Create a new user thread in the given address space.
@@ -131,18 +144,18 @@ tid_t thread_create_kernel(void (*entry)(void *), void *arg, int priority);
  * @param priority    Initial priority.
  * @return Thread ID, or negative error code.
  */
-tid_t thread_create_user(u64 entry, u64 arg, addr_space_t *as, int priority);
+tid_t ThreadCreateUser(u64 entry, u64 arg, addr_space_t *as, int priority);
 
 /**
  * Exit the current thread.
  * @param code  Exit code.
  */
-void thread_exit(int code);
+void ThreadExit(int code);
 
 /**
  * Yield the CPU to the scheduler.
  */
-void thread_yield(void);
+void ThreadYield(void);
 
 /**
  * Get the current running thread.
@@ -160,14 +173,14 @@ thread_t *thread_get(tid_t tid);
  * thread cannot free itself while running on its own stack.  No-op for
  * NULL / already-released / non-FINISHED threads.
  */
-void thread_release(thread_t *t);
+void ThreadRelease(thread_t *t);
 
 /**
  * Set CPU affinity for a thread.
  * @param tid     Thread ID.
  * @param cpu     CPU core (-1 = any).
  */
-error_t thread_set_affinity(tid_t tid, i32 cpu);
+error_t ThreadSetAffinity(tid_t tid, i32 cpu);
 
 /**
  * Switch context from one thread to another (defined in context_switch.S).
@@ -189,7 +202,7 @@ void context_switch(thread_t *prev, thread_t *next, int resume_if);
  * @param cs      User code segment selector.
  * @param ss      User stack segment selector.
  */
-void context_switch_to_user(u64 rip, u64 rsp, u64 rflags, u64 cs, u64 ss);
+void context_switchToUser(u64 rip, u64 rsp, u64 rflags, u64 cs, u64 ss);
 
 /**
  * Enter ring 3 for the first time.  Switches CR3 to the user address

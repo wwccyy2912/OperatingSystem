@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * shm.c - Shared physical-page pools (zero-copy read path, vfs_design §8.4)
  * Copyright (c) 2026 OpSys Project
  *
@@ -19,8 +32,34 @@
  *   - Client mappings are READ-ONLY and NON-EXECUTABLE; the client
  *     supplies a vspace_alloc()'d target range, so the mapping cannot
  *     clobber existing mappings.
- *   - Pools owned by a dying process are released by shm_cleanup_process()
+ *   - Pools owned by a dying process are released by ShmCleanupProcess()
  *     (called from process_reap), so physical pages never leak.
+ *
+ * ------------------------------------------------------------------
+ * Structure (shm):
+ *   s_pools[SHM_MAX_POOLS = 8] of shm_pool_t {in_use, owner_subject,
+ *   phys_base, page_count}; one pool = one contiguous PMM run of up to
+ *   SHM_MAX_PAGES (1024, 4 MiB). No per-mapping refcounts: a pool's
+ *   lifetime is owned by the creating subject.
+ *
+ * How it works:
+ *   SYS_SHM_CREATE (67): ATOM_SERVICE_MANAGE gate -> PmmAllocPages() ->
+ *   VmmMapRange() RW+NX into the caller's vspace_alloc()'d range; the
+ *   physical base is returned as the kernel-only handle. SYS_SHM_MAP
+ *   (68): gate + shm_pool_find() verifies (phys_base, count) is an
+ *   existing pool, then maps it READ-ONLY+NX into the target process's
+ *   address space. ShmCleanupProcess() frees a dead owner's pools.
+ *
+ * Purpose:
+ *   Zero-copy read path (vfs_design §8.4): fs_mem_driver stores file
+ *   data in a pool; clients get it mapped instead of 4096-byte IPC
+ *   copies. Callers can only map kernel-allocated pool pages.
+ *
+ * Caveats:
+ *   The kernel never unmaps a client's view — the client unmaps its
+ *   own vspace range; pool pages are released only when the owner
+ *   dies. Fixed table: 8 pools max, 4 MiB per pool.
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/types.h>
@@ -71,7 +110,7 @@ i64 sc_sys_shm_create(u64 count, u64 virt) {
         return (i64)ERR_FAULT;
 
     /* GATE (docs/ops_format.md §6): pool creation is management-plane. */
-    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, 0) ==
+    if (CapLookupByAtom(proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, 0) ==
         CAP_NULL)
         return (i64)ERR_NOCAP;
 
@@ -89,17 +128,17 @@ i64 sc_sys_shm_create(u64 count, u64 virt) {
     if (!slot)
         return (i64)ERR_NOMEM;
 
-    u64 phys = pmm_alloc_pages(count);
+    u64 phys = PmmAllocPages(count);
     if (!phys)
         return (i64)ERR_NOMEM;
 
-    error_t err = vmm_map_range(proc->addr_space,
+    error_t err = VmmMapRange(proc->addr_space,
                                 virt,
                                 phys,
                                 count,
                                 PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NO_EXECUTE);
     if (err != OK) {
-        pmm_free_pages(phys, count);
+        PmmFreePages(phys, count);
         return (i64)err;
     }
 
@@ -107,7 +146,7 @@ i64 sc_sys_shm_create(u64 count, u64 virt) {
     slot->owner_subject = proc->subject_id;
     slot->phys_base     = phys;
     slot->page_count    = (u32)count;
-    serial_printf("shm: pool created subject=%u phys=0x%x count=%u\n",
+    SerialPrintf("shm: pool created subject=%u phys=0x%x count=%u\n",
                   (unsigned)proc->subject_id,
                   (u32)phys,
                   (unsigned)count);
@@ -135,7 +174,7 @@ i64 sc_sys_shm_map(u64 phys_base, u64 count, u64 target_subject, u64 target_virt
 
     /* GATE: management-plane caller (vfs_server exports on a client's
      * behalf after its own permission check). */
-    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, 0) ==
+    if (CapLookupByAtom(proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, 0) ==
         CAP_NULL)
         return (i64)ERR_NOCAP;
 
@@ -154,7 +193,7 @@ i64 sc_sys_shm_map(u64 phys_base, u64 count, u64 target_subject, u64 target_virt
 
     /* READ-ONLY, NON-EXECUTABLE: the client may not modify the shared
      * file pages or jump into them. */
-    error_t err = vmm_map_range(target->addr_space,
+    error_t err = VmmMapRange(target->addr_space,
                                 target_virt,
                                 phys_base,
                                 (u32)count,
@@ -164,14 +203,14 @@ i64 sc_sys_shm_map(u64 phys_base, u64 count, u64 target_subject, u64 target_virt
 
 /*
  * Release every pool owned by a dying process.  Called from
- * process_reap(); without this the pool's physical pages would leak.
+ * ProcessReap(); without this the pool's physical pages would leak.
  */
-void shm_cleanup_process(subject_id_t owner) {
+void ShmCleanupProcess(subject_id_t owner) {
     for (u32 i = 0; i < SHM_MAX_POOLS; i++) {
         if (s_pools[i].in_use && s_pools[i].owner_subject == owner) {
-            pmm_free_pages(s_pools[i].phys_base, s_pools[i].page_count);
+            PmmFreePages(s_pools[i].phys_base, s_pools[i].page_count);
             s_pools[i].in_use = false;
-            serial_printf("shm: pool freed (subject=%u, %u pages)\n",
+            SerialPrintf("shm: pool freed (subject=%u, %u pages)\n",
                           (unsigned)owner,
                           (unsigned)s_pools[i].page_count);
         }

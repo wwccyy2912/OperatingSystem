@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * process_desc.c - Descriptor-based process creation (SYS_PROCESS_CREATE)
  * Copyright (c) 2026 OpSys Project
  *
@@ -20,9 +33,23 @@
  *
  * The kernel-side ELF parser (kernel/mm/elf.c, kernel/include/kernel/
  * elf.h) is gone; the only ELF walking left in the kernel is the
- * bootstrap-only init loader in kernel/mm/elf_boot.c.
+ * bootstrap-only init loader in kernel/mm/elf_boot.c. *
+ * ------------------------------------------------------------------
+ * Structure (process_desc):
+ *   SYS_PROCESS_CREATE: blob -> proc_seg_desc_t[] (text/data/bss/
+ *   stack) -> MapSegment() -> new process { addr_space, entry, cap
+ *   table }.
+ * How it works:
+ *   Validates the segment descriptors, maps each into a fresh address
+ *   space, then hands the process to ProcessCreate() with the caller's
+ *   capabilities.
+ * Purpose:
+ *   The kernel-side half of user process spawning (manager + shell).
+ * Caveats:
+ *   Segment bounds are checked against blob size; ownership of the
+ *   address space transfers to the process on success.
+ * ------------------------------------------------------------------
  */
-
 #include <kernel/types.h>
 #include <kernel/vmm.h>
 #include <kernel/process.h>
@@ -46,8 +73,8 @@
  * kernel can dereference it without #PF.  Same checks as the removed
  * sys_process_create in syscall.c.
  */
-static bool validate_user_ptr(u64 ptr, u64 size, bool need_write) {
-    return vmm_validate_user_ptr(ptr, size, need_write);
+static bool ValidateUserPtr(u64 ptr, u64 size, bool need_write) {
+    return VmmValidateUserPtr(ptr, size, need_write);
 }
 
 /* Convenience: cast a validated user pointer */
@@ -66,7 +93,7 @@ static bool validate_user_ptr(u64 ptr, u64 size, bool need_write) {
  *
  * All segment fields were validated before this is called.
  */
-static error_t map_segment(addr_space_t *as, const proc_seg_desc_t *seg, const u8 *blob) {
+static error_t MapSegment(addr_space_t *as, const proc_seg_desc_t *seg, const u8 *blob) {
     u64 page_vaddr = seg->vaddr & ~(PAGE_SIZE - 1);
     u64 page_end   = (seg->vaddr + seg->memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
@@ -78,9 +105,9 @@ static error_t map_segment(addr_space_t *as, const proc_seg_desc_t *seg, const u
         pte_flags |= PTE_NO_EXECUTE;
 
     for (u64 pg = page_vaddr; pg < page_end; pg += PAGE_SIZE) {
-        error_t err = vmm_alloc_and_map(as, pg, pte_flags);
+        error_t err = VmmAllocAndMap(as, pg, pte_flags);
         if (err != OK) {
-            serial_printf("proc: vmm_alloc_and_map(0x%x) failed: %d\n", (u32)pg, err);
+            SerialPrintf("proc: VmmAllocAndMap(0x%x) failed: %d\n", (u32)pg, err);
             return ERR_NOMEM;
         }
     }
@@ -95,7 +122,7 @@ static error_t map_segment(addr_space_t *as, const proc_seg_desc_t *seg, const u
     for (u64 pg = page_vaddr; pg < page_end; pg += PAGE_SIZE) {
         /* Resolve the user page to a physical page so we can write
          * through the kernel's direct-mapped identity. */
-        u64 phys = vmm_virt_to_phys(as, pg);
+        u64 phys = VmmVirtToPhys(as, pg);
         if (!phys)
             return ERR_NOMEM;
         u8 *dest = (u8 *)(phys + KERNEL_VIRT_BASE);
@@ -148,7 +175,7 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     (void)a5;
 
     /* ---- arg1: process name (bounded 64-byte read) ---- */
-    if (a1 == 0 || !validate_user_ptr(a1, PROC_NAME_MAX, false))
+    if (a1 == 0 || !ValidateUserPtr(a1, PROC_NAME_MAX, false))
         return (i64)ERR_FAULT;
 
     char        name[PROC_NAME_MAX];
@@ -159,7 +186,7 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     name[i] = '\0';
 
     /* ---- arg2: image descriptor + segment table ---- */
-    if (a2 == 0 || !validate_user_ptr(a2, sizeof(proc_image_desc_t), false))
+    if (a2 == 0 || !ValidateUserPtr(a2, sizeof(proc_image_desc_t), false))
         return (i64)ERR_FAULT;
 
     proc_image_desc_t desc;
@@ -174,12 +201,12 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
      * the whole range is mapped before dereferencing it. */
     const proc_seg_desc_t *segs =
         (const proc_seg_desc_t *)((const u8 *)USER_PTR(a2) + sizeof(proc_image_desc_t));
-    if (!validate_user_ptr(
+    if (!ValidateUserPtr(
             a2 + sizeof(proc_image_desc_t), desc.seg_count * sizeof(proc_seg_desc_t), false))
         return (i64)ERR_FAULT;
 
     /* ---- arg3/arg4: blob range (opaque bytes, never parsed) ---- */
-    if (a3 == 0 || a4 == 0 || !validate_user_ptr(a3, a4, false))
+    if (a3 == 0 || a4 == 0 || !ValidateUserPtr(a3, a4, false))
         return (i64)ERR_FAULT;
     const u8 *blob      = (const u8 *)USER_PTR(a3);
     u64       blob_size = a4;
@@ -189,11 +216,11 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
         const proc_seg_desc_t *seg = &segs[si];
 
         if (seg->vaddr == 0 || (seg->vaddr & (PAGE_SIZE - 1)) != 0) {
-            serial_printf("proc: seg %d vaddr 0x%x not page-aligned\n", (int)si, (u32)seg->vaddr);
+            SerialPrintf("proc: seg %d vaddr 0x%x not page-aligned\n", (int)si, (u32)seg->vaddr);
             return (i64)ERR_INVAL;
         }
         if (seg->memsz < seg->filesz) {
-            serial_printf("proc: seg %d memsz 0x%x < filesz 0x%x\n",
+            SerialPrintf("proc: seg %d memsz 0x%x < filesz 0x%x\n",
                           (int)si,
                           (u32)seg->memsz,
                           (u32)seg->filesz);
@@ -201,17 +228,17 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
         }
         /* prot must be a subset of PROT_NONE|PROT_READ|PROT_WRITE|PROT_EXEC */
         if ((seg->prot & ~(u64)(PROT_NONE | PROT_READ | PROT_WRITE | PROT_EXEC)) != 0) {
-            serial_printf("proc: seg %d bad prot 0x%x\n", (int)si, (u32)seg->prot);
+            SerialPrintf("proc: seg %d bad prot 0x%x\n", (int)si, (u32)seg->prot);
             return (i64)ERR_INVAL;
         }
         /* [vaddr, vaddr+memsz) must stay in the user address space. */
         if (seg->memsz > USER_PTR_MAX || seg->vaddr > USER_PTR_MAX - seg->memsz) {
-            serial_printf("proc: seg %d vaddr out of user space\n", (int)si);
+            SerialPrintf("proc: seg %d vaddr out of user space\n", (int)si);
             return (i64)ERR_INVAL;
         }
         /* File data [src_offset, src_offset+filesz) must lie in blob. */
         if (seg->filesz > blob_size || seg->src_offset > blob_size - seg->filesz) {
-            serial_printf("proc: seg %d blob range out of bounds\n", (int)si);
+            SerialPrintf("proc: seg %d blob range out of bounds\n", (int)si);
             return (i64)ERR_INVAL;
         }
     }
@@ -230,13 +257,13 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
             u64 b_lo = segs[j].vaddr;
             u64 b_hi = segs[j].vaddr + segs[j].memsz;
             if (a_lo < b_hi && b_lo < a_hi) {
-                serial_printf("proc: seg %d and %d overlap\n", (int)i, (int)j);
+                SerialPrintf("proc: seg %d and %d overlap\n", (int)i, (int)j);
                 return (i64)ERR_INVAL;
             }
         }
     }
 
-    serial_printf(
+    SerialPrintf(
         "proc: CREATE name=%s entry=0x%x segs=%d\n", name, (u32)desc.entry, (int)desc.seg_count);
 
     /* ---- Build the address space ---- */
@@ -246,9 +273,9 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
 
     /* ---- Map + fill every segment ---- */
     for (u64 si = 0; si < desc.seg_count; si++) {
-        error_t err = map_segment(as, &segs[si], blob);
+        error_t err = MapSegment(as, &segs[si], blob);
         if (err != OK) {
-            vmm_destroy_addr_space(as);
+            VmmDestroyAddrSpace(as);
             return (i64)err;
         }
     }
@@ -276,13 +303,13 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
      *
      * CALLER GATE (production hardening): the spawner itself must
      * hold ATOM_SERVICE_MANAGE.  Otherwise an untrusted app could
-     * blob_get("perm") + process_create() a byte-identical copy and
+     * BlobGet("perm") + process_create() a byte-identical copy and
      * receive the management atom (privilege escalation).  The legit
      * chain is init -> manager -> services; init and manager both
      * hold the atom, so real service spawns keep working. ---- */
     process_t *cur = process_current();
     if (proc->cap_table && cur && cur->cap_table &&
-        cap_lookup_by_atom(cur->cap_table, cur->subject_id, ATOM_SERVICE_MANAGE, 0) !=
+        CapLookupByAtom(cur->cap_table, cur->subject_id, ATOM_SERVICE_MANAGE, 0) !=
             CAP_NULL) {
         static const char *const s_svc_blobs[] = {
             "manager", "perm", "pkg", "term", "vfs", "fs_mem_driver", "user",
@@ -291,11 +318,11 @@ i64 sc_sys_process_create(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
         for (u64 bi = 0; bi < sizeof(s_svc_blobs) / sizeof(s_svc_blobs[0]); bi++) {
             const void *blob_data = NULL;
             u64         blob_sz   = 0;
-            if (blob_get(s_svc_blobs[bi], &blob_data, &blob_sz) != OK)
+            if (BlobGet(s_svc_blobs[bi], &blob_data, &blob_sz) != OK)
                 continue;
             if (blob_size == blob_sz && memcmp(blob, blob_data, blob_sz) == 0) {
                 cap_t h = CAP_NULL;
-                cap_create_atom(
+                CapCreateAtom(
                     proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, RIGHT_ALL, 0, 0, 0, &h);
                 break;
             }

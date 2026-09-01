@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * rtc.h - Real-time clock (CMOS RTC) wall-clock time
  * Copyright (c) 2026 OpSys Project
  *
@@ -29,7 +42,7 @@ typedef struct {
  * and handles both 12-hour and 24-hour mode.
  * @param out  Filled with the current time.
  */
-void rtc_read(rtc_time_t *out);
+void RtcRead(rtc_time_t *out);
 
 /**
  * Set the wall-clock time on the CMOS RTC (P2 地基: SYS_SET_TIME).
@@ -41,6 +54,6 @@ void rtc_read(rtc_time_t *out);
  * handles either mode, so the permanent mode switch is harmless.
  * @param t  Time to write; ignored (no-op) when NULL.
  */
-void rtc_write(const rtc_time_t *t);
+void RtcWrite(const rtc_time_t *t);
 
 #endif /* KERNEL_RTC_H */

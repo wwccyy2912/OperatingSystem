@@ -1,3 +1,15 @@
+; SPDX-License-Identifier: GPL-3.0-or-later
+;
+; This program is free software: you can redistribute it and/or modify
+; it under the terms of the GNU General Public License as published by
+; the Free Software Foundation, either version 3 of the License, or
+; (at your option) any later version.
+;
+; This program is distributed in the hope that it will be useful, but
+; WITHOUT ANY WARRANTY; without even the implied warranty of
+; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+; General Public License for more details: <https://www.gnu.org/licenses/>.
+;
 ; =============================================================================
 ; boot.asm - Multiboot2 entry point with long mode switch
 ; NASM Intel syntax, x86_64 target
@@ -10,7 +22,7 @@
 ;      1GB huge pages from 4GB to 128GB in the shared PDP)
 ;   4. Enable PAE, EFER.LME, paging -> IA-32e compatibility mode
 ;   5. Load 64-bit GDT, far jump to 64-bit code
-;   6. Switch to higher-half, call kernel_main()
+;   6. Switch to higher-half, call KernelMain()
 ; =============================================================================
 
 %define MULTIBOOT2_MAGIC         0xe85250d6
@@ -89,7 +101,7 @@ section .text
 bits 32
 
 global _start
-extern kernel_main
+extern KernelMain
 
 ; Linker symbols (physical addresses, defined in linker.ld)
 extern __kernel_phys_start
@@ -539,8 +551,8 @@ start64_higher_half:
         ; Pass kernel physical base as second argument (RSI)
         mov rsi, __kernel_phys_start
 
-        ; Call kernel_main using absolute indirect call
-        mov rax, kernel_main
+        ; Call KernelMain using absolute indirect call
+        mov rax, KernelMain
         call rax
 
         ; Should never return, but halt just in case

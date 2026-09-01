@@ -1,9 +1,49 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * syscall.c - System call initialization and dispatch
  * Copyright (c) 2026 OpSys Project
  *
  * Single entry point for all syscalls. The assembly stub (syscall_entry.S)
  * saves user registers and calls syscall_dispatch(num, arg1..arg5).
+ *
+ * ------------------------------------------------------------------
+ * Structure (syscall dispatch):
+ *
+ *   user: syscall (LSTAR) or int 0x80
+ *     -> syscall_entry_fast / syscall_entry_stub (syscall_entry.S)
+ *     -> syscall_common: save GPRs, build args
+ *     -> syscall_dispatch(num, arg1..arg5)      [bounds check]
+ *     -> s_syscall_table[num] -> handler        [NULL = ERR_INVAL]
+ *     -> signal_check_syscall -> restore GPRs/GS -> iretq
+ *
+ * How it works:
+ *   The asm entry synthesizes the CPU frame, saves all GPRs and calls
+ *   syscall_dispatch, which bounds-checks the number, looks it up in
+ *   the designated-initializer table and invokes the matching handler
+ *   through a uniform 5-arg adapter.  The first syscall also re-enables
+ *   the PIT and unmasks PIC IRQs (EnableSchedulerOnce()).
+ * Purpose:
+ *   Single choke point for all user->kernel traps: O(1) table lookup,
+ *   sparse numbers via designated initializers, and one shared
+ *   register-save/restore and signal-checkpoint path.
+ * Caveats:
+ *   Handlers run with IF=0 (SFMASK / int gate), which makes
+ *   validate-then-copy race-free by construction.  A blocking handler
+ *   can yield mid-flight, so the exit restores GS explicitly (wrmsr)
+ *   instead of relying on the entry swapgs pairing.
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/syscall.h>
@@ -28,7 +68,7 @@
 #include <kernel/proc_info.h>
 
 /* Forward declarations (defined below in this file). */
-static bool proc_has_io_port_cap(rights_t need, u16 port);
+static bool ProcHasIoPortCap(rights_t need, u16 port);
 #include <kernel/panic.h>
 #include <kernel/pci.h>
 
@@ -41,10 +81,10 @@ static bool proc_has_io_port_cap(rights_t need, u16 port);
  *   - when need_write, EVERY page is also writable (the kernel will
  *     write into the range); pass false for read-only user buffers
  */
-static bool validate_user_ptr(u64 ptr, u64 size, bool need_write) {
+static bool ValidateUserPtr(u64 ptr, u64 size, bool need_write) {
     /* Single shared implementation (vmm.c); kept as a thin alias so the
      * many call sites read naturally. */
-    return vmm_validate_user_ptr(ptr, size, need_write);
+    return VmmValidateUserPtr(ptr, size, need_write);
 }
 
 /* Convenience: cast a validated user pointer */
@@ -82,7 +122,7 @@ static i64 sys_debug_log(u64 arg1) {
         if (chunk > DEBUG_LOG_MAX - n)
             chunk = DEBUG_LOG_MAX - n;
 
-        if (!validate_user_ptr(p, chunk, false))
+        if (!ValidateUserPtr(p, chunk, false))
             break; /* rest of the string is unmapped — end it here */
 
         const char *src = (const char *)(uintptr_t)p;
@@ -129,7 +169,7 @@ static i64 sys_debug_log(u64 arg1) {
      * except for one bounded burst. */
     static u64 budget_tick = ~0ULL;
     static u64 budget      = DEBUG_LOG_BUCKET_MAX;
-    u64        now         = sched_get_ticks();
+    u64        now         = SchedGetTicks();
     if (now != budget_tick) {
         budget_tick = now;
         budget += DEBUG_LOG_TICK_BUDGET;
@@ -143,7 +183,7 @@ static i64 sys_debug_log(u64 arg1) {
     budget -= n;
 
     buf[n] = '\0';
-    serial_puts(buf);
+    SerialPuts(buf);
     return 0;
 }
 
@@ -169,7 +209,7 @@ static i64 sys_cap_create(u64 type, u64 rights, u64 obj_id) {
     /* Validate obj_id for typed caps so a bogus range cannot be stored. */
     if (cap_type == CAP_TYPE_IRQ && obj_id >= 16)
         return (i64)ERR_INVAL;
-    if (cap_type == CAP_TYPE_PCI_DEV && obj_id >= (u64)pci_device_count())
+    if (cap_type == CAP_TYPE_PCI_DEV && obj_id >= (u64)PciDeviceCount())
         return (i64)ERR_INVAL; /* obj_id must be a live PCI table index */
 
     /* Security: CAP_TYPE_DAC_OVERRIDE is a purely privileged capability
@@ -195,11 +235,11 @@ static i64 sys_cap_create(u64 type, u64 rights, u64 obj_id) {
      * atom.  A future non-service driver would receive its caps via
      * the perm-engine grant path instead of self-minting. */
     if ((cap_type == CAP_TYPE_PCI_DEV || cap_type == CAP_TYPE_IO_PORT) &&
-        cap_lookup_by_atom(proc->cap_table, proc->subject_id,
+        CapLookupByAtom(proc->cap_table, proc->subject_id,
                            ATOM_SERVICE_MANAGE, 0) == CAP_NULL)
         return (i64)ERR_NOCAP;
 
-    cap_t handle = cap_create_in_table(proc->cap_table, cap_type, (rights_t)rights, obj_id, 0);
+    cap_t handle = CapCreateInTable(proc->cap_table, cap_type, (rights_t)rights, obj_id, 0);
     if (handle == CAP_NULL)
         return (i64)ERR_NOMEM;
 
@@ -219,7 +259,7 @@ static i64 sys_cap_grant(u64 handle, u64 target_pid, u64 rights) {
         return (i64)ERR_NOENT;
 
     cap_t new_handle =
-        cap_grant(src_proc->cap_table, dst_proc->cap_table, (cap_t)handle, (rights_t)rights);
+        CapGrant(src_proc->cap_table, dst_proc->cap_table, (cap_t)handle, (rights_t)rights);
     if (new_handle == CAP_NULL)
         return (i64)ERR_DENIED;
 
@@ -234,7 +274,7 @@ static i64 sys_cap_revoke(u64 handle) {
     if (!proc || !proc->cap_table)
         return (i64)ERR_FAULT;
 
-    error_t err = cap_revoke(proc->cap_table, (cap_t)handle);
+    error_t err = CapRevoke(proc->cap_table, (cap_t)handle);
     return (i64)err;
 }
 
@@ -260,11 +300,11 @@ static i64 sys_cap_create_atom(u64 atom, u64 rights, u64 expiry_ticks, u64 quota
     /* GATE FIRST (docs/ops_format.md §6): a live ATOM_CAP_GRANT_SELF
      * cap held by the caller's subject is the entire authorization.
      * Same pattern as sys_set_time (cap_lookup_by_atom gate). */
-    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_CAP_GRANT_SELF, 0) == CAP_NULL)
+    if (CapLookupByAtom(proc->cap_table, proc->subject_id, ATOM_CAP_GRANT_SELF, 0) == CAP_NULL)
         return (i64)ERR_NOCAP;
 
     cap_t handle = CAP_NULL;
-    int   err    = cap_create_atom(proc->cap_table,
+    int   err    = CapCreateAtom(proc->cap_table,
                                    proc->subject_id,
                                    (atom_id_t)atom,
                                    (rights_t)rights,
@@ -288,7 +328,7 @@ static i64 sys_cap_consume(u64 handle) {
     if (!proc || !proc->cap_table)
         return (i64)ERR_FAULT;
 
-    return (i64)cap_consume(proc->cap_table, (cap_t)handle);
+    return (i64)CapConsume(proc->cap_table, (cap_t)handle);
 }
 
 /*
@@ -309,10 +349,10 @@ static i64 sys_cap_revoke_by_atom(u64 subject, u64 atom, u64 scope_hash) {
 
     /* GATE FIRST (docs/ops_format.md §6): look up the atom in the
      * CALLER's own cap table (same sys_set_time gate pattern). */
-    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, 0) == CAP_NULL)
+    if (CapLookupByAtom(proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, 0) == CAP_NULL)
         return (i64)ERR_NOCAP;
 
-    return (i64)cap_revoke_by_atom((subject_id_t)subject, (atom_id_t)atom, scope_hash);
+    return (i64)CapRevokeByAtom((subject_id_t)subject, (atom_id_t)atom, scope_hash);
 }
 
 /*
@@ -342,11 +382,11 @@ sys_cap_grant_to_subject(u64 subject, u64 atom, u64 rights, u64 expiry_ticks, u6
     /* GATE FIRST (docs/ops_format.md §6): a live ATOM_SERVICE_MANAGE
      * cap held by the CALLER's subject is the entire authorization
      * (same sys_set_time gate pattern). */
-    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, 0) == CAP_NULL)
+    if (CapLookupByAtom(proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, 0) == CAP_NULL)
         return (i64)ERR_NOCAP;
 
     cap_t handle = CAP_NULL;
-    int   err    = cap_grant_to_subject((subject_id_t)subject,
+    int   err    = CapGrantToSubject((subject_id_t)subject,
                                         (atom_id_t)atom,
                                         (rights_t)rights,
                                         expiry_ticks,
@@ -375,14 +415,14 @@ static i64 sys_cap_has_atom(u64 subject, u64 atom) {
 
     /* GATE FIRST (docs/ops_format.md §6): caller must hold
      * ATOM_SERVICE_MANAGE (same sys_set_time gate pattern). */
-    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, 0) == CAP_NULL)
+    if (CapLookupByAtom(proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, 0) == CAP_NULL)
         return (i64)ERR_NOCAP;
 
     process_t *dst = process_get_by_subject((subject_id_t)subject);
     if (!dst || !dst->cap_table)
         return (i64)ERR_NOENT;
 
-    return (cap_lookup_by_atom(dst->cap_table, (subject_id_t)subject, (atom_id_t)atom, 0) !=
+    return (CapLookupByAtom(dst->cap_table, (subject_id_t)subject, (atom_id_t)atom, 0) !=
             CAP_NULL)
                ? 1
                : 0;
@@ -392,10 +432,10 @@ static i64 sys_cap_has_atom(u64 subject, u64 atom) {
  * IPC: send a message to a port.
  */
 static i64 sys_ipc_send(u64 port, u64 msg, u64 len) {
-    if (!validate_user_ptr(msg, len, false)) /* kernel reads msg */
+    if (!ValidateUserPtr(msg, len, false)) /* kernel reads msg */
         return (i64)ERR_FAULT;
 
-    error_t err = ipc_send((port_t)port, USER_PTR(msg), (u32)len);
+    error_t err = IpcSend((port_t)port, USER_PTR(msg), (u32)len);
     return (i64)err;
 }
 
@@ -407,23 +447,23 @@ static i64 sys_ipc_send(u64 port, u64 msg, u64 len) {
  * unchanged to SYS_IPC_REPLY), 0 for a plain send.
  */
 static i64 sys_ipc_recv(u64 port, u64 buf, u64 len_ptr, u64 tok_ptr) {
-    if (!validate_user_ptr(len_ptr, sizeof(u32), true)) /* kernel writes len */
+    if (!ValidateUserPtr(len_ptr, sizeof(u32), true)) /* kernel writes len */
         return (i64)ERR_FAULT;
 
     u32 *user_len = (u32 *)USER_PTR(len_ptr);
     u32  len      = *user_len;
 
-    if (buf != 0 && !validate_user_ptr(buf, len, true)) /* kernel writes buf */
+    if (buf != 0 && !ValidateUserPtr(buf, len, true)) /* kernel writes buf */
         return (i64)ERR_FAULT;
 
     u32 *user_tok = NULL;
     if (tok_ptr != 0) {
-        if (!validate_user_ptr(tok_ptr, sizeof(u32), true)) /* kernel writes token */
+        if (!ValidateUserPtr(tok_ptr, sizeof(u32), true)) /* kernel writes token */
             return (i64)ERR_FAULT;
         user_tok = (u32 *)USER_PTR(tok_ptr);
     }
 
-    error_t err = ipc_recv((port_t)port, USER_PTR(buf), &len, user_tok);
+    error_t err = IpcRecv((port_t)port, USER_PTR(buf), &len, user_tok);
     if (err == OK)
         *user_len = len;
     return (i64)err;
@@ -437,31 +477,31 @@ static i64 sys_ipc_recv(u64 port, u64 buf, u64 len_ptr, u64 tok_ptr) {
  * write).  The user-pointer check is the same one sys_ipc_recv uses.
  */
 static i64 sys_ipc_recv_from(u64 port, u64 buf, u64 len_ptr, u64 tok_ptr, u64 subj_ptr) {
-    if (!validate_user_ptr(len_ptr, sizeof(u32), true)) /* kernel writes len */
+    if (!ValidateUserPtr(len_ptr, sizeof(u32), true)) /* kernel writes len */
         return (i64)ERR_FAULT;
 
     u32 *user_len = (u32 *)USER_PTR(len_ptr);
     u32  len      = *user_len;
 
-    if (buf != 0 && !validate_user_ptr(buf, len, true)) /* kernel writes buf */
+    if (buf != 0 && !ValidateUserPtr(buf, len, true)) /* kernel writes buf */
         return (i64)ERR_FAULT;
 
     u32 *user_tok = NULL;
     if (tok_ptr != 0) {
-        if (!validate_user_ptr(tok_ptr, sizeof(u32), true)) /* kernel writes token */
+        if (!ValidateUserPtr(tok_ptr, sizeof(u32), true)) /* kernel writes token */
             return (i64)ERR_FAULT;
         user_tok = (u32 *)USER_PTR(tok_ptr);
     }
 
     u64 *user_subj = NULL;
     if (subj_ptr != 0) {
-        if (!validate_user_ptr(subj_ptr, sizeof(u64), true)) /* kernel writes subject */
+        if (!ValidateUserPtr(subj_ptr, sizeof(u64), true)) /* kernel writes subject */
             return (i64)ERR_FAULT;
         user_subj = (u64 *)USER_PTR(subj_ptr);
     }
 
     subject_id_t subj = 0;
-    error_t      err  = ipc_recv_from((port_t)port, USER_PTR(buf), &len, user_tok, &subj);
+    error_t      err  = IpcRecvFrom((port_t)port, USER_PTR(buf), &len, user_tok, &subj);
     if (err == OK) {
         *user_len = len;
         if (user_subj)
@@ -475,19 +515,19 @@ static i64 sys_ipc_recv_from(u64 port, u64 buf, u64 len_ptr, u64 tok_ptr, u64 su
  * arg5 points to an in/out response length value.
  */
 static i64 sys_ipc_call(u64 port, u64 req, u64 req_len, u64 resp, u64 resp_len_ptr) {
-    if (!validate_user_ptr(req, req_len, false)) /* kernel reads request */
+    if (!ValidateUserPtr(req, req_len, false)) /* kernel reads request */
         return (i64)ERR_FAULT;
 
-    if (!validate_user_ptr(resp_len_ptr, sizeof(u32), true)) /* kernel writes resp_len */
+    if (!ValidateUserPtr(resp_len_ptr, sizeof(u32), true)) /* kernel writes resp_len */
         return (i64)ERR_FAULT;
 
     u32 *user_resp_len = (u32 *)USER_PTR(resp_len_ptr);
     u32  resp_len      = *user_resp_len;
 
-    if (resp != 0 && !validate_user_ptr(resp, resp_len, true)) /* kernel writes resp */
+    if (resp != 0 && !ValidateUserPtr(resp, resp_len, true)) /* kernel writes resp */
         return (i64)ERR_FAULT;
 
-    error_t err    = ipc_call((port_t)port, USER_PTR(req), (u32)req_len, USER_PTR(resp), &resp_len);
+    error_t err    = IpcCall((port_t)port, USER_PTR(req), (u32)req_len, USER_PTR(resp), &resp_len);
     *user_resp_len = resp_len;
     return (i64)err;
 }
@@ -496,7 +536,7 @@ static i64 sys_ipc_call(u64 port, u64 req, u64 req_len, u64 resp, u64 resp_len_p
  * IPC: create a new port owned by the current thread.
  */
 static i64 sys_ipc_port_create(void) {
-    port_t port = ipc_port_create();
+    port_t port = IpcPortCreate();
     return (i64)port;
 }
 
@@ -506,10 +546,10 @@ static i64 sys_ipc_port_create(void) {
  * call message), arg2 = response buffer, arg3 = response length.
  */
 static i64 sys_ipc_reply(u64 token, u64 buf, u64 len) {
-    if (!validate_user_ptr(buf, len, false)) /* kernel reads reply buffer */
+    if (!ValidateUserPtr(buf, len, false)) /* kernel reads reply buffer */
         return (i64)ERR_FAULT;
 
-    error_t err = ipc_reply((u32)token, USER_PTR(buf), (u32)len);
+    error_t err = IpcReply((u32)token, USER_PTR(buf), (u32)len);
     return (i64)err;
 }
 
@@ -572,7 +612,7 @@ static i64 sys_map_memory(u64 cap_handle, u64 virt, u64 size, u64 prot) {
     error_t err = OK;
     for (u64 i = 0; i < page_count; i++) {
         u64 v = virt + i * PAGE_SIZE;
-        err   = vmm_alloc_and_map(proc->addr_space, v, flags);
+        err   = VmmAllocAndMap(proc->addr_space, v, flags);
         if (err != OK)
             return 0;
     }
@@ -611,7 +651,7 @@ static i64 sys_unmap_memory(u64 virt, u64 size) {
 
     u64 page_count = size / PAGE_SIZE;
 
-    error_t err = vmm_unmap_range(proc->addr_space, virt, page_count);
+    error_t err = VmmUnmapRange(proc->addr_space, virt, page_count);
     return (i64)err;
 }
 
@@ -628,15 +668,15 @@ static i64 sys_fb_get_info(u64 buf_ptr) {
     process_t *proc = process_current();
     if (!proc || !proc->cap_table)
         return (i64)ERR_FAULT;
-    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, 0) ==
+    if (CapLookupByAtom(proc->cap_table, proc->subject_id, ATOM_SERVICE_MANAGE, 0) ==
         CAP_NULL)
         return (i64)ERR_NOCAP;
 
     fb_user_info_t info;
-    if (fb_get_user_info(&info) < 0)
+    if (FbGetUserInfo(&info) < 0)
         return (i64)ERR_NOENT;
 
-    if (!validate_user_ptr(buf_ptr, sizeof(fb_user_info_t), true))
+    if (!ValidateUserPtr(buf_ptr, sizeof(fb_user_info_t), true))
         return (i64)ERR_FAULT;
     memcpy(USER_PTR(buf_ptr), &info, sizeof(fb_user_info_t));
     return 0;
@@ -656,12 +696,12 @@ static i64 sys_fb_map(u64 virt, u64 size) {
     process_t *gproc = process_current();
     if (!gproc || !gproc->cap_table)
         return (i64)ERR_FAULT;
-    if (cap_lookup_by_atom(gproc->cap_table, gproc->subject_id, ATOM_SERVICE_MANAGE, 0) ==
+    if (CapLookupByAtom(gproc->cap_table, gproc->subject_id, ATOM_SERVICE_MANAGE, 0) ==
         CAP_NULL)
         return (i64)ERR_NOCAP;
 
     fb_user_info_t info;
-    if (fb_get_user_info(&info) < 0)
+    if (FbGetUserInfo(&info) < 0)
         return (i64)ERR_NOENT;
 
     process_t *proc = process_current();
@@ -703,10 +743,10 @@ static i64 sys_fb_map(u64 virt, u64 size) {
     u64 page_count = size / PAGE_SIZE;
     for (u64 i = 0; i < page_count; i++) {
         error_t err =
-            vmm_map(proc->addr_space, virt + i * PAGE_SIZE, info.phys_addr + i * PAGE_SIZE, flags);
+            VmmMap(proc->addr_space, virt + i * PAGE_SIZE, info.phys_addr + i * PAGE_SIZE, flags);
         if (err != OK) {
             /* Partial map on failure: unmap what we mapped, then bail */
-            vmm_unmap_range(proc->addr_space, virt, i);
+            VmmUnmapRange(proc->addr_space, virt, i);
             return (i64)err;
         }
     }
@@ -730,7 +770,7 @@ static i64 sys_thread_create(u64 entry, u64 arg, u64 priority) {
     if (!proc || !proc->addr_space)
         return (i64)ERR_FAULT;
 
-    tid_t tid = thread_create_user(entry, arg, proc->addr_space, (int)priority);
+    tid_t tid = ThreadCreateUser(entry, arg, proc->addr_space, (int)priority);
     if (tid < 0)
         return (i64)tid;
 
@@ -742,7 +782,7 @@ static i64 sys_thread_create(u64 entry, u64 arg, u64 priority) {
     if (t) {
         t->pid = proc->pid;
         /* Count the spawned thread.  Every user thread exits through
-         * thread_exit() -> process_thread_exited(), which decrements
+         * ThreadExit() -> ProcessThreadExited(), which decrements
          * thread_count; without this increment the count would hit
          * zero as soon as the first spawned thread exits (premature
          * PROC_STATE_ZOMBIE) and keep drifting negative. */
@@ -757,7 +797,7 @@ static i64 sys_thread_create(u64 entry, u64 arg, u64 priority) {
  * Should never return.
  */
 static i64 sys_thread_exit(u64 code) {
-    thread_exit((int)code);
+    ThreadExit((int)code);
     return 0; /* unreachable, satisfies compiler */
 }
 
@@ -765,7 +805,7 @@ static i64 sys_thread_exit(u64 code) {
  * Thread: yield the CPU to the scheduler.
  */
 static i64 sys_thread_yield(void) {
-    thread_yield();
+    ThreadYield();
     return 0;
 }
 
@@ -773,7 +813,7 @@ static i64 sys_thread_yield(void) {
  * Thread: set CPU affinity.
  */
 static i64 sys_thread_set_affinity(u64 tid, u64 cpu) {
-    error_t err = thread_set_affinity((tid_t)tid, (i32)cpu);
+    error_t err = ThreadSetAffinity((tid_t)tid, (i32)cpu);
     return (i64)err;
 }
 
@@ -793,11 +833,11 @@ static i64 sys_thread_join(u64 tid, u64 exit_code_ptr) {
     /* Target already finished — collect immediately */
     if (target->state == THREAD_STATE_FINISHED) {
         if (exit_code_ptr != 0) {
-            if (!validate_user_ptr(exit_code_ptr, sizeof(int), true)) /* kernel writes */
+            if (!ValidateUserPtr(exit_code_ptr, sizeof(int), true)) /* kernel writes */
                 return (i64)ERR_FAULT;
             *(int *)USER_PTR(exit_code_ptr) = target->exit_code;
         }
-        thread_release(target);
+        ThreadRelease(target);
         return 0;
     }
 
@@ -808,16 +848,16 @@ static i64 sys_thread_join(u64 tid, u64 exit_code_ptr) {
     /* Block until target finishes */
     target->joiner_tid = cur->tid;
     cur->state         = THREAD_STATE_BLOCKED;
-    sched_dequeue(cur);
-    sched_reschedule(); /* Pure switch — returns when we're unblocked */
+    SchedDequeue(cur);
+    SchedReschedule(); /* Pure switch — returns when we're unblocked */
 
     /* We're awake now — target finished */
     if (exit_code_ptr != 0) {
-        if (!validate_user_ptr(exit_code_ptr, sizeof(int), true)) /* kernel writes */
+        if (!ValidateUserPtr(exit_code_ptr, sizeof(int), true)) /* kernel writes */
             return (i64)ERR_FAULT;
         *(int *)USER_PTR(exit_code_ptr) = target->exit_code;
     }
-    thread_release(target);
+    ThreadRelease(target);
     return 0;
 }
 
@@ -825,7 +865,7 @@ static i64 sys_thread_join(u64 tid, u64 exit_code_ptr) {
  * Time: get the current tick count.
  */
 static i64 sys_get_time(void) {
-    return (i64)sched_get_ticks();
+    return (i64)SchedGetTicks();
 }
 
 /*
@@ -840,7 +880,7 @@ static i64 sys_get_time(void) {
 static i64 sys_sleep(u64 ticks) {
     if (ticks == 0 || ticks > (u64)0x7FFFFFFF)
         return (i64)ERR_INVAL;
-    sched_sleep((u64)ticks);
+    SchedSleep((u64)ticks);
     return 0;
 }
 
@@ -852,10 +892,10 @@ static i64 sys_sleep(u64 ticks) {
 static i64 sys_rtc_time(u64 out_ptr) {
     if (out_ptr == 0)
         return (i64)ERR_FAULT;
-    if (!validate_user_ptr(out_ptr, sizeof(rtc_time_t), true)) /* kernel writes */
+    if (!ValidateUserPtr(out_ptr, sizeof(rtc_time_t), true)) /* kernel writes */
         return (i64)ERR_FAULT;
 
-    rtc_read((rtc_time_t *)USER_PTR(out_ptr));
+    RtcRead((rtc_time_t *)USER_PTR(out_ptr));
     return 0;
 }
 
@@ -876,12 +916,12 @@ static i64 sys_set_time(u64 user_t_ptr) {
     /* GATE FIRST: a live ATOM_SYS_SET_TIME cap held by the caller's
      * subject is the entire authorization.  The cap table IS the
      * decision cache; no IPC, no user-space policy query. */
-    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_SYS_SET_TIME, 0) == CAP_NULL)
+    if (CapLookupByAtom(proc->cap_table, proc->subject_id, ATOM_SYS_SET_TIME, 0) == CAP_NULL)
         return (i64)ERR_NOCAP;
 
     if (user_t_ptr == 0)
         return (i64)ERR_FAULT;
-    if (!validate_user_ptr(user_t_ptr, sizeof(rtc_time_t), false))
+    if (!ValidateUserPtr(user_t_ptr, sizeof(rtc_time_t), false))
         return (i64)ERR_FAULT; /* kernel reads time struct */
 
     rtc_time_t t;
@@ -892,7 +932,7 @@ static i64 sys_set_time(u64 user_t_ptr) {
         t.minute > 59 || t.second > 59)
         return (i64)ERR_INVAL;
 
-    rtc_write(&t);
+    RtcWrite(&t);
     return 0;
 }
 
@@ -900,10 +940,10 @@ static i64 sys_set_time(u64 user_t_ptr) {
  * Port: register a well-known port by name.
  */
 static i64 sys_port_register(u64 name, u64 port) {
-    if (!validate_user_ptr(name, 1, false)) /* kernel reads name string */
+    if (!ValidateUserPtr(name, 1, false)) /* kernel reads name string */
         return (i64)ERR_FAULT;
 
-    error_t err = ipc_register_port((const char *)USER_PTR(name), (port_t)port);
+    error_t err = IpcRegisterPort((const char *)USER_PTR(name), (port_t)port);
     return (i64)err;
 }
 
@@ -911,10 +951,10 @@ static i64 sys_port_register(u64 name, u64 port) {
  * Port: look up a well-known port by name.
  */
 static i64 sys_port_get(u64 name) {
-    if (!validate_user_ptr(name, 1, false)) /* kernel reads name string */
+    if (!ValidateUserPtr(name, 1, false)) /* kernel reads name string */
         return (i64)ERR_FAULT;
 
-    port_t port = ipc_get_port((const char *)USER_PTR(name));
+    port_t port = IpcGetPort((const char *)USER_PTR(name));
     return (i64)port;
 }
 
@@ -922,7 +962,7 @@ static i64 sys_port_get(u64 name) {
  * Init protocol: return number of free physical pages.
  */
 static i64 sys_get_free_pages(void) {
-    return (i64)(pmm_get_free_memory() / PAGE_SIZE);
+    return (i64)(PmmGetFreeMemory() / PAGE_SIZE);
 }
 
 /*
@@ -987,7 +1027,7 @@ static i64 sys_process_wait(u64 pid, u64 exit_code_ptr) {
      * Validate the pointer before claiming so a bad buffer does not
      * leave the zombie unclaimed. */
     if (proc->state == PROC_STATE_ZOMBIE) {
-        if (exit_code_ptr != 0 && !validate_user_ptr(exit_code_ptr, sizeof(int), true))
+        if (exit_code_ptr != 0 && !ValidateUserPtr(exit_code_ptr, sizeof(int), true))
             return (i64)ERR_FAULT; /* kernel writes */
         if (proc->waiting_tid >= 0)
             return (i64)ERR_BUSY; /* a woken waiter owns the reap */
@@ -995,7 +1035,7 @@ static i64 sys_process_wait(u64 pid, u64 exit_code_ptr) {
         if (exit_code_ptr != 0)
             *(int *)USER_PTR(exit_code_ptr) = proc->exit_code;
         pid_t out_pid = proc->pid;
-        process_reap(proc);
+        ProcessReap(proc);
         return (i64)out_pid;
     }
 
@@ -1004,33 +1044,33 @@ static i64 sys_process_wait(u64 pid, u64 exit_code_ptr) {
         return (i64)ERR_BUSY;
 
     /* Block until the process's last thread exits.  The waker is
-     * process_thread_exited(), called from thread_exit(). */
+     * ProcessThreadExited(), called from ThreadExit(). */
     thread_t *cur     = thread_current();
     proc->waiting_tid = cur->tid;
     cur->state        = THREAD_STATE_BLOCKED;
-    sched_dequeue(cur);
-    sched_reschedule(); /* Pure switch — returns when we're woken */
+    SchedDequeue(cur);
+    SchedReschedule(); /* Pure switch — returns when we're woken */
 
     /* Awake: the process finished while we were blocked.  Only the
      * thread that owns waiting_tid may collect and reap.  (If the
-     * waiter vanished while blocked, process_thread_exited() reaped
+     * waiter vanished while blocked, ProcessThreadExited() reaped
      * the process as an orphan; that path is unreachable from here.) */
     if (proc->waiting_tid != cur->tid)
         return (i64)ERR_NOENT;
     proc->waiting_tid = -1;
 
     if (exit_code_ptr != 0) {
-        if (!validate_user_ptr(exit_code_ptr, sizeof(int), true)) {
+        if (!ValidateUserPtr(exit_code_ptr, sizeof(int), true)) {
             /* We claimed the process (waiting_tid cleared above) and
              * nothing else will reap it — free it even though the exit
              * code cannot be delivered. */
-            process_reap(proc);
+            ProcessReap(proc);
             return (i64)ERR_FAULT; /* kernel writes */
         }
         *(int *)USER_PTR(exit_code_ptr) = proc->exit_code;
     }
     pid_t out_pid = proc->pid;
-    process_reap(proc);
+    ProcessReap(proc);
     return (i64)out_pid;
 }
 
@@ -1045,9 +1085,9 @@ static i64 sys_process_list(u64 buf_ptr, u64 max_entries) {
         return 0;
     if (max_entries > MAX_THREADS)
         max_entries = MAX_THREADS;
-    if (!validate_user_ptr(buf_ptr, max_entries * sizeof(proc_info_t), true))
+    if (!ValidateUserPtr(buf_ptr, max_entries * sizeof(proc_info_t), true))
         return (i64)ERR_FAULT;
-    i64 n = process_list_fill((proc_info_t *)USER_PTR(buf_ptr), (u32)max_entries);
+    i64 n = ProcessListFill((proc_info_t *)USER_PTR(buf_ptr), (u32)max_entries);
     return n;
 }
 
@@ -1062,7 +1102,7 @@ static i64 sys_process_list(u64 buf_ptr, u64 max_entries) {
  * subject, or a dead process; ERR_FAULT on a bad output pointer.
  */
 static i64 sys_proc_info_by_subject(u64 subject, u64 out_ptr) {
-    if (out_ptr == 0 || !validate_user_ptr(out_ptr, sizeof(proc_ident_t), true))
+    if (out_ptr == 0 || !ValidateUserPtr(out_ptr, sizeof(proc_ident_t), true))
         return (i64)ERR_FAULT; /* kernel writes */
 
     process_t *proc = process_get_by_subject((subject_id_t)subject);
@@ -1090,12 +1130,12 @@ static i64 sys_proc_info_by_subject(u64 subject, u64 out_ptr) {
  */
 static i64 sys_blob_get(u64 name_ptr, u64 buf_ptr, u64 buf_size) {
     /* Validate the blob name: bounded 32-byte read below. */
-    if (name_ptr == 0 || !validate_user_ptr(name_ptr, BLOB_NAME_MAX, false)) /* kernel reads */
+    if (name_ptr == 0 || !ValidateUserPtr(name_ptr, BLOB_NAME_MAX, false)) /* kernel reads */
         return (i64)ERR_FAULT;
 
     /* Validate the destination buffer range (every page mapped). */
     if (buf_ptr == 0 || buf_size == 0 ||
-        !validate_user_ptr(buf_ptr, buf_size, true)) /* kernel writes */
+        !ValidateUserPtr(buf_ptr, buf_size, true)) /* kernel writes */
         return (i64)ERR_FAULT;
 
     /* Copy the name (bounded; all 32 bytes validated mapped above). */
@@ -1109,7 +1149,7 @@ static i64 sys_blob_get(u64 name_ptr, u64 buf_ptr, u64 buf_size) {
     /* Look up the blob and copy it out. */
     const void *data;
     u64         size;
-    int         err = blob_get(name, &data, &size);
+    int         err = BlobGet(name, &data, &size);
     if (err != OK)
         return (i64)err;
 
@@ -1127,9 +1167,9 @@ static i64 sys_debug_getchar(void) {
      * driver — the serial service holds the 0x3F8..0x3FF IO-port cap
      * (serial.c cap_create_obj).  Without this any Ring-3 process
      * could consume/steal the console input stream. */
-    if (!proc_has_io_port_cap(RIGHT_READ, 0x3F8)) /* SERIAL_COM1_BASE */
+    if (!ProcHasIoPortCap(RIGHT_READ, 0x3F8)) /* SERIAL_COM1_BASE */
         return (i64)ERR_NOCAP;
-    char c = serial_getchar();
+    char c = SerialGetchar();
     return (i64)(unsigned char)c;
 }
 
@@ -1138,7 +1178,7 @@ static i64 sys_debug_getchar(void) {
  * GATED (production hardening): the target must be a thread of the
  * CALLING process — no other process may inject spurious wakeups /
  * fake notification bits into a foreign thread.  (The kernel's own
- * irq.c forwards IRQs via notify() internally and is unaffected.)
+ * irq.c forwards IRQs via Notify() internally and is unaffected.)
  */
 static i64 sys_notify(u64 target_tid, u64 mask) {
     process_t *proc = process_current();
@@ -1147,14 +1187,14 @@ static i64 sys_notify(u64 target_tid, u64 mask) {
     thread_t *t = thread_get((tid_t)target_tid);
     if (!t || t->pid != proc->pid)
         return (i64)ERR_NOENT; /* foreign/unknown TID: no existence leak */
-    return (i64)notify((tid_t)target_tid, (u32)mask);
+    return (i64)Notify((tid_t)target_tid, (u32)mask);
 }
 
 /*
  * Notification: wait for (or poll) a set of signal bits.
  */
 static i64 sys_wait_notification(u64 mask) {
-    return (i64)wait_notification((u32)mask);
+    return (i64)WaitNotification((u32)mask);
 }
 
 /*
@@ -1174,7 +1214,7 @@ static i64 sys_bind_irq(u64 cap_handle, u64 irq, u64 mask) {
     if (cap->obj_id != irq)
         return (i64)ERR_NOCAP;
 
-    return (i64)irq_bind((u8)irq, (u32)mask);
+    return (i64)IrqBind((u8)irq, (u32)mask);
 }
 
 /*
@@ -1194,7 +1234,7 @@ static i64 sys_unbind_irq(u64 cap_handle, u64 irq) {
     if (cap->obj_id != irq)
         return (i64)ERR_NOCAP;
 
-    return (i64)irq_unbind((u8)irq);
+    return (i64)IrqUnbind((u8)irq);
 }
 
 /*
@@ -1204,7 +1244,7 @@ static i64 sys_unbind_irq(u64 cap_handle, u64 irq) {
  * obj_id encodes a port range: (count << 16) | base_port.
  * A cap with count == 0 names exactly the single port base_port.
  */
-static bool proc_has_io_port_cap(rights_t need, u16 port) {
+static bool ProcHasIoPortCap(rights_t need, u16 port) {
     process_t *proc = process_current();
     if (!proc || !proc->cap_table)
         return false;
@@ -1217,7 +1257,7 @@ static bool proc_has_io_port_cap(rights_t need, u16 port) {
          * expiring IO_PORT cap must not outlive its deadline). */
         if (e->type == CAP_TYPE_NONE)
             continue;
-        if (e->expiry_ticks != 0 && e->expiry_ticks <= sched_get_ticks())
+        if (e->expiry_ticks != 0 && e->expiry_ticks <= SchedGetTicks())
             continue;
         if (e->type == CAP_TYPE_IO_PORT && (e->rights & need) == need) {
             u16 base  = (u16)(e->obj_id & 0xFFFF);
@@ -1235,10 +1275,10 @@ static bool proc_has_io_port_cap(rights_t need, u16 port) {
  * covering `port` with RIGHT_READ.  arg1 = port number.
  */
 static i64 sys_io_read8(u64 port) {
-    if (!proc_has_io_port_cap(RIGHT_READ, (u16)port))
+    if (!ProcHasIoPortCap(RIGHT_READ, (u16)port))
         return (i64)ERR_NOCAP;
 
-    return (i64)io_inb((u16)port);
+    return (i64)IoInb((u16)port);
 }
 
 /*
@@ -1247,10 +1287,10 @@ static i64 sys_io_read8(u64 port) {
  * covering `port` with RIGHT_WRITE.  arg1 = port number, arg2 = byte value.
  */
 static i64 sys_io_write8(u64 port, u64 val) {
-    if (!proc_has_io_port_cap(RIGHT_WRITE, (u16)port))
+    if (!ProcHasIoPortCap(RIGHT_WRITE, (u16)port))
         return (i64)ERR_NOCAP;
 
-    io_outb((u16)port, (u8)val);
+    IoOutb((u16)port, (u8)val);
     return 0;
 }
 
@@ -1259,15 +1299,15 @@ static i64 sys_io_write8(u64 port, u64 val) {
  * Same capability gate as the byte variants.
  */
 static i64 sys_io_read16(u64 port) {
-    if (!proc_has_io_port_cap(RIGHT_READ, (u16)port))
+    if (!ProcHasIoPortCap(RIGHT_READ, (u16)port))
         return (i64)ERR_NOCAP;
-    return (i64)io_inw((u16)port);
+    return (i64)IoInw((u16)port);
 }
 
 static i64 sys_io_write16(u64 port, u64 val) {
-    if (!proc_has_io_port_cap(RIGHT_WRITE, (u16)port))
+    if (!ProcHasIoPortCap(RIGHT_WRITE, (u16)port))
         return (i64)ERR_NOCAP;
-    io_outw((u16)port, (u16)val);
+    IoOutw((u16)port, (u16)val);
     return 0;
 }
 
@@ -1275,7 +1315,7 @@ static i64 sys_io_write16(u64 port, u64 val) {
  * Mutex: create a new mutex owned by no thread.
  */
 static i64 sys_mutex_create(void) {
-    u32 handle = mutex_create();
+    u32 handle = MutexCreate();
     /* mutex_create returns 0 (invalid handle sentinel) when full */
     if (handle == 0)
         return (i64)ERR_NOMEM;
@@ -1286,21 +1326,21 @@ static i64 sys_mutex_create(void) {
  * Mutex: acquire, blocking until free.
  */
 static i64 sys_mutex_lock(u64 handle) {
-    return (i64)mutex_lock((u32)handle);
+    return (i64)MutexLock((u32)handle);
 }
 
 /*
  * Mutex: release, handing off to the next FIFO waiter.
  */
 static i64 sys_mutex_unlock(u64 handle) {
-    return (i64)mutex_unlock((u32)handle);
+    return (i64)MutexUnlock((u32)handle);
 }
 
 /*
  * Mutex: destroy, waking every waiter with ERR_NOENT.
  */
 static i64 sys_mutex_destroy(u64 handle) {
-    mutex_destroy((u32)handle);
+    MutexDestroy((u32)handle);
     return 0;
 }
 
@@ -1322,23 +1362,23 @@ static i64 sys_reboot(void) {
      * (docs/permission_model.md §四).  Pure kernel cap-table lookup —
      * zero IPC.  An unauthorized caller gets ERR_NOCAP and the system
      * keeps running (the reset line is never touched). */
-    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_SYS_SHUTDOWN, 0) == CAP_NULL)
+    if (CapLookupByAtom(proc->cap_table, proc->subject_id, ATOM_SYS_SHUTDOWN, 0) == CAP_NULL)
         return (i64)ERR_NOCAP;
 
-    serial_puts("OpSys: reboot requested, asserting 8042 reset line\n");
+    SerialPuts("OpSys: reboot requested, asserting 8042 reset line\n");
 
     /* Disable interrupts before the reset so a stray IRQ cannot
      * re-enter the kernel during the reset sequence. */
     __asm__ volatile("cli");
 
     /* Standard PC reboot sequence: pulse the 8042 reset line. */
-    io_outb(0x64, 0xFE);
+    IoOutb(0x64, 0xFE);
 
     /* If the reset line is ignored (non-standard hardware), fall back
      * to a triple fault: load IDT with base 0 and raise #BP.
      * QEMU treats a triple fault as a reboot request as well. */
-    io_delay();
-    io_outb(0x64, 0xFE);
+    IoDelay();
+    IoOutb(0x64, 0xFE);
 
     /* We should never get here.  Busy-loop to keep the CPU parked. */
     for (;;)
@@ -1360,20 +1400,20 @@ static i64 sys_shutdown(void) {
     if (!proc || !proc->cap_table)
         return (i64)ERR_FAULT;
 
-    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_SYS_SHUTDOWN, 0) == CAP_NULL)
+    if (CapLookupByAtom(proc->cap_table, proc->subject_id, ATOM_SYS_SHUTDOWN, 0) == CAP_NULL)
         return (i64)ERR_NOCAP;
 
-    serial_puts("OpSys: shutdown requested\n");
+    SerialPuts("OpSys: shutdown requested\n");
 
     __asm__ volatile("cli");
 
     /* ACPI PM1a_CNT sleep (S5): QEMU/VirtualBox respond to the ACPI
      * shutdown event on port 0x604 with the SLP_TYP S5 value. */
-    io_outw(0x604, 0x2000);
-    io_delay();
+    IoOutw(0x604, 0x2000);
+    IoDelay();
 
     /* Fallback: pulse the 8042 reset line (reboot). */
-    io_outb(0x64, 0xFE);
+    IoOutb(0x64, 0xFE);
 
     for (;;)
         __asm__ volatile("hlt");
@@ -1398,7 +1438,7 @@ static i64 sc_sys_panic(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     process_t *proc = process_current();
     if (!proc || !proc->cap_table)
         return (i64)ERR_FAULT;
-    if (cap_lookup_by_atom(proc->cap_table, proc->subject_id, ATOM_SYS_DEBUG, 0) == CAP_NULL)
+    if (CapLookupByAtom(proc->cap_table, proc->subject_id, ATOM_SYS_DEBUG, 0) == CAP_NULL)
         return (i64)ERR_NOCAP;
 
     panic("User-triggered panic (SYS_PANIC from shell)");
@@ -1451,14 +1491,14 @@ static i64 sys_kill(u64 pid, u64 signum) {
     if (!caller || !caller->cap_table)
         return (i64)ERR_FAULT;
     if (proc->pid != caller->pid &&
-        cap_lookup_by_atom(caller->cap_table, caller->subject_id, ATOM_SERVICE_MANAGE, 0) ==
+        CapLookupByAtom(caller->cap_table, caller->subject_id, ATOM_SERVICE_MANAGE, 0) ==
             CAP_NULL)
         return (i64)ERR_NOCAP;
 
     if (signum == SIGKILL) {
         /* Force-kill: every thread gets force_exit and blocked ones
          * are woken; each dies at its next checkpoint. */
-        signal_kill_process(proc, 128 + SIGKILL);
+        SignalKillProcess(proc, 128 + SIGKILL);
         return OK;
     }
 
@@ -1483,14 +1523,14 @@ static i64 sys_kill(u64 pid, u64 signum) {
  * @return The restored user RAX (or a negative error code).
  */
 static i64 sys_sigreturn(u64 frame_ptr) {
-    return signal_restore(frame_ptr);
+    return SignalRestore(frame_ptr);
 }
 
 /*
  * Initialize the syscall subsystem.
  * The IDT entry for vector 0x80 is set up by idt.c.
  */
-void syscall_init(void) {}
+void SyscallInit(void) {}
 
 /*
  * Re-enable PIT timer and PIC IRQs after the init process has started.
@@ -1498,19 +1538,19 @@ void syscall_init(void) {}
  * all PIC IRQs were masked before the IRETQ transition to ring 3 to
  * prevent timer interrupts during the CR3/IRETQ critical section.
  */
-static void enable_scheduler_once(void) {
+static void EnableSchedulerOnce(void) {
     /* PIT: re-program Channel 0, lobyte/hibyte, rate generator (mode 2) */
-    io_outb(0x43, 0x34);         /* channel 0, lobyte/hibyte, mode 2 */
+    IoOutb(0x43, 0x34);         /* channel 0, lobyte/hibyte, mode 2 */
     u32 divisor = 1193182 / 100; /* 100 Hz */
-    io_outb(0x40, (u8)(divisor & 0xFF));
-    io_outb(0x40, (u8)((divisor >> 8) & 0xFF));
+    IoOutb(0x40, (u8)(divisor & 0xFF));
+    IoOutb(0x40, (u8)((divisor >> 8) & 0xFF));
 
     /* Unmask IRQ0 (timer) and IRQ2 (cascade) on master PIC */
-    u8 mask = io_inb(0x21);
+    u8 mask = IoInb(0x21);
     mask &= ~((1 << 0) | (1 << 2)); /* unmask IRQ0 and IRQ2 */
-    io_outb(0x21, mask);
+    IoOutb(0x21, mask);
 
-    serial_puts("  PIT re-enabled at 100 Hz, IRQs unmasked\n");
+    SerialPuts("  PIT re-enabled at 100 Hz, IRQs unmasked\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1710,7 +1750,7 @@ i64 syscall_dispatch(u64 num, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5) 
     static bool scheduler_started = false;
     if (!scheduler_started) {
         scheduler_started = true;
-        enable_scheduler_once();
+        EnableSchedulerOnce();
     }
 
     /* Bounds check, then table lookup (NULL entry = unimplemented) */

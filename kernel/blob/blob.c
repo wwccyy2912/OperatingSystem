@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * blob.c - Embedded ELF blob registry
  * Copyright (c) 2026 OpSys Project
  *
@@ -11,9 +24,21 @@
  *
  * kernel_main fetches "init" here instead of using extern symbols
  * directly; SYS_BLOB_GET lets user-space (e.g. the shell) fetch any
- * registered image by name to spawn it via SYS_PROCESS_CREATE.
+ * registered image by name to spawn it via SYS_PROCESS_CREATE. *
+ * ------------------------------------------------------------------
+ * Structure (blob):
+ *   linker table (s_blobs[]: name -> address/size) -> BlobGet/BlobFind
+ *   -> process_create loads ELF image from the blob.
+ * How it works:
+ *   Build-time blobs are linked into the kernel; BlobInit() registers
+ *   them; BlobGet() binary-searches by name.
+ * Purpose:
+ *   Ship user services (init/shell/term/...) inside the kernel image.
+ * Caveats:
+ *   Blob names must match the manager's spawn table; blob buffer is
+ *   capped (manager blob_buf).
+ * ------------------------------------------------------------------
  */
-
 #include <kernel/blob.h>
 #include <kernel/string.h>
 #include <kernel/panic.h>
@@ -51,13 +76,13 @@ extern char net_elf_start[], net_elf_end[], net_elf_size[];
 static blob_entry_t s_blobs[BLOB_MAX_ENTRIES];
 static int          s_blob_count = 0;
 
-void blob_init(void) {
+void BlobInit(void) {
     /* Every registration MUST succeed: a missing blob means a service
      * can never be spawned (it would fail subtly at runtime).  Fail
      * the boot loudly instead of limping on. */
 #define BLOB_REG(name, data, sz)                              \
     do {                                                      \
-        if (blob_register(name, data, sz) != OK)              \
+        if (BlobRegister(name, data, sz) != OK)              \
             panic("blob_init: register '%s' failed", name);   \
     } while (0)
 
@@ -97,7 +122,7 @@ void blob_init(void) {
 #undef BLOB_REG
 }
 
-int blob_register(const char *name, const void *data, u64 size) {
+int BlobRegister(const char *name, const void *data, u64 size) {
     size_t len;
 
     if (!name || !data || size == 0)
@@ -118,7 +143,7 @@ int blob_register(const char *name, const void *data, u64 size) {
     return OK;
 }
 
-int blob_get(const char *name, const void **data, u64 *size) {
+int BlobGet(const char *name, const void **data, u64 *size) {
     if (!name || !data || !size)
         return ERR_INVAL;
 

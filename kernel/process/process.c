@@ -1,10 +1,55 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * process.c - Process creation and management
  * Copyright (c) 2026 OpSys Project
  *
  * Maintains a static process table indexed by PID.  Each process
  * owns an address space, a capability table, and one or more threads.
  * PID 0 is the kernel; PID 1 is the init process.
+ *
+ * ------------------------------------------------------------------
+ * Structure (process):
+ *   s_process_table[MAX_THREADS] -- static table indexed by slot
+ *     +-- s_process_used[] bitmap; s_process_list (user processes)
+ *   process_t: pid, state, addr_space, cap_table, main_tid,
+ *              thread_count, exit_code, waiting_tid, heap_base,
+ *              subject_id/app_uuid, sig_dispatcher/sig_pending
+ *   PID 0 = kernel (idle thread), PID 1 = init (s_init_process)
+ *   addr_space: adopted from the caller, which mapped the image from
+ *   an embedded ELF blob (BlobGet / SYS_PROCESS_CREATE, process_desc.c)
+ * How it works:
+ *   process_create() finds a free slot, creates the cap table, spawns
+ *   the main thread via ThreadCreateUser() (priority 10) in the
+ *   caller-loaded address space, back-links t->pid and appends to the
+ *   list.  When the last thread exits, ProcessThreadExited() marks the
+ *   process ZOMBIE and wakes waiting_tid (or orphan-reaps);
+ *   ProcessReap() frees IPC/IRQ/SHM resources, the cap table, the main
+ *   thread and the address space, then recycles the slot -- PIDs are
+ *   never reused, only slots are.
+ * Purpose:
+ *   Central process lifecycle: create, lookup by pid/subject, thread
+ *   accounting, and zombie reaping with full resource teardown.
+ * Caveats:
+ *   - process_get() walks s_process_list: slot index != pid once a
+ *     slot is recycled, and PID 0 never appears in the list.
+ *   - ProcessReap() releases the main thread's slot BEFORE
+ *     VmmDestroyAddrSpace() (FreeThread unmaps the per-thread user
+ *     stack) to avoid double-free / use-after-free.
+ *   - The caller transfers address-space ownership; process_create()
+ *     rolls everything back if setup fails.
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/process.h>
@@ -50,7 +95,7 @@ static u32 s_process_count;
 /*  Helper: copy a C string without <string.h>                         */
 /* ------------------------------------------------------------------ */
 
-static void copy_string(char *dst, const char *src, size_t max) {
+static void CopyString(char *dst, const char *src, size_t max) {
     size_t i;
     for (i = 0; i < max - 1 && src[i]; i++)
         dst[i] = src[i];
@@ -61,7 +106,7 @@ static void copy_string(char *dst, const char *src, size_t max) {
 /*  PUBLIC API                                                         */
 /* ================================================================== */
 
-void process_init(void) {
+void ProcessInit(void) {
     /* Clear the entire table */
     for (int i = 0; i < MAX_THREADS; i++) {
         s_process_used[i]               = false;
@@ -97,7 +142,7 @@ void process_init(void) {
     kern->thread_count = 1;
     kern->subject_id   = 0; /* System (reserved, kernel) */
     kern->next         = NULL;
-    copy_string(kern->name, "kernel", sizeof(kern->name));
+    CopyString(kern->name, "kernel", sizeof(kern->name));
     /* PID 0 does NOT appear in the user process list */
     s_process_count = 1;
 
@@ -115,12 +160,12 @@ void process_init(void) {
     /* Unit 1: kernel-issued App Subject (uuid), drawn from the PRNG
      * at app instantiation.  The kernel/system process (PID 0,
      * subject 0) keeps (0,0). */
-    init->app_uuid_hi = rng_u64();
-    init->app_uuid_lo = rng_u64();
+    init->app_uuid_hi = RngU64();
+    init->app_uuid_lo = RngU64();
     /* ASLR: randomize init's heap base; fold in boot timing entropy. */
-    rng_mix(sched_get_ticks() ^ 1ULL);
-    init->heap_base = aslr_heap_base();
-    copy_string(init->name, "init", sizeof(init->name));
+    RngMix(SchedGetTicks() ^ 1ULL);
+    init->heap_base = AslrHeapBase();
+    CopyString(init->name, "init", sizeof(init->name));
 
     /* Add to user process list */
     init->next     = s_process_list;
@@ -157,33 +202,33 @@ process_t *process_create(const char *name, u64 entry, addr_space_t *as) {
     proc->subject_id = s_next_subject++;
     /* Unit 1: kernel-issued App Subject (uuid), drawn from the PRNG
      * at app instantiation.  Unforgeable: never user-supplied. */
-    proc->app_uuid_hi = rng_u64();
-    proc->app_uuid_lo = rng_u64();
+    proc->app_uuid_hi = RngU64();
+    proc->app_uuid_lo = RngU64();
     /* Signals: fresh process starts with no dispatcher, nothing pending. */
     proc->sig_dispatcher = 0;
     proc->sig_pending    = 0;
     /* ASLR: randomize the child's heap base; mix in creation timing +
      * PID so sibling processes get decorrelated layouts. */
-    rng_mix(sched_get_ticks() ^ ((u64)s_next_pid << 32));
-    proc->heap_base = aslr_heap_base();
+    RngMix(SchedGetTicks() ^ ((u64)s_next_pid << 32));
+    proc->heap_base = AslrHeapBase();
     proc->next      = NULL;
-    copy_string(proc->name, name, sizeof(proc->name));
+    CopyString(proc->name, name, sizeof(proc->name));
 
     if (!proc->cap_table) {
         /* Roll back: release the address space and free the SLOT
          * (index, not pid — they diverge once slots are recycled). */
-        vmm_destroy_addr_space(proc->addr_space);
+        VmmDestroyAddrSpace(proc->addr_space);
         s_process_used[slot] = false;
         return NULL;
     }
 
     /* Create the main thread in the process's address space */
-    tid_t tid = thread_create_user(entry, 0, proc->addr_space, 10);
+    tid_t tid = ThreadCreateUser(entry, 0, proc->addr_space, 10);
     if (tid < 0) {
         /* Roll back */
-        cap_table_destroy(proc->cap_table);
+        CapTableDestroy(proc->cap_table);
         if (proc->addr_space)
-            vmm_destroy_addr_space(proc->addr_space);
+            VmmDestroyAddrSpace(proc->addr_space);
         s_process_used[slot] = false;
         return NULL;
     }
@@ -192,7 +237,7 @@ process_t *process_create(const char *name, u64 entry, addr_space_t *as) {
     proc->thread_count = 1;
     /* Main thread is enqueued and runnable: leave CREATED for the state
      * machine.  The process is now READY to run (ZOMBIE is reached via
-     * process_thread_exited() when the last thread exits). */
+     * ProcessThreadExited() when the last thread exits). */
     proc->state = PROC_STATE_READY;
 
     /* Back-link the thread to this process */
@@ -211,7 +256,7 @@ process_t *process_create(const char *name, u64 entry, addr_space_t *as) {
     }
     s_process_count++;
 
-    serial_printf("proc: CREATE pid=%d name=%s slot=%d count=%d\n",
+    SerialPrintf("proc: CREATE pid=%d name=%s slot=%d count=%d\n",
                   proc->pid,
                   proc->name,
                   slot,
@@ -224,7 +269,7 @@ process_t *process_create(const char *name, u64 entry, addr_space_t *as) {
 
 process_t *process_get(pid_t pid) {
     /* PID 0 (the kernel) is not a user process and never appears in
-     * the list.  Table slots are recycled by process_reap() while PIDs
+     * the list.  Table slots are recycled by ProcessReap() while PIDs
      * themselves are never reused, so the slot index and the pid
      * diverge once a slot has been recycled — lookup must walk the
      * list instead of indexing the table by pid. */
@@ -270,12 +315,12 @@ process_t *process_get_init(void) {
  *
  * The caller must hold the reap ownership: either the process died as
  * an orphan (nobody is waiting on it), or the caller claimed it via
- * sys_process_wait() (waiting_tid matched and was cleared).  All
+ * SysProcessWait() (waiting_tid matched and was cleared).  All
  * threads are gone by construction (thread_count hit zero), so no code
  * runs in the freed address space.  PIDs are never reused — only table
  * slots are recycled.
  */
-void process_reap(process_t *proc) {
+void ProcessReap(process_t *proc) {
     /* Detach from the process list. */
     process_t **pp = &s_process_list;
     while (*pp && *pp != proc)
@@ -289,7 +334,7 @@ void process_reap(process_t *proc) {
     if (s_init_process == proc)
         s_init_process = NULL;
 
-    serial_printf(
+    SerialPrintf(
         "proc: REAP pid=%d detached=%d count->%d\n", proc->pid, detached, s_process_count);
 
     /* Tear down the process's IPC + IRQ resources FIRST: every client
@@ -299,35 +344,35 @@ void process_reap(process_t *proc) {
      * re-register them.  IRQ lines it bound are released immediately
      * (irq_handle's lazy self-heal only fires on the next IRQ).  Any
      * shared-page pools it owned are returned to the PMM. */
-    ipc_cleanup_process(proc->pid);
-    irq_cleanup_process(proc->pid);
-    shm_cleanup_process(proc->subject_id);
+    IpcCleanupProcess(proc->pid);
+    IrqCleanupProcess(proc->pid);
+    ShmCleanupProcess(proc->subject_id);
 
     /* Free the process's resources. */
     if (proc->cap_table)
-        cap_table_destroy(proc->cap_table);
+        CapTableDestroy(proc->cap_table);
 
     /*
      * Return the main thread's slot to the free list FIRST, while the
-     * address space is still alive: free_thread() unmaps the per-thread
+     * address space is still alive: FreeThread() unmaps the per-thread
      * user stack (a page owned by this address space) and releases its
      * physical page.  Reversing the order would double-free that page
-     * (vmm_destroy_addr_space() below frees every user page) and would
-     * use-after-free the page tables when free_thread() calls vmm_unmap()
+     * (VmmDestroyAddrSpace() below frees every user page) and would
+     * use-after-free the page tables when FreeThread() calls VmmUnmap()
      * on an already-destroyed address space.
      *
      * The main thread exited by construction (thread_count hit zero), so
      * its kernel stack is dead — EXCEPT in the orphan-reap path, where the
-     * reaper IS the exiting main thread itself (process_thread_exited()
-     * runs on its own stack).  thread_release() skips the current thread,
+     * reaper IS the exiting main thread itself (ProcessThreadExited()
+     * runs on its own stack).  ThreadRelease() skips the current thread,
      * so that path cannot free the stack we are executing on.  (The slot
      * then leaks, but that only affects the rare nobody-waits case.)
      */
     if (proc->main_tid >= 0)
-        thread_release(thread_get(proc->main_tid));
+        ThreadRelease(thread_get(proc->main_tid));
 
     if (proc->addr_space)
-        vmm_destroy_addr_space(proc->addr_space);
+        VmmDestroyAddrSpace(proc->addr_space);
 
     /* Release the table slot and clear the PCB so a stale pointer can
      * never observe half-recycled state. */
@@ -346,14 +391,14 @@ void process_reap(process_t *proc) {
 }
 
 /*
- * Called from thread_exit() when a thread of this process terminates.
+ * Called from ThreadExit() when a thread of this process terminates.
  * Decrements the process's thread count; when the LAST thread exits,
  * the process becomes ZOMBIE, records the exit code and either hands
  * the reap to a thread blocked in process_wait() (which wakes with
  * waiting_tid ownership) or — if nobody is waiting — reaps the orphan
  * zombie immediately so it cannot linger in the table forever.
  */
-void process_thread_exited(process_t *proc, int code) {
+void ProcessThreadExited(process_t *proc, int code) {
     if (!proc)
         return;
 
@@ -367,7 +412,7 @@ void process_thread_exited(process_t *proc, int code) {
     if (proc->thread_count > 0)
         proc->thread_count--;
     if (proc->thread_count != 0) {
-        serial_printf(
+        SerialPrintf(
             "proc: THREAD_EXITED pid=%d tc->%d (not last)\n", proc->pid, proc->thread_count);
         return;
     }
@@ -375,19 +420,19 @@ void process_thread_exited(process_t *proc, int code) {
     /* Last thread of the process has exited: mark it ZOMBIE. */
     proc->state     = PROC_STATE_ZOMBIE;
     proc->exit_code = code;
-    serial_printf(
+    SerialPrintf(
         "proc: LAST_THREAD pid=%d code=%d waiting_tid=%d\n", proc->pid, code, proc->waiting_tid);
 
     /* Wake a process_wait() caller, if any.  waiting_tid is left in
-     * place: the woken caller checks it in sys_process_wait() and is
+     * place: the woken caller checks it in SysProcessWait() and is
      * the one that reaps the process (collecting the exit code before
      * the resources are freed). */
     if (proc->waiting_tid >= 0) {
         thread_t *waiter = thread_get(proc->waiting_tid);
         if (waiter && waiter->state == THREAD_STATE_BLOCKED) {
             waiter->state = THREAD_STATE_READY;
-            sched_enqueue(waiter);
-            serial_printf(
+            SchedEnqueue(waiter);
+            SerialPrintf(
                 "proc: WAKE_WAITER pid=%d tid=%d (waiter reaps)\n", proc->pid, waiter->tid);
             return; /* the woken caller owns the reap */
         }
@@ -396,13 +441,13 @@ void process_thread_exited(process_t *proc, int code) {
 
     /* Orphan zombie: no live waiter will ever collect this process.
      * Reap it now instead of leaving it in the table permanently. */
-    serial_printf("proc: ORPHAN pid=%d -> reap\n", proc->pid);
-    process_reap(proc);
+    SerialPrintf("proc: ORPHAN pid=%d -> reap\n", proc->pid);
+    ProcessReap(proc);
 }
 
 /* ------------------------------------------------------------------ */
 
-u32 process_get_count(void) {
+u32 ProcessGetCount(void) {
     return s_process_count;
 }
 
@@ -415,7 +460,7 @@ u32 process_get_count(void) {
  * consecutive out entries in list (creation) order.  Writes at most
  * max_entries; returns the number written.
  */
-u32 process_list_fill(proc_info_t *out, u32 max_entries) {
+u32 ProcessListFill(proc_info_t *out, u32 max_entries) {
     u32        n = 0;
     process_t *proc;
 
@@ -426,7 +471,7 @@ u32 process_list_fill(proc_info_t *out, u32 max_entries) {
         info->thread_count = proc->thread_count;
         info->exit_code    = (i32)proc->exit_code;
         info->main_tid     = (u32)proc->main_tid;
-        copy_string(info->name, proc->name, sizeof(info->name));
+        CopyString(info->name, proc->name, sizeof(info->name));
         n++;
     }
 

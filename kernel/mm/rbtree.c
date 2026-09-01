@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * rbtree.c - Red-black tree implementation
  * Copyright (c) 2026 OpSys Project
  *
@@ -7,6 +20,31 @@
  * replacement node is NULL.  The public API uses NULL for empty trees.
  *
  * All operations: O(log n).
+ *
+ * ------------------------------------------------------------------
+ * Structure (rbtree):
+ *   Intrusive rb_node_t {left, right, parent, color, key, in_tree}
+ *   embedded in the owner (e.g. thread_t); rb_root_t {node, count}.
+ *   Invariants: root black, no red-red path, equal black-height, so
+ *   height <= 2*log2(n+1). Static NIL sentinel for internal use only.
+ *
+ * How it works:
+ *   RbInsert(): plain BST insert (duplicates go right), then
+ *   RbInsertFixup() with recolor / RbRotateLeft / RbRotateRight
+ *   (3 cases). RbRemove(): RbTransplant() + tree_minimum() successor,
+ *   then RbDeleteFixup() resolving the double-black (4 cases); NIL
+ *   lets a NULL replacement be fixed up. rb_min/rb_max/rb_next give
+ *   ordered iteration.
+ *
+ * Purpose:
+ *   Generic ordered u64-key tree; currently the CFS scheduler's ready
+ *   queue (sched.c s_ready_tree, key = vruntime, lower = higher prio).
+ *
+ * Caveats:
+ *   RbInsert() has no in_tree check — callers must not double-insert
+ *   (see sched.c). Public API uses NULL, internals use NIL; keep the
+ *   two views consistent.
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/rbtree.h>
@@ -29,7 +67,7 @@ static rb_node_t _nil = {
 /*  Left rotation                                                     */
 /* ------------------------------------------------------------------ */
 
-static void rb_rotate_left(rb_root_t *root, rb_node_t *x) {
+static void RbRotateLeft(rb_root_t *root, rb_node_t *x) {
     rb_node_t *y = x->right;
 
     x->right = y->left;
@@ -52,7 +90,7 @@ static void rb_rotate_left(rb_root_t *root, rb_node_t *x) {
 /*  Right rotation                                                    */
 /* ------------------------------------------------------------------ */
 
-static void rb_rotate_right(rb_root_t *root, rb_node_t *x) {
+static void RbRotateRight(rb_root_t *root, rb_node_t *x) {
     rb_node_t *y = x->left;
 
     x->left = y->right;
@@ -75,7 +113,7 @@ static void rb_rotate_right(rb_root_t *root, rb_node_t *x) {
 /*  Insert fixup                                                      */
 /* ------------------------------------------------------------------ */
 
-static void rb_insert_fixup(rb_root_t *root, rb_node_t *z) {
+static void RbInsertFixup(rb_root_t *root, rb_node_t *z) {
     while (z->parent && z->parent->color == RB_RED) {
         rb_node_t *gp = z->parent->parent;
 
@@ -92,12 +130,12 @@ static void rb_insert_fixup(rb_root_t *root, rb_node_t *z) {
                 if (z == z->parent->right) {
                     /* Case 2: zig-zag — rotate to make zig-zig */
                     z = z->parent;
-                    rb_rotate_left(root, z);
+                    RbRotateLeft(root, z);
                 }
                 /* Case 3: zig-zig — rotate grandparent */
                 z->parent->color = RB_BLACK;
                 gp->color        = RB_RED;
-                rb_rotate_right(root, gp);
+                RbRotateRight(root, gp);
             }
         } else {
             /* Symmetric: parent is right child of grandparent */
@@ -111,11 +149,11 @@ static void rb_insert_fixup(rb_root_t *root, rb_node_t *z) {
             } else {
                 if (z == z->parent->left) {
                     z = z->parent;
-                    rb_rotate_right(root, z);
+                    RbRotateRight(root, z);
                 }
                 z->parent->color = RB_BLACK;
                 gp->color        = RB_RED;
-                rb_rotate_left(root, gp);
+                RbRotateLeft(root, gp);
             }
         }
     }
@@ -127,7 +165,7 @@ static void rb_insert_fixup(rb_root_t *root, rb_node_t *z) {
 /*  Insert                                                            */
 /* ------------------------------------------------------------------ */
 
-int rb_insert(rb_root_t *root, rb_node_t *node) {
+int RbInsert(rb_root_t *root, rb_node_t *node) {
     if (!root || !node)
         return -1;
 
@@ -158,7 +196,7 @@ int rb_insert(rb_root_t *root, rb_node_t *node) {
         y->right = node;
 
     root->count++;
-    rb_insert_fixup(root, node);
+    RbInsertFixup(root, node);
     return 0;
 }
 
@@ -166,7 +204,7 @@ int rb_insert(rb_root_t *root, rb_node_t *node) {
 /*  Transplant (replace subtree rooted at u with subtree rooted at v)  */
 /* ------------------------------------------------------------------ */
 
-static void rb_transplant(rb_root_t *root, rb_node_t *u, rb_node_t *v) {
+static void RbTransplant(rb_root_t *root, rb_node_t *u, rb_node_t *v) {
     if (u->parent == NULL)
         root->node = v;
     else if (u == u->parent->left)
@@ -196,7 +234,7 @@ static rb_node_t *tree_minimum(rb_node_t *x) {
  * we track its parent and side separately (since NIL has no parent
  * pointer).
  */
-static void rb_delete_fixup(rb_root_t *root, rb_node_t *x, rb_node_t *x_parent, bool x_is_left) {
+static void RbDeleteFixup(rb_root_t *root, rb_node_t *x, rb_node_t *x_parent, bool x_is_left) {
     while (x != root->node && x->color == RB_BLACK) {
         if (x_is_left) {
             rb_node_t *w = x_parent->right; /* sibling */
@@ -205,7 +243,7 @@ static void rb_delete_fixup(rb_root_t *root, rb_node_t *x, rb_node_t *x_parent, 
                 /* Case 1: sibling is red */
                 w->color        = RB_BLACK;
                 x_parent->color = RB_RED;
-                rb_rotate_left(root, x_parent);
+                RbRotateLeft(root, x_parent);
                 w = x_parent->right;
             }
 
@@ -222,14 +260,14 @@ static void rb_delete_fixup(rb_root_t *root, rb_node_t *x, rb_node_t *x_parent, 
                     /* Case 3: right nephew black, left red */
                     w->left->color = RB_BLACK;
                     w->color       = RB_RED;
-                    rb_rotate_right(root, w);
+                    RbRotateRight(root, w);
                     w = x_parent->right;
                 }
                 /* Case 4: right nephew red */
                 w->color        = x_parent->color;
                 x_parent->color = RB_BLACK;
                 w->right->color = RB_BLACK;
-                rb_rotate_left(root, x_parent);
+                RbRotateLeft(root, x_parent);
                 x = root->node;
             }
         } else {
@@ -239,7 +277,7 @@ static void rb_delete_fixup(rb_root_t *root, rb_node_t *x, rb_node_t *x_parent, 
             if (w->color == RB_RED) {
                 w->color        = RB_BLACK;
                 x_parent->color = RB_RED;
-                rb_rotate_right(root, x_parent);
+                RbRotateRight(root, x_parent);
                 w = x_parent->left;
             }
 
@@ -254,13 +292,13 @@ static void rb_delete_fixup(rb_root_t *root, rb_node_t *x, rb_node_t *x_parent, 
                 if (w->left->color == RB_BLACK) {
                     w->right->color = RB_BLACK;
                     w->color        = RB_RED;
-                    rb_rotate_left(root, w);
+                    RbRotateLeft(root, w);
                     w = x_parent->left;
                 }
                 w->color        = x_parent->color;
                 x_parent->color = RB_BLACK;
                 w->left->color  = RB_BLACK;
-                rb_rotate_right(root, x_parent);
+                RbRotateRight(root, x_parent);
                 x = root->node;
             }
         }
@@ -273,7 +311,7 @@ static void rb_delete_fixup(rb_root_t *root, rb_node_t *x, rb_node_t *x_parent, 
 /*  Remove                                                            */
 /* ------------------------------------------------------------------ */
 
-void rb_remove(rb_root_t *root, rb_node_t *z) {
+void RbRemove(rb_root_t *root, rb_node_t *z) {
     if (!root || !z || z == NIL)
         return;
     if (!z->in_tree)
@@ -289,12 +327,12 @@ void rb_remove(rb_root_t *root, rb_node_t *z) {
         x         = z->right;
         x_parent  = z->parent;
         x_is_left = (x_parent != NULL && z == x_parent->left);
-        rb_transplant(root, z, z->right);
+        RbTransplant(root, z, z->right);
     } else if (z->right == NIL) {
         x         = z->left;
         x_parent  = z->parent;
         x_is_left = (x_parent != NULL && z == x_parent->left);
-        rb_transplant(root, z, z->left);
+        RbTransplant(root, z, z->left);
     } else {
         y                = tree_minimum(z->right);
         y_original_color = y->color;
@@ -308,11 +346,11 @@ void rb_remove(rb_root_t *root, rb_node_t *z) {
         } else {
             x_parent  = y->parent;
             x_is_left = (x == x_parent->left);
-            rb_transplant(root, y, y->right);
+            RbTransplant(root, y, y->right);
             y->right         = z->right;
             y->right->parent = y;
         }
-        rb_transplant(root, z, y);
+        RbTransplant(root, z, y);
         y->left         = z->left;
         y->left->parent = y;
         y->color        = z->color;
@@ -322,7 +360,7 @@ void rb_remove(rb_root_t *root, rb_node_t *z) {
     z->in_tree = false;
 
     if (y_original_color == RB_BLACK)
-        rb_delete_fixup(root, x, x_parent, x_is_left);
+        RbDeleteFixup(root, x, x_parent, x_is_left);
 }
 
 /* ------------------------------------------------------------------ */

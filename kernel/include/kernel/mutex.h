@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * mutex.h - Kernel mutexes (blocking, FIFO, non-recursive)
  * Copyright (c) 2026 OpSys Project
  *
@@ -37,34 +50,34 @@ typedef struct mutex {
 /**
  * Initialize the mutex subsystem.
  */
-void mutex_init(void);
+void MutexInit(void);
 
 /**
  * Create a new mutex.
  * @return Handle (>= 1), or 0 when the table is full (0 is an invalid
  *         handle -- mutex_lookup rejects it -- so it is a safe sentinel).
  */
-u32 mutex_create(void);
+u32 MutexCreate(void);
 
 /**
  * Acquire a mutex, blocking until it is free.
  * @param handle  Mutex handle.
  * @return OK, ERR_NOENT (bad/stale handle), ERR_BUSY (already owner).
  */
-error_t mutex_lock(u32 handle);
+error_t MutexLock(u32 handle);
 
 /**
  * Release a mutex, handing ownership to the next FIFO waiter.
  * @param handle  Mutex handle.
  * @return OK, ERR_NOENT (bad handle), ERR_DENIED (not the owner).
  */
-error_t mutex_unlock(u32 handle);
+error_t MutexUnlock(u32 handle);
 
 /**
  * Destroy a mutex: wake every waiter with ERR_NOENT and free the slot.
  * @param handle  Mutex handle.
  */
-void mutex_destroy(u32 handle);
+void MutexDestroy(u32 handle);
 
 /**
  * Release every mutex held by thread t (hand off to next waiter, or
@@ -72,16 +85,16 @@ void mutex_destroy(u32 handle);
  * strands blocked waiters.
  * @param t  Thread that is exiting.
  */
-void mutex_release_all(thread_t *t);
+void MutexReleaseAll(thread_t *t);
 
 /**
  * Remove t from any mutex FIFO wait queue it is blocked on (called
  * from the signal kill path when force-terminating a blocked thread).
  * A stale queue entry would later hand the mutex to an exited thread.
- * The woken mutex_lock() sees owner != cur and returns ERR_NOENT.
+ * The woken MutexLock() sees owner != cur and returns ERR_NOENT.
  * Caller must NOT hold s_mutex_lock.
  * @param t  Thread possibly blocked on a mutex (no-op otherwise).
  */
-void mutex_abort_wait(thread_t *t);
+void MutexAbortWait(thread_t *t);
 
 #endif /* KERNEL_MUTEX_H */

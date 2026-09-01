@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * blob.h - Embedded ELF blob registry
  * Copyright (c) 2026 OpSys Project
  *
@@ -31,7 +44,7 @@ typedef struct {
  * fetched.  Looks up the objcopy-renamed symbols emitted by the build
  * (init_elf_*, hello_elf_*) and inserts them into the registry.
  */
-void blob_init(void);
+void BlobInit(void);
 
 /**
  * blob_register - Add a named blob to the registry.
@@ -41,7 +54,7 @@ void blob_init(void);
  *
  * Returns OK, ERR_NOMEM (table full) or ERR_INVAL (bad arguments).
  */
-int blob_register(const char *name, const void *data, u64 size);
+int BlobRegister(const char *name, const void *data, u64 size);
 
 /**
  * blob_get - Look up a blob by name.
@@ -51,6 +64,6 @@ int blob_register(const char *name, const void *data, u64 size);
  *
  * Returns OK and fills *data and *size on success, or ERR_NOENT.
  */
-int blob_get(const char *name, const void **data, u64 *size);
+int BlobGet(const char *name, const void **data, u64 *size);
 
 #endif /* KERNEL_BLOB_H */

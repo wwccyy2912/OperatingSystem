@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * pci.c - PCI config-space enumeration syscalls (SYS_PCI_GET_COUNT/GET_DEVICE)
  * Copyright (c) 2026 OpSys Project
  *
@@ -28,9 +41,21 @@
  *
  * QEMU's i440FX exposes at least the host bridge (device 0, function 0)
  * and a VGA controller (device 1), so a count >= 2 is expected; an
- * empty bus must still return 0 cleanly.
+ * empty bus must still return 0 cleanly. *
+ * ------------------------------------------------------------------
+ * Structure (pci):
+ *   PCI config access (0xCF8/0xCFC) -> PciScan() walks bus 0-5 ->
+ *   device table -> SYS_PCI_GET_COUNT/GET_DEVICE/CFG_READ/WRITE.
+ * How it works:
+ *   Scans all 256 slots per bus, probes vendor != 0xFFFF, records
+ *   BAR/IRQ/class; config reads go through the two I/O ports.
+ * Purpose:
+ *   Give user services (net, blk driver) PCI enumeration + config.
+ * Caveats:
+ *   Config space access is gated on CAP_TYPE_PCI_DEV; the scan is
+ *   one-shot at boot (hotplug unsupported).
+ * ------------------------------------------------------------------
  */
-
 #include <kernel/cap.h>
 #include <kernel/io.h>
 #include <kernel/pci.h>
@@ -74,13 +99,13 @@ static bool              s_enumerated   = false;
  * in the calling process's address space — otherwise the kernel's
  * copy-out would #PF inside a syscall.
  */
-static bool pci_validate_user_ptr(u64 ptr, u64 size) {
+static bool PciValidateUserPtr(u64 ptr, u64 size) {
     process_t *proc = process_current();
     if (!proc || !proc->addr_space)
         return false;
     if (ptr == 0 || ptr >= USER_PTR_MAX || size > USER_PTR_MAX - ptr)
         return false;
-    return vmm_validate_user_range(proc->addr_space, ptr, size, true);
+    return VmmValidateUserRange(proc->addr_space, ptr, size, true);
 }
 
 /* Convenience: cast a validated user pointer */
@@ -92,19 +117,19 @@ static bool pci_validate_user_ptr(u64 ptr, u64 size) {
  * to 0xFC).  Writes the dword address to CONFIG_ADDRESS, then reads
  * the selected dword from CONFIG_DATA.
  */
-static u32 pci_config_read(u32 bus, u32 dev, u32 func, u32 reg) {
+static u32 PciConfigRead(u32 bus, u32 dev, u32 func, u32 reg) {
     u32 addr = PCI_CONFIG_ENABLE | ((bus & 0xFF) << 16) | ((dev & 0x1F) << 11) |
                ((func & 0x07) << 8) | (reg & 0xFC);
-    io_outl(PCI_CONFIG_ADDR, addr);
-    return io_inl(PCI_CONFIG_DATA);
+    IoOutl(PCI_CONFIG_ADDR, addr);
+    return IoInl(PCI_CONFIG_DATA);
 }
 
 /* Fill one pci_device_info_t from the config-space register block. */
-static void pci_read_device(u32 bus, u32 dev, u32 func, pci_device_info_t *out) {
-    u32 id  = pci_config_read(bus, dev, func, 0x00); /* vendor | device */
-    u32 rev = pci_config_read(bus, dev, func, 0x08); /* revision | prog_if
+static void PciReadDevice(u32 bus, u32 dev, u32 func, pci_device_info_t *out) {
+    u32 id  = PciConfigRead(bus, dev, func, 0x00); /* vendor | device */
+    u32 rev = PciConfigRead(bus, dev, func, 0x08); /* revision | prog_if
                                                       * | subclass | base */
-    u32 cl = pci_config_read(bus, dev, func, 0x3C);  /* interrupt line  */
+    u32 cl = PciConfigRead(bus, dev, func, 0x3C);  /* interrupt line  */
     u32 i;
 
     out->bus         = bus;
@@ -119,7 +144,7 @@ static void pci_read_device(u32 bus, u32 dev, u32 func, pci_device_info_t *out) 
 
     /* Base address registers 0..5; 0 = absent (IO/legacy or unimplemented) */
     for (i = 0; i < PCI_MAX_BARS; i++)
-        out->bar[i] = pci_config_read(bus, dev, func, 0x10 + i * 4);
+        out->bar[i] = PciConfigRead(bus, dev, func, 0x10 + i * 4);
 
     out->irq_line = (u8)(cl & 0xFF);
 }
@@ -129,7 +154,7 @@ static void pci_read_device(u32 bus, u32 dev, u32 func, pci_device_info_t *out) 
  * SYS_PCI_GET_COUNT call; every later call returns the same snapshot.
  * count == 0 (no devices found) is a valid, clean result.
  */
-static void pci_scan(void) {
+static void PciScan(void) {
     u32 bus, dev, func;
 
     s_device_count = 0;
@@ -140,20 +165,20 @@ static void pci_scan(void) {
             /* Function 0 first: its vendor ID tells us whether the slot
              * is occupied at all.  Only probe functions 1..7 when
              * function 0 exists (multifunction device heuristic). */
-            u32 id = pci_config_read(bus, dev, 0, 0x00);
+            u32 id = PciConfigRead(bus, dev, 0, 0x00);
             if ((u16)(id & 0xFFFF) == PCI_INVALID_VENDOR)
                 continue;
 
             for (func = 0; func < PCI_MAX_FUNCTIONS; func++) {
                 if (func > 0) {
-                    u32 fid = pci_config_read(bus, dev, func, 0x00);
+                    u32 fid = PciConfigRead(bus, dev, func, 0x00);
                     if ((u16)(fid & 0xFFFF) == PCI_INVALID_VENDOR)
                         continue;
                 }
                 if (s_device_count >= PCI_CONFIG_MAX_DEVS)
                     return; /* capped: keep the first PCI_CONFIG_MAX_DEVS */
 
-                pci_read_device(bus, dev, func, &s_devices[s_device_count]);
+                PciReadDevice(bus, dev, func, &s_devices[s_device_count]);
                 s_device_count++;
             }
         }
@@ -177,7 +202,7 @@ i64 sc_sys_pci_get_count(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     (void)a5;
 
     if (!s_enumerated)
-        pci_scan();
+        PciScan();
 
     return (i64)s_device_count;
 }
@@ -194,13 +219,13 @@ i64 sc_sys_pci_get_device(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     (void)a5;
 
     if (!s_enumerated)
-        pci_scan();
+        PciScan();
 
     u32 index = (u32)a1;
     if (index >= s_device_count)
         return (i64)ERR_INVAL;
 
-    if (!pci_validate_user_ptr(a2, sizeof(pci_device_info_t)))
+    if (!PciValidateUserPtr(a2, sizeof(pci_device_info_t)))
         return (i64)ERR_FAULT;
 
     memcpy(USER_PTR(a2), &s_devices[index], sizeof(pci_device_info_t));
@@ -212,7 +237,7 @@ i64 sc_sys_pci_get_device(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
  * naming PCI table index `obj_id` with both RIGHT_READ and RIGHT_WRITE
  * (mirror of the io-port gate in syscall.c / virtio_blk.c).
  */
-static bool proc_has_pci_dev_cap(u64 obj_id) {
+static bool ProcHasPciDevCap(u64 obj_id) {
     process_t *proc = process_current();
     if (!proc || !proc->cap_table)
         return false;
@@ -221,7 +246,7 @@ static bool proc_has_pci_dev_cap(u64 obj_id) {
         cap_entry_t *e = &proc->cap_table->entries[i];
         if (e->type == CAP_TYPE_NONE)
             continue;
-        if (e->expiry_ticks != 0 && e->expiry_ticks <= sched_get_ticks())
+        if (e->expiry_ticks != 0 && e->expiry_ticks <= SchedGetTicks())
             continue;
         if (e->type == CAP_TYPE_PCI_DEV && e->obj_id == obj_id &&
             (e->rights & (RIGHT_READ | RIGHT_WRITE)) == (RIGHT_READ | RIGHT_WRITE))
@@ -238,11 +263,11 @@ static bool proc_has_pci_dev_cap(u64 obj_id) {
  * bus mastering on arbitrary devices (the permission model routes
  * sensitive syscalls through atom gates; see docs/permission_model.md).
  */
-static bool proc_has_service_manage(void) {
+static bool ProcHasServiceManage(void) {
     process_t *proc = process_current();
     if (!proc || !proc->cap_table)
         return false;
-    return cap_lookup_by_atom(proc->cap_table, proc->subject_id,
+    return CapLookupByAtom(proc->cap_table, proc->subject_id,
                               ATOM_SERVICE_MANAGE, 0) != CAP_NULL;
 }
 
@@ -261,9 +286,9 @@ i64 sc_sys_pci_cfg_read(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     (void)a4;
     (void)a5;
 
-    if (!proc_has_pci_dev_cap(a1))
+    if (!ProcHasPciDevCap(a1))
         return (i64)ERR_NOCAP;
-    if (!proc_has_service_manage())
+    if (!ProcHasServiceManage())
         return (i64)ERR_NOCAP;
     if (a1 >= s_device_count)
         return (i64)ERR_INVAL;
@@ -271,7 +296,7 @@ i64 sc_sys_pci_cfg_read(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
         return (i64)ERR_INVAL;
 
     pci_device_info_t *d = &s_devices[a1];
-    return (i64)pci_config_read(d->bus, d->dev, d->func, (u32)a2);
+    return (i64)PciConfigRead(d->bus, d->dev, d->func, (u32)a2);
 }
 
 /*
@@ -283,9 +308,9 @@ i64 sc_sys_pci_cfg_write(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     (void)a4;
     (void)a5;
 
-    if (!proc_has_pci_dev_cap(a1))
+    if (!ProcHasPciDevCap(a1))
         return (i64)ERR_NOCAP;
-    if (!proc_has_service_manage())
+    if (!ProcHasServiceManage())
         return (i64)ERR_NOCAP;
     if (a1 >= s_device_count)
         return (i64)ERR_INVAL;
@@ -296,8 +321,8 @@ i64 sc_sys_pci_cfg_write(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     u32 addr = PCI_CONFIG_ENABLE | ((d->bus & 0xFF) << 16) |
                ((d->dev & 0x1F) << 11) | ((d->func & 0x07) << 8) |
                ((u32)a2 & 0xFC);
-    io_outl(PCI_CONFIG_ADDR, addr);
-    io_outl(PCI_CONFIG_DATA, (u32)a3);
+    IoOutl(PCI_CONFIG_ADDR, addr);
+    IoOutl(PCI_CONFIG_DATA, (u32)a3);
     return 0;
 }
 
@@ -306,7 +331,7 @@ i64 sc_sys_pci_cfg_write(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
  *
  * A kernel driver that wants to find a specific PCI device (e.g. a
  * virtio-blk adapter) can query the cached enumeration snapshot with
- * pci_find()/pci_device_count() without touching config-space ports
+ * PciFind()/PciDeviceCount() without touching config-space ports
  * itself.  Like the syscall handlers, both trigger the lazy bus-0 scan
  * on first use and then serve the frozen snapshot.
  * ==================================================================== */
@@ -316,9 +341,9 @@ i64 sc_sys_pci_cfg_write(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
  * snapshot, scanning the bus lazily first if needed.  0 is a valid,
  * clean result (no PCI devices found).
  */
-int pci_device_count(void) {
+int PciDeviceCount(void) {
     if (!s_enumerated)
-        pci_scan();
+        PciScan();
 
     return (int)s_device_count;
 }
@@ -328,11 +353,11 @@ int pci_device_count(void) {
  * device_id both match, triggering the lazy scan if not yet done.
  * Returns -1 when no cached device matches.
  */
-int pci_find(u16 vendor_id, u16 device_id) {
+int PciFind(u16 vendor_id, u16 device_id) {
     u32 i;
 
     if (!s_enumerated)
-        pci_scan();
+        PciScan();
 
     for (i = 0; i < s_device_count; i++) {
         if (s_devices[i].vendor_id == vendor_id && s_devices[i].device_id == device_id)

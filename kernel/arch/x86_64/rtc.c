@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * rtc.c - Real-time clock (CMOS RTC) wall-clock time
  * Copyright (c) 2026 OpSys Project
  *
@@ -21,9 +34,21 @@
  * Time-of-day registers update roughly once per second.  Reading
  * while an update is in progress (UIP = status A bit 7) can yield
  * torn values, so we wait for UIP to clear, then read all
- * registers twice and re-read while the value changes.
+ * registers twice and re-read while the value changes. *
+ * ------------------------------------------------------------------
+ * Structure (rtc):
+ *   CMOS ports 0x70/0x71 -> BCD registers (sec/min/hour/day/...) ->
+ *   RtcGetTime()/RtcSetTime() in 24h format.
+ * How it works:
+ *   Selects a register via 0x70 then reads 0x71; NMI disabled while
+ *   selecting; BCD decoded to binary.
+ * Purpose:
+ *   Wall-clock for timestamps and the user set_time syscall.
+ * Caveats:
+ *   CMOS is volatile across power loss (RTC battery aside); update-
+ *   in-progress bit (UIP) should be polled on real hardware.
+ * ------------------------------------------------------------------
  */
-
 #include <kernel/rtc.h>
 #include <kernel/io.h>
 
@@ -50,25 +75,25 @@
 /*  Low-level port access                                              */
 /* ------------------------------------------------------------------ */
 
-static u8 rtc_read_reg(u8 reg) {
+static u8 RtcReadReg(u8 reg) {
     /* Bit 7 set: disable NMIs around the access */
-    io_outb(RTC_INDEX_PORT, reg | 0x80);
-    io_delay();
-    return io_inb(RTC_DATA_PORT);
+    IoOutb(RTC_INDEX_PORT, reg | 0x80);
+    IoDelay();
+    return IoInb(RTC_DATA_PORT);
 }
 
-static void rtc_write_reg(u8 reg, u8 val) {
+static void RtcWriteReg(u8 reg, u8 val) {
     /* Bit 7 set: disable NMIs around the access (mirrors rtc_read_reg) */
-    io_outb(RTC_INDEX_PORT, reg | 0x80);
-    io_delay();
-    io_outb(RTC_DATA_PORT, val);
+    IoOutb(RTC_INDEX_PORT, reg | 0x80);
+    IoDelay();
+    IoOutb(RTC_DATA_PORT, val);
 }
 
 /* ------------------------------------------------------------------ */
 /*  BCD conversion                                                     */
 /* ------------------------------------------------------------------ */
 
-static u8 rtc_bcd_to_bin(u8 bcd) {
+static u8 RtcBcdToBin(u8 bcd) {
     return (u8)(((bcd >> 4) & 0x0F) * 10 + (bcd & 0x0F));
 }
 
@@ -79,53 +104,53 @@ static u8 rtc_bcd_to_bin(u8 bcd) {
  * clears (or a bounded number of tries — a stuck RTC must never
  * hang the kernel).  UIP is set for 244 µs of every second.
  */
-static void rtc_wait_uip_clear(void) {
+static void RtcWaitUipClear(void) {
     for (int i = 0; i < 10000; i++) {
-        if (!(rtc_read_reg(RTC_REG_STATUS_A) & RTC_STATUS_A_UIP))
+        if (!(RtcReadReg(RTC_REG_STATUS_A) & RTC_STATUS_A_UIP))
             return;
-        io_delay();
+        IoDelay();
     }
 }
 
 /* ------------------------------------------------------------------ */
 
-void rtc_read(rtc_time_t *out) {
+void RtcRead(rtc_time_t *out) {
     if (!out)
         return;
 
-    u8   status_b = rtc_read_reg(RTC_REG_STATUS_B);
+    u8   status_b = RtcReadReg(RTC_REG_STATUS_B);
     bool binary   = (status_b & RTC_STATUS_B_BINARY) != 0;
 
     u8 sec, min, hour, day, mon, year;
     u8 century;
 
     for (int attempt = 0; attempt < 4; attempt++) {
-        rtc_wait_uip_clear();
+        RtcWaitUipClear();
 
-        sec     = rtc_read_reg(RTC_REG_SECONDS);
-        min     = rtc_read_reg(RTC_REG_MINUTES);
-        hour    = rtc_read_reg(RTC_REG_HOURS);
-        day     = rtc_read_reg(RTC_REG_DAY);
-        mon     = rtc_read_reg(RTC_REG_MONTH);
-        year    = rtc_read_reg(RTC_REG_YEAR);
-        century = rtc_read_reg(RTC_REG_CENTURY);
+        sec     = RtcReadReg(RTC_REG_SECONDS);
+        min     = RtcReadReg(RTC_REG_MINUTES);
+        hour    = RtcReadReg(RTC_REG_HOURS);
+        day     = RtcReadReg(RTC_REG_DAY);
+        mon     = RtcReadReg(RTC_REG_MONTH);
+        year    = RtcReadReg(RTC_REG_YEAR);
+        century = RtcReadReg(RTC_REG_CENTURY);
 
         /* Consistency check: re-read the first register; if the RTC
          * ticked over between reads, retry. */
-        u8 sec2 = rtc_read_reg(RTC_REG_SECONDS);
+        u8 sec2 = RtcReadReg(RTC_REG_SECONDS);
         if (sec2 == sec)
             break;
     }
 
     /* Convert BCD to binary unless the RTC is already in binary mode */
     if (!binary) {
-        sec     = rtc_bcd_to_bin(sec);
-        min     = rtc_bcd_to_bin(min);
-        hour    = rtc_bcd_to_bin(hour);
-        day     = rtc_bcd_to_bin(day);
-        mon     = rtc_bcd_to_bin(mon);
-        year    = rtc_bcd_to_bin(year);
-        century = rtc_bcd_to_bin(century);
+        sec     = RtcBcdToBin(sec);
+        min     = RtcBcdToBin(min);
+        hour    = RtcBcdToBin(hour);
+        day     = RtcBcdToBin(day);
+        mon     = RtcBcdToBin(mon);
+        year    = RtcBcdToBin(year);
+        century = RtcBcdToBin(century);
     }
 
     /* 12-hour mode: bit 7 of the hours register is the PM flag */
@@ -155,7 +180,7 @@ void rtc_read(rtc_time_t *out) {
     out->second = sec;
 }
 
-void rtc_write(const rtc_time_t *t) {
+void RtcWrite(const rtc_time_t *t) {
     if (!t)
         return;
 
@@ -163,23 +188,23 @@ void rtc_write(const rtc_time_t *t) {
      * bit 2 = binary).  This sidesteps two write hazards: the PM bit
      * (bit 7 of the hours register in 12-hour mode) and BCD-vs-binary
      * encoding.  After this every register below is written as a plain
-     * binary value, and rtc_read (which already handles both modes)
+     * binary value, and RtcRead(which already handles both modes)
      * reads them back consistently.  Wait for UIP before touching
      * status B so the mode switch does not race an update. */
-    rtc_wait_uip_clear();
-    u8 status_b = rtc_read_reg(RTC_REG_STATUS_B);
+    RtcWaitUipClear();
+    u8 status_b = RtcReadReg(RTC_REG_STATUS_B);
     status_b |= RTC_STATUS_B_24H | RTC_STATUS_B_BINARY;
-    rtc_write_reg(RTC_REG_STATUS_B, status_b);
+    RtcWriteReg(RTC_REG_STATUS_B, status_b);
 
     /* Now wait for UIP again and write the time-of-day registers while
      * no update is in progress (the RTC updates roughly once a second). */
-    rtc_wait_uip_clear();
+    RtcWaitUipClear();
 
-    rtc_write_reg(RTC_REG_SECONDS, (u8)t->second);
-    rtc_write_reg(RTC_REG_MINUTES, (u8)t->minute);
-    rtc_write_reg(RTC_REG_HOURS, (u8)t->hour);
-    rtc_write_reg(RTC_REG_DAY, (u8)t->day);
-    rtc_write_reg(RTC_REG_MONTH, (u8)t->month);
-    rtc_write_reg(RTC_REG_YEAR, (u8)(t->year % 100));
-    rtc_write_reg(RTC_REG_CENTURY, (u8)(t->year / 100));
+    RtcWriteReg(RTC_REG_SECONDS, (u8)t->second);
+    RtcWriteReg(RTC_REG_MINUTES, (u8)t->minute);
+    RtcWriteReg(RTC_REG_HOURS, (u8)t->hour);
+    RtcWriteReg(RTC_REG_DAY, (u8)t->day);
+    RtcWriteReg(RTC_REG_MONTH, (u8)t->month);
+    RtcWriteReg(RTC_REG_YEAR, (u8)(t->year % 100));
+    RtcWriteReg(RTC_REG_CENTURY, (u8)(t->year / 100));
 }

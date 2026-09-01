@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * vmm.h - Virtual Memory Manager
  * Copyright (c) 2026 OpSys Project
  *
@@ -20,7 +33,7 @@
  * User heap region — MUST match user/runtime/malloc.c (HEAP_USER_SIZE).
  *
  * ASLR (design item ⑭): each process's heap base is randomized at
- * creation (process_t.heap_base, via aslr_heap_base()); the region size
+ * creation (process_t.heap_base, via AslrHeapBase()); the region size
  * HEAP_USER_SIZE is fixed.  The kernel reserves one guard page below the
  * base and one at base + HEAP_USER_SIZE: sys_map_memory/sys_unmap_memory
  * refuse to map/unmap them (checked against the CURRENT process's
@@ -33,7 +46,7 @@
 #define HEAP_USER_SIZE 0x10000000ULL /* 256 MB region per process */
 
 /* Kernel CR3 (physical address of kernel PML4).
- * Set during vmm_init(), used by syscall_entry.S to switch page tables. */
+ * Set during VmmInit(), used by syscall_entry.S to switch page tables. */
 extern u64 vmm_kernel_cr3;
 
 /* Page table entry flags */
@@ -54,14 +67,14 @@ typedef struct {
     u64 stack_base; /* ASLR: per-address-space user stack region base
                      * (1 MB aligned; thread TID stacks at
                      * stack_base + tid*PAGE_SIZE).  Random per
-                     * address space — see rng.h aslr_stack_base(). */
+                     * address space — see rng.h AslrStackBase(). */
 } addr_space_t;
 
 /**
  * Initialize virtual memory: set up kernel page tables.
  * Called after pmm_init.
  */
-void vmm_init(void);
+void VmmInit(void);
 
 /**
  * Create a new user address space with only kernel mappings.
@@ -73,7 +86,7 @@ addr_space_t *vmm_create_addr_space(void);
  * Destroy an address space and free all user page tables.
  * @param as  Address space to destroy.
  */
-void vmm_destroy_addr_space(addr_space_t *as);
+void VmmDestroyAddrSpace(addr_space_t *as);
 
 /**
  * Map a virtual address to a physical address in an address space.
@@ -83,14 +96,14 @@ void vmm_destroy_addr_space(addr_space_t *as);
  * @param flags PTE flags (PTE_PRESENT | PTE_WRITABLE | PTE_USER | ...).
  * @return OK on success, error code on failure.
  */
-error_t vmm_map(addr_space_t *as, u64 virt, u64 phys, u64 flags);
+error_t VmmMap(addr_space_t *as, u64 virt, u64 phys, u64 flags);
 
 /**
  * Unmap a virtual address.
  * @param as    Target address space.
  * @param virt  Virtual address (page-aligned).
  */
-error_t vmm_unmap(addr_space_t *as, u64 virt);
+error_t VmmUnmap(addr_space_t *as, u64 virt);
 
 /**
  * Get the physical address mapped to a virtual address.
@@ -98,7 +111,7 @@ error_t vmm_unmap(addr_space_t *as, u64 virt);
  * @param virt  Virtual address.
  * @return Physical address, or 0 if not mapped.
  */
-u64 vmm_virt_to_phys(addr_space_t *as, u64 virt);
+u64 VmmVirtToPhys(addr_space_t *as, u64 virt);
 
 /**
  * Get the current (bootstrapped) kernel address space.
@@ -109,17 +122,17 @@ addr_space_t *vmm_get_kernel_addr_space(void);
  * Switch to a different address space (loads CR3).
  * @param as  Address space to switch to.
  */
-void vmm_switch_addr_space(addr_space_t *as);
+void VmmSwitchAddrSpace(addr_space_t *as);
 
 /**
  * Map a range of pages.
  */
-error_t vmm_map_range(addr_space_t *as, u64 virt, u64 phys, u64 page_count, u64 flags);
+error_t VmmMapRange(addr_space_t *as, u64 virt, u64 phys, u64 page_count, u64 flags);
 
 /**
  * Unmap a range of pages.
  */
-error_t vmm_unmap_range(addr_space_t *as, u64 virt, u64 page_count);
+error_t VmmUnmapRange(addr_space_t *as, u64 virt, u64 page_count);
 
 /**
  * Allocate a page from PMM and map it to a virtual address.
@@ -128,7 +141,7 @@ error_t vmm_unmap_range(addr_space_t *as, u64 virt, u64 page_count);
  * @param flags PTE flags.
  * @return OK or error.
  */
-error_t vmm_alloc_and_map(addr_space_t *as, u64 virt, u64 flags);
+error_t VmmAllocAndMap(addr_space_t *as, u64 virt, u64 flags);
 
 /**
  * Check whether a range of user virtual addresses is safe to access
@@ -145,13 +158,13 @@ error_t vmm_alloc_and_map(addr_space_t *as, u64 virt, u64 flags);
  *                   will write into the range); if false, Present alone
  *                   suffices (the kernel only reads from the range).
  */
-bool vmm_validate_user_range(addr_space_t *as, u64 ptr, u64 size, bool need_write);
+bool VmmValidateUserRange(addr_space_t *as, u64 ptr, u64 size, bool need_write);
 
 /* Validate a user pointer range against the CURRENT process's address
  * space: non-zero, overflow-free, below USER_PTR_MAX, and every page
  * mapped (writable iff need_write).  Single shared implementation for
  * all syscall handlers (was duplicated in syscall.c, process_desc.c,
  * pci.c and virtio_blk.c). */
-bool vmm_validate_user_ptr(u64 ptr, u64 size, bool need_write);
+bool VmmValidateUserPtr(u64 ptr, u64 size, bool need_write);
 
 #endif /* KERNEL_VMM_H */

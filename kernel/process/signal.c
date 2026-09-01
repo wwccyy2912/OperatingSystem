@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * signal.c - POSIX-style signal delivery
  * Copyright (c) 2026 OpSys Project
  *
@@ -6,7 +19,7 @@
  *
  *   - signal_check_syscall()    syscall_entry.S, after syscall_dispatch
  *                               returns, before the GPR pops + IRETQ
- *   - signal_check_interrupt()  isr_handler (idt.c), on every
+ *   - SignalCheckInterrupt()  isr_handler(idt.c), on every
  *                               interrupt/IRQ return to user mode
  *
  * Both run with IF=0 (interrupt gates) on the current thread's kernel
@@ -14,7 +27,7 @@
  * scheduler (thread_exit / sched_enqueue) but never block.
  *
  * Semantics (Ring 3 migration, kernel_roadmap.md D4/P2):
- *   - kill(SIGKILL)            -> signal_kill_process(): force_exit on
+ *   - kill(SIGKILL)            -> SignalKillProcess(): force_exit on
  *                                 every thread + wake blocked ones;
  *                                 each thread dies at its next checkpoint.
  *   - kill(other)              -> set the pending bit; at the next
@@ -27,8 +40,35 @@
  *                                 Handler lookup, ignore/default
  *                                 policy and default actions live in
  *                                 user/runtime/signal_user.c.
- *   - SYS_SIGRETURN            -> signal_restore(): copy the sigframe
+ *   - SYS_SIGRETURN            -> SignalRestore(): copy the sigframe
  *                                 back into the current syscall frame.
+ *
+ * ------------------------------------------------------------------
+ * Structure (signal):
+ *   proc->sig_pending    -- per-process bitmask (bit i = signal i)
+ *   proc->sig_dispatcher -- ring-3 dispatcher RIP set by the C runtime
+ *   checkpoints: signal_check_syscall() (syscall return path) and
+ *                SignalCheckInterrupt() (every IRQ return to user mode)
+ *   delivery: sigframe_t on the user stack (gprs, rip, rflags, rsp,
+ *             signum), entered via diverted RIP/RDI/RSP
+ * How it works:
+ *   kill() only sets the pending bit (SIGKILL instead marks every
+ *   thread force_exit).  At the next checkpoint SignalCheckCommon()
+ *   consumes one pending bit, snapshots the interrupted user context
+ *   into a sigframe and rewrites RIP/RDI/RSP into the ring-3
+ *   dispatcher.  The handler runs; SYS_SIGRETURN (SignalRestore())
+ *   copies the sigframe back into the current syscall frame.
+ * Purpose:
+ *   Defer all signal work to safe return points: the checkpoints run
+ *   with IF=0, hold no locks and may re-enter the scheduler without
+ *   blocking; handler policy lives in user/runtime/signal_user.c.
+ * Caveats:
+ *   - Single delivery, no queuing: the bit is consumed when seen and
+ *     re-set only if delivery is deferred (no dispatcher, or the user
+ *     stack is exhausted/invalid).
+ *   - Only user-mode frames (CPL 3) can be diverted; force_exit
+ *     threads die at their next checkpoint via ThreadExit().
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/signal.h>
@@ -69,7 +109,7 @@
  * Returns true when the frame was rewritten to enter the Ring 3
  * dispatcher; false when nothing was delivered.
  */
-static bool signal_check_common(process_t *proc, u64 *gprs, u64 *rip, u64 *rsp, u64 *rflags) {
+static bool SignalCheckCommon(process_t *proc, u64 *gprs, u64 *rip, u64 *rsp, u64 *rflags) {
     if (!proc || proc->sig_pending == 0)
         return false;
 
@@ -100,7 +140,7 @@ static bool signal_check_common(process_t *proc, u64 *gprs, u64 *rip, u64 *rsp, 
         u64 base = (*rsp - SIGFRAME_TOTAL) & ~0xFULL;
 
         if (base < 0x1000 ||
-            !vmm_validate_user_range(proc->addr_space, base - 8, SIGFRAME_TOTAL, true)) {
+            !VmmValidateUserRange(proc->addr_space, base - 8, SIGFRAME_TOTAL, true)) {
             /* Stack exhausted: cannot deliver now.  Keep the signal
              * pending and retry at the next checkpoint. */
             proc->sig_pending |= (1ULL << signum);
@@ -146,7 +186,7 @@ bool signal_check_syscall(u64 *frame) {
 
     /* Force-kill: terminate now with the recorded exit code */
     if (cur->force_exit) {
-        thread_exit(cur->exit_code);
+        ThreadExit(cur->exit_code);
         /* never returns */
     }
 
@@ -154,7 +194,7 @@ bool signal_check_syscall(u64 *frame) {
     if (!proc)
         return false;
 
-    return signal_check_common(
+    return SignalCheckCommon(
         proc, frame, &frame[SF_RIP_IDX], &frame[SF_RSP_IDX], &frame[SF_RFLAGS_IDX]);
 }
 
@@ -162,7 +202,7 @@ bool signal_check_syscall(u64 *frame) {
  * Interrupt/IRQ-return checkpoint (idt.c isr_handler tail and IRQ
  * branch).  Called with the isr_common_stub interrupt frame.
  */
-bool signal_check_interrupt(interrupt_frame_t *frame) {
+bool SignalCheckInterrupt(interrupt_frame_t *frame) {
     thread_t *cur = thread_current();
     if (!cur)
         return false;
@@ -173,7 +213,7 @@ bool signal_check_interrupt(interrupt_frame_t *frame) {
 
     /* Force-kill: terminate now with the recorded exit code */
     if (cur->force_exit) {
-        thread_exit(cur->exit_code);
+        ThreadExit(cur->exit_code);
         /* never returns */
     }
 
@@ -208,7 +248,7 @@ bool signal_check_interrupt(interrupt_frame_t *frame) {
     rsp      = frame->rsp;
     rflags   = frame->rflags;
 
-    bool delivered = signal_check_common(proc, gprs, &rip, &rsp, &rflags);
+    bool delivered = SignalCheckCommon(proc, gprs, &rip, &rsp, &rflags);
 
     /* Write back only what the common core may have rewritten
      * (handler entry point + RSP + RDI); RFLAGS stays interrupted. */
@@ -244,7 +284,7 @@ bool signal_check_interrupt(interrupt_frame_t *frame) {
  * Returns the restored user RAX (becomes the value the interrupted
  * code sees the syscall returning), or an error code (< 0).
  */
-i64 signal_restore(u64 frame_ptr) {
+i64 SignalRestore(u64 frame_ptr) {
     thread_t *cur = thread_current();
     if (!cur)
         return (i64)ERR_FAULT;
@@ -254,7 +294,7 @@ i64 signal_restore(u64 frame_ptr) {
     process_t *proc = process_current();
     if (!proc || !proc->addr_space)
         return (i64)ERR_FAULT;
-    if (!vmm_validate_user_range(proc->addr_space, frame_ptr, sizeof(sigframe_t), false))
+    if (!VmmValidateUserRange(proc->addr_space, frame_ptr, sizeof(sigframe_t), false))
         return (i64)ERR_FAULT;
 
     /* Read the sigframe from user memory (same address space: the
@@ -290,13 +330,13 @@ i64 signal_restore(u64 frame_ptr) {
  * cannot linger.  Blocked threads are first unlinked from whatever
  * wait structure holds them, then re-enqueued as READY; when they run
  * their interrupted syscall returns an error and the checkpoint
- * thread_exit()s them.
+ * ThreadExit()s them.
  *
  * The CURRENT thread (if part of the target process) is only marked --
  * its checkpoint (or the direct thread_exit in the default-action
  * path) performs the exit.
  */
-void signal_kill_process(process_t *proc, int exit_code) {
+void SignalKillProcess(process_t *proc, int exit_code) {
     if (!proc)
         return;
 
@@ -316,18 +356,18 @@ void signal_kill_process(process_t *proc, int exit_code) {
              * between the kill and the sleep deadline it would sit
              * simultaneously on the sleep list and in the ready tree,
              * violating the scheduler's single-structure invariant.
-             * sched_unsleep() is a no-op for non-sleepers.  notify
+             * SchedUnsleep() is a no-op for non-sleepers.  notify
              * (wait_mask) and join (joiner_tid) have no queue structure
              * to corrupt; process_wait's waiting_tid is cleared by
-             * process_thread_exited() after the wake. */
+             * ProcessThreadExited() after the wake. */
             if (t->blocked_port != PORT_NULL)
-                ipc_abort_wait(t);
-            mutex_abort_wait(t);
+                IpcAbortWait(t);
+            MutexAbortWait(t);
 
-            sched_unsleep(t);
+            SchedUnsleep(t);
 
             t->state = THREAD_STATE_READY;
-            sched_enqueue(t);
+            SchedEnqueue(t);
         }
     }
 }

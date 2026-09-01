@@ -1,16 +1,29 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * rng.h - Boot-time PRNG and ASLR address helpers
  * Copyright (c) 2026 OpSys Project
  *
  * Single kernel-wide xorshift64* PRNG.  Seeded once at boot from
  * hardware timing entropy (rdtsc, PIT channel-0, CMOS RTC, boot
  * stack address); additional entropy can be folded in later with
- * rng_mix() (e.g. scheduler ticks + PID at process creation).
+ * RngMix() (e.g. scheduler ticks + PID at process creation).
  *
  * All user-space address randomization (ASLR design item ⑭) routes
  * through the aslr_*() helpers so the entropy source and the address
  * regions are centralized in one place.  When the full PIE variant
- * (design option A) is implemented, only aslr_elf_base() + the ELF
+ * (design option A) is implemented, only AslrElfBase() + the ELF
  * loader need to change.
  */
 
@@ -21,28 +34,28 @@
 
 /**
  * Seed the PRNG from hardware entropy.  Call very early in boot
- * (kernel_main, right after serial_init) so every later random draw
+ * (KernelMain, right after serial_init) so every later random draw
  * is unpredictable across boots.  Safe to call once; idempotent.
  */
-void rng_init(void);
+void RngInit(void);
 
 /**
  * Fold additional entropy into the PRNG state.
  * Use after subsystems with timing/identity entropy come up
  * (scheduler ticks, PID counter) to decorrelate per-process draws.
  */
-void rng_mix(u64 entropy);
+void RngMix(u64 entropy);
 
 /**
  * Return the next 64-bit pseudo-random value.
  */
-u64 rng_u64(void);
+u64 RngU64(void);
 
 /**
  * Return a pseudo-random value in [0, limit).
- * limit must be non-zero (values are rng_u64() % limit).
+ * limit must be non-zero (values are RngU64() % limit).
  */
-u64 rng_range(u64 limit);
+u64 RngRange(u64 limit);
 
 /* ==================================================================
  * ASLR address helpers (design item ⑭, option B: stack/heap/canary)
@@ -65,7 +78,7 @@ u64 rng_range(u64 limit);
 /**
  * Random ASLR_STACK_BLOCK-aligned base for a process's user thread stacks.
  */
-u64 aslr_stack_base(void);
+u64 AslrStackBase(void);
 
 /*
  * init boot stack region: [0x4000000, 0x10000000).
@@ -79,7 +92,7 @@ u64 aslr_stack_base(void);
 /**
  * Random page-aligned address for the init boot stack.
  */
-u64 aslr_boot_stack(void);
+u64 AslrBootStack(void);
 
 /*
  * User heap region: the heap base is randomized within
@@ -95,7 +108,7 @@ u64 aslr_boot_stack(void);
 /**
  * Random 64 KB-aligned heap base for a new process.
  */
-u64 aslr_heap_base(void);
+u64 AslrHeapBase(void);
 
 /* ==================================================================
  * Option A (full PIE) reservation
@@ -115,6 +128,6 @@ u64 aslr_heap_base(void);
 /**
  * Random page-aligned PIE load base (option A reservation).
  */
-u64 aslr_elf_base(void);
+u64 AslrElfBase(void);
 
 #endif /* KERNEL_RNG_H */

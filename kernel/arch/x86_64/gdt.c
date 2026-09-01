@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * gdt.c - Global Descriptor Table for x86_64 long mode
  * Copyright (c) 2026 OpSys Project
  *
@@ -9,9 +22,21 @@
  *   0x18: User code segment    (selector 0x1B, RPL=3)
  *   0x20: User data segment    (selector 0x23, RPL=3)
  *   0x28: TSS low  (selector 0x28)
- *   0x30: TSS high
+ *   0x30: TSS high *
+ * ------------------------------------------------------------------
+ * Structure (gdt):
+ *   gdt[6] entries (null | code | data | user-code | user-data | TSS)
+ *   -> lgdt + reload CS via far-return, then DS/ES/SS/FS/GS; TSS:
+ *   RSP0/IST (kernel stacks) written before enter_user_mode().
+ * How it works:
+ *   GdtInit() builds the 64-bit flat descriptors; GdtSetTssEntry()
+ *   links the TSS so ring-3 -> ring-0 transitions find kernel stacks.
+ * Purpose:
+ *   Segment state for ring transitions and IST exception stacks.
+ * Caveats:
+ *   CS reload needs the far-return trick (ljmp not encodable in 64-bit).
+ * ------------------------------------------------------------------
  */
-
 #include <kernel/gdt.h>
 #include <kernel/io.h>
 #include <kernel/string.h>
@@ -68,7 +93,7 @@ static gdt_ptr_t   gdt_ptr;
 /*
  * Encode a GDT entry from base, limit, access byte, and flags.
  */
-static void gdt_set_entry(gdt_entry_t *entry, u32 base, u32 limit, u8 access, u8 flags) {
+static void GdtSetEntry(gdt_entry_t *entry, u32 base, u32 limit, u8 access, u8 flags) {
     entry->limit_low        = limit & 0xFFFF;
     entry->base_low         = base & 0xFFFF;
     entry->base_mid         = (base >> 16) & 0xFF;
@@ -83,7 +108,7 @@ static void gdt_set_entry(gdt_entry_t *entry, u32 base, u32 limit, u8 access, u8
  *   Entry N:   base[15:0], limit[15:0], base[23:16], access, flags|limit[19:16], base[31:24]
  *   Entry N+1: base[63:32], reserved (0)
  */
-static void gdt_set_tss_entry(gdt_entry_t *entries, u64 tss_base, u32 tss_limit) {
+static void GdtSetTssEntry(gdt_entry_t *entries, u64 tss_base, u32 tss_limit) {
     /* First entry (lower 8 bytes) */
     entries[0].limit_low        = tss_limit & 0xFFFF;
     entries[0].base_low         = tss_base & 0xFFFF;
@@ -101,44 +126,44 @@ static void gdt_set_tss_entry(gdt_entry_t *entries, u64 tss_base, u32 tss_limit)
     entries[1].base_high        = 0;
 }
 
-void gdt_init(void) {
+void GdtInit(void) {
     /* Clear GDT */
     memset(gdt, 0, sizeof(gdt));
 
     /* Null descriptor (index 0, selector 0x00) */
-    gdt_set_entry(&gdt[0], 0, 0, 0x00, 0x00);
+    GdtSetEntry(&gdt[0], 0, 0, 0x00, 0x00);
 
     /* Kernel code segment (index 1, selector 0x08)
      * L=1 (long mode), D=0, P=1 (present), S=1 (code/data), type=0xA (execute/read)
      * G=1 (4KB granularity), D=0, L=1, AVL=0 → flags=0xA
      * Access: P=1, DPL=00, S=1, type=1010 → 0x9A
      */
-    gdt_set_entry(&gdt[1], 0, 0xFFFFF, 0x9A, 0xA);
+    GdtSetEntry(&gdt[1], 0, 0xFFFFF, 0x9A, 0xA);
 
     /* Kernel data segment (index 2, selector 0x10)
      * P=1, S=1, type=0x2 (data, expand-up, writable)
      * G=1, B=1, L=0, AVL=0 → flags=0xC
      * Access: P=1, DPL=00, S=1, type=0010 → 0x92
      */
-    gdt_set_entry(&gdt[2], 0, 0xFFFFF, 0x92, 0xC);
+    GdtSetEntry(&gdt[2], 0, 0xFFFFF, 0x92, 0xC);
 
     /* User code segment (index 3, selector 0x1B with RPL=3)
      * Same as kernel code but DPL=3
      * Access: P=1, DPL=11, S=1, type=1010 → 0xFA
      */
-    gdt_set_entry(&gdt[3], 0, 0xFFFFF, 0xFA, 0xA);
+    GdtSetEntry(&gdt[3], 0, 0xFFFFF, 0xFA, 0xA);
 
     /* User data segment (index 4, selector 0x23 with RPL=3)
      * Same as kernel data but DPL=3
      * Access: P=1, DPL=11, S=1, type=0010 → 0xF2
      */
-    gdt_set_entry(&gdt[4], 0, 0xFFFFF, 0xF2, 0xC);
+    GdtSetEntry(&gdt[4], 0, 0xFFFFF, 0xF2, 0xC);
 
     /* TSS (index 5-6, selector 0x28) */
     memset(&tss, 0, sizeof(tss));
     tss.iopb_offset = sizeof(tss);
 
-    gdt_set_tss_entry(&gdt[5], (u64)&tss, sizeof(tss) - 1);
+    GdtSetTssEntry(&gdt[5], (u64)&tss, sizeof(tss) - 1);
 
     /* Build GDT pointer */
     gdt_ptr.limit = sizeof(gdt) - 1;
@@ -177,11 +202,11 @@ void gdt_init(void) {
     );
 }
 
-void gdt_set_tss_rsp0(u64 rsp) {
+void GdtSetTssRsp0(u64 rsp) {
     tss.rsp0 = rsp;
 }
 
-void gdt_set_tss_ist(int ist_num, u64 stack) {
+void GdtSetTssIst(int ist_num, u64 stack) {
     switch (ist_num) {
     case 1:
         tss.ist1 = stack;

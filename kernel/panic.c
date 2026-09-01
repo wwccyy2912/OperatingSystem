@@ -1,3 +1,18 @@
+/*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ */
+
 
 /*
  * panic.c - Unified kernel panic path
@@ -20,6 +35,24 @@
  * instrumented frame; panic() never returns, so its own canary is never
  * verified, and running it with a corrupted stack must not re-enter
  * __stack_chk_fail.
+ *
+ * ------------------------------------------------------------------
+ * Structure (panic):
+ *   caller -> panic(fmt,...): cli -> PanicVsnprintf -> SerialPuts
+ *   (full detail) -> PanicRenderScreen (VGA cells or fill + 8x16
+ *   font) -> for(;;) hlt (never returns).
+ * How it works:
+ *   Formats the reason once and mirrors it to serial + framebuffer,
+ *   then parks the CPU. The screen path is self-contained, so a
+ *   fatal fault stays visible even with the term service halted.
+ * Purpose:
+ *   Single choke point for all fatal kernel faults — detection stays
+ *   distributed, only the final stop is centralized.
+ * Caveats:
+ *   no_stack_protector: panic() never returns, so its canary is
+ *   never verified and a corrupted stack must not re-enter
+ *   __stack_chk_fail. No framebuffer yet -> screen part is skipped.
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/panic.h>
@@ -43,11 +76,11 @@
 
 /*
  * Minimal vsnprintf used to format the panic reason into a buffer.
- * Supports the same specifiers as serial_printf (%d %u %x %X %s %c %%
+ * Supports the same specifiers as SerialPrintf(%d %u %x %X %s %c %%
  * plus width and zero-padding) so the on-screen text matches the
  * serial text exactly.
  */
-static int panic_vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
+static int PanicVsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
     int  written = 0;
     char numbuf[24];
 
@@ -173,7 +206,7 @@ static int panic_vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) 
 /*
  * Fill the whole framebuffer with a solid color.
  */
-static void panic_fb_fill(const fb_info_t *fb, u32 color) {
+static void PanicFbFill(const fb_info_t *fb, u32 color) {
     u8 *base  = (u8 *)(u64)fb->addr;
     u32 pitch = fb->pitch;
 
@@ -201,7 +234,7 @@ static void panic_fb_fill(const fb_info_t *fb, u32 color) {
  * Stamp one 8x16 glyph at cell (cx, cy).  Cells outside the screen are
  * ignored.
  */
-static void panic_fb_putc(const fb_info_t *fb, u32 cx, u32 cy, u8 ch) {
+static void PanicFbPutc(const fb_info_t *fb, u32 cx, u32 cy, u8 ch) {
     if (ch < 0x20 || ch > 0x7E)
         return; /* no glyph for control chars */
 
@@ -237,7 +270,7 @@ static void panic_fb_putc(const fb_info_t *fb, u32 cx, u32 cy, u8 ch) {
  * Render a multi-line message on the panic screen.  '\n' advances to the
  * next cell row; long lines wrap at the screen width.
  */
-static void panic_fb_puts(const fb_info_t *fb, const char *s) {
+static void PanicFbPuts(const fb_info_t *fb, const char *s) {
     u32 cols = fb->width / CELL_W;
     u32 rows = fb->height / CELL_H;
     u32 cx = 0, cy = 0;
@@ -249,7 +282,7 @@ static void panic_fb_puts(const fb_info_t *fb, const char *s) {
         } else if (*s == '\r') {
             cx = 0;
         } else {
-            panic_fb_putc(fb, cx, cy, (u8)*s);
+            PanicFbPutc(fb, cx, cy, (u8)*s);
             if (++cx >= cols) {
                 cx = 0;
                 cy++;
@@ -265,7 +298,7 @@ static void panic_fb_puts(const fb_info_t *fb, const char *s) {
  * Draw the full panic screen: solid dark-red background, then a bold
  * "KERNEL PANIC" title line, a blank row, and the reason message.
  */
-static void panic_render_screen(const char *msg) {
+static void PanicRenderScreen(const char *msg) {
     const fb_info_t *fb = fb_get_info();
     if (!fb)
         return; /* no framebuffer yet (early boot) */
@@ -282,7 +315,7 @@ static void panic_render_screen(const char *msg) {
     *dst = '\0';
 
     /* VGA text mode (0xB8000): write cells directly, no font needed */
-    if (fb_is_vga_text()) {
+    if (FbIsVgaText()) {
         u16 *cells = (u16 *)(u64)fb->addr;
         u32  cols  = fb->width / CELL_W;
         u32  rows  = fb->height / CELL_H;
@@ -311,8 +344,8 @@ static void panic_render_screen(const char *msg) {
     }
 
     /* Linear RGB mode: fill + render font */
-    panic_fb_fill(fb, PANIC_BG);
-    panic_fb_puts(fb, screen);
+    PanicFbFill(fb, PANIC_BG);
+    PanicFbPuts(fb, screen);
 }
 
 __attribute__((noreturn, no_stack_protector)) void panic(const char *fmt, ...) {
@@ -324,17 +357,17 @@ __attribute__((noreturn, no_stack_protector)) void panic(const char *fmt, ...) {
     char    msg[PANIC_MSG_MAX];
     va_list ap;
     va_start(ap, fmt);
-    panic_vsnprintf(msg, sizeof(msg), fmt, ap);
+    PanicVsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
     /* Serial output (ungated) */
-    serial_puts("\n========== KERNEL PANIC ==========\n");
-    serial_puts(msg);
-    serial_puts("\n==================================\n");
-    serial_puts("System halted.\n");
+    SerialPuts("\n========== KERNEL PANIC ==========\n");
+    SerialPuts(msg);
+    SerialPuts("\n==================================\n");
+    SerialPuts("System halted.\n");
 
     /* Screen output: red screen + white message */
-    panic_render_screen(msg);
+    PanicRenderScreen(msg);
 
     /* Park the CPU forever.  No attempt to unwind: after a fatal fault
      * the kernel state is untrustworthy. */

@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * process.h - Process management
  * Copyright (c) 2026 OpSys Project
  */
@@ -51,7 +64,7 @@ typedef struct process {
      * kernel-issued app identity, allocated at app instantiation
      * (docs/permission_model.md §三), replacing the forgeable
      * self-reported u32 app_id_hash.  Unforgeable like subject_id:
-     * drawn from the kernel PRNG at process_create()/process_init(),
+     * drawn from the kernel PRNG at process_create()/ProcessInit(),
      * never from user input.  (0,0) only for the kernel/system
      * process (subject 0). */
     u64 app_uuid_hi;
@@ -73,7 +86,7 @@ typedef struct process {
 /**
  * Initialize process management.
  */
-void process_init(void);
+void ProcessInit(void);
 
 /**
  * Create a new process.
@@ -117,30 +130,30 @@ process_t *process_get_init(void);
  * When the LAST thread exits, the process becomes PROC_STATE_ZOMBIE
  * with the given exit code and either:
  *  - hands the reap to a thread blocked in process_wait() on it (that
- *    thread wakes, collects the code and calls process_reap()), or
+ *    thread wakes, collects the code and calls ProcessReap()), or
  *  - if nobody is waiting, reaps the orphan zombie immediately.
- * Called by thread_exit(); safe for kernel threads (caller must pass
+ * Called by ThreadExit(); safe for kernel threads (caller must pass
  * NULL or skip when pid == 0).
  */
-void process_thread_exited(process_t *proc, int code);
+void ProcessThreadExited(process_t *proc, int code);
 
 /**
  * Reap a ZOMBIE process: free its address space and capability table,
  * release its table slot and detach it from the process list.
  * The caller must hold reap ownership (see process_thread_exited).
  */
-void process_reap(process_t *proc);
+void ProcessReap(process_t *proc);
 
 /**
  * Get total process count.
  */
-u32 process_get_count(void);
+u32 ProcessGetCount(void);
 
 /**
  * Fill a caller buffer with one proc_info_t per user process
  * (init + spawned, including zombies), in creation order.
  * Writes at most max_entries.  Returns the number written.
  */
-u32 process_list_fill(proc_info_t *out, u32 max_entries);
+u32 ProcessListFill(proc_info_t *out, u32 max_entries);
 
 #endif /* KERNEL_PROCESS_H */

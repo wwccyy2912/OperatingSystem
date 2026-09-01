@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * pmm.c - Physical Memory Manager
  * Copyright (c) 2026 OpSys Project
  *
@@ -6,6 +19,33 @@
  * Uses a reserved region in physical memory for the bitmap rather than
  * a large static array, keeping BSS small. The bitmap is placed in an
  * available gap found via the multiboot2 memory map.
+ *
+ * ------------------------------------------------------------------
+ * Structure (pmm):
+ *   Physical memory: [page 0 (reserved)] [kernel @ 0x100000..kernel_end]
+ *                    [bitmap gap] [free pages ...] [.. s_mem_end)
+ *   s_bitmap: 1 bit per 4 KB page, u64 words; s_total_pages,
+ *   s_free_pages, s_bitmap_phys, s_bitmap_pages, s_next_hint (next-fit)
+ *   Helpers: BitmapSet/BitmapClear/BitmapTest, BitmapFindFree(Bit)
+ *
+ * How it works:
+ *   PmmInit() parses the multiboot2 memory map, clamps s_mem_end to the
+ *   boot-mapped physical range, parks the bitmap in a free gap (past
+ *   the kernel and the multiboot2 info), marks all bits used, then
+ *   clears bits for AVAILABLE regions and re-sets kernel / mb-info /
+ *   framebuffer pages. PmmAllocPage(s)/PmmFreePage(s) toggle bits;
+ *   BitmapFindFree scans word-at-a-time (ctz) from the next-fit hint,
+ *   wrapping around to page 1 when needed.
+ *
+ * Purpose:
+ *   Sole source of physical frames: page tables, user pages, DMA
+ *   buffers, shm pools — every physical allocation in the kernel.
+ *
+ * Caveats:
+ *   Page index 0 is never returned; phys 0 or >= s_mem_end is refused
+ *   on free. Contiguous runs (PmmAllocPages) need a linear scan and
+ *   can fail even when enough total free pages exist (fragmentation).
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/pmm.h>
@@ -28,7 +68,7 @@ static u64  s_bitmap_pages; /* Pages occupied by bitmap */
 static u64  s_mem_end;      /* Highest physical address + 1 */
 
 /* Next-fit hint (v0.5): the page index where the previous allocation
- * scan stopped.  bitmap_find_free() resumes from here (wrapping around)
+ * scan stopped.  BitmapFindFree() resumes from here (wrapping around)
  * instead of always scanning from page 1 — repeated small allocations
  * become O(run) instead of O(total).  The hint is a hint only: the scan
  * always covers the whole map when needed, so correctness is
@@ -37,15 +77,15 @@ static u64 s_next_hint = 1;
 
 /* ---- Bitmap helpers ---- */
 
-static inline void bitmap_set(u64 idx) {
+static inline void BitmapSet(u64 idx) {
     s_bitmap[idx / 64] |= (1ULL << (idx % 64));
 }
 
-static inline void bitmap_clear(u64 idx) {
+static inline void BitmapClear(u64 idx) {
     s_bitmap[idx / 64] &= ~(1ULL << (idx % 64));
 }
 
-static inline bool bitmap_test(u64 idx) {
+static inline bool BitmapTest(u64 idx) {
     return (s_bitmap[idx / 64] >> (idx % 64)) & 1ULL;
 }
 
@@ -55,7 +95,7 @@ static inline bool bitmap_test(u64 idx) {
  * Word-at-a-time: one load + ctz per candidate word instead of one load
  * per bit.  Page index 0 is never returned.
  */
-static u64 bitmap_find_free_bit(u64 start) {
+static u64 BitmapFindFreeBit(u64 start) {
     u64 total  = s_total_pages;
     u64 nwords = (total + 63) / 64;
     u64 first  = start / 64;
@@ -79,7 +119,7 @@ static u64 bitmap_find_free_bit(u64 start) {
  * Returns the starting page index, or 0 if not found.
  * Page index 0 is never returned (physical page 0 is never allocated).
  */
-static u64 bitmap_find_free(u64 count) {
+static u64 BitmapFindFree(u64 count) {
     if (count == 0 || s_free_pages < count) {
         return 0;
     }
@@ -90,9 +130,9 @@ static u64 bitmap_find_free(u64 count) {
      * faults, malloc heap growth, process creation): word-at-a-time
      * scan from the next-fit hint, wrapping to page 1 if needed. */
     if (count == 1) {
-        u64 idx = bitmap_find_free_bit(s_next_hint);
+        u64 idx = BitmapFindFreeBit(s_next_hint);
         if (idx == 0 && s_next_hint > 1)
-            idx = bitmap_find_free_bit(1);
+            idx = BitmapFindFreeBit(1);
         if (idx != 0) {
             s_next_hint = idx + 1;
             if (s_next_hint >= total)
@@ -110,7 +150,7 @@ static u64 bitmap_find_free(u64 count) {
         u64 run_start = 0;
 
         for (u64 i = start; i < total; i++) {
-            if (!bitmap_test(i)) {
+            if (!BitmapTest(i)) {
                 if (run == 0)
                     run_start = i;
                 run++;
@@ -169,14 +209,14 @@ mboot2_mmap_entry_t *mboot2_get_mmap(u64 mboot_addr, u32 *count_out) {
 
 /* ---- Physical memory manager ---- */
 
-void pmm_init(u64 mboot_addr, u64 kernel_end) {
-    serial_puts("PMM: Initializing...\n");
+void PmmInit(u64 mboot_addr, u64 kernel_end) {
+    SerialPuts("PMM: Initializing...\n");
 
     /* Step 1: Parse multiboot2 memory map */
     u32                  mmap_count = 0;
     mboot2_mmap_entry_t *mmap       = mboot2_get_mmap(mboot_addr, &mmap_count);
     if (!mmap) {
-        serial_puts("PMM: ERROR - No memory map found\n");
+        SerialPuts("PMM: ERROR - No memory map found\n");
         return;
     }
 
@@ -187,7 +227,7 @@ void pmm_init(u64 mboot_addr, u64 kernel_end) {
     s_mem_end = 0;
     for (u32 i = 0; i < mmap_count; i++) {
         u64 region_end = mmap[i].base_addr + mmap[i].length;
-        serial_printf_level(SERIAL_LOG_DEBUG,
+        SerialPrintfLevel(SERIAL_LOG_DEBUG,
                             "  mmap[%u]: base=0x%x len=0x%x type=%u\n",
                             i,
                             (u32)mmap[i].base_addr,
@@ -220,14 +260,14 @@ void pmm_init(u64 mboot_addr, u64 kernel_end) {
 
     s_total_pages = s_mem_end / PAGE_SIZE;
 
-    serial_printf("PMM: Memory: 0x%x bytes, 0x%x pages\n", s_mem_end, s_total_pages);
+    SerialPrintf("PMM: Memory: 0x%x bytes, 0x%x pages\n", s_mem_end, s_total_pages);
 
     /* Step 3: Calculate bitmap size in bytes and pages */
     u64 bitmap_words        = (s_total_pages + 63) / 64;
     u64 bitmap_bytes        = bitmap_words * sizeof(u64);
     u64 bitmap_pages_needed = (bitmap_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    serial_printf("PMM: bitmap: words=%u bytes=%u pages=%u\n",
+    SerialPrintf("PMM: bitmap: words=%u bytes=%u pages=%u\n",
                   bitmap_words,
                   bitmap_bytes,
                   bitmap_pages_needed);
@@ -273,7 +313,7 @@ void pmm_init(u64 mboot_addr, u64 kernel_end) {
     }
 
     if (!bitmap_phys) {
-        serial_puts("PMM: ERROR - No room for bitmap\n");
+        SerialPuts("PMM: ERROR - No room for bitmap\n");
         return;
     }
 
@@ -299,7 +339,7 @@ void pmm_init(u64 mboot_addr, u64 kernel_end) {
         if (end_page > s_total_pages)
             end_page = s_total_pages;
         for (u64 p = start_page; p < end_page; p++) {
-            bitmap_clear(p);
+            BitmapClear(p);
         }
     }
 
@@ -307,14 +347,14 @@ void pmm_init(u64 mboot_addr, u64 kernel_end) {
     u64 bm_start_page = bitmap_phys / PAGE_SIZE;
     u64 bm_end_page   = (bitmap_phys + bitmap_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     for (u64 p = bm_start_page; p < bm_end_page; p++) {
-        bitmap_set(p);
+        BitmapSet(p);
     }
 
     /* Step 8: Mark kernel code/data region as used */
     u64 k_start_page = KERNEL_PHYS_START / PAGE_SIZE;
     u64 k_end_page   = (kernel_end + PAGE_SIZE - 1) / PAGE_SIZE;
     for (u64 p = k_start_page; p < k_end_page; p++) {
-        bitmap_set(p);
+        BitmapSet(p);
     }
 
     /* Step 9: Mark multiboot2 info structure as used.
@@ -323,7 +363,7 @@ void pmm_init(u64 mboot_addr, u64 kernel_end) {
     u64 mb_start_page = mboot_addr / PAGE_SIZE;
     u64 mb_end_page   = (mboot_addr + mb_total_size + PAGE_SIZE - 1) / PAGE_SIZE;
     for (u64 p = mb_start_page; p < mb_end_page; p++) {
-        bitmap_set(p);
+        BitmapSet(p);
     }
 
     /* Step 9b: Mark the framebuffer physical range as used.
@@ -338,7 +378,7 @@ void pmm_init(u64 mboot_addr, u64 kernel_end) {
      * framebuffer, corrupting the display.
      *
      * Parse the framebuffer tag (type 8) here and reserve its physical
-     * range so no allocation can touch it.  fb_init() runs later, but
+     * range so no allocation can touch it.  FbInit() runs later, but
      * the tag is already in the multiboot2 info structure. */
     {
         mboot2_tag_t *fb_tag = mboot2_find_tag(mboot_addr, 8);
@@ -361,15 +401,15 @@ void pmm_init(u64 mboot_addr, u64 kernel_end) {
                     if (fb_end_page > s_total_pages)
                         fb_end_page = s_total_pages;
                     for (u64 p = fb_start_page; p < fb_end_page; p++) {
-                        bitmap_set(p);
+                        BitmapSet(p);
                     }
-                    serial_printf("PMM: reserved framebuffer "
+                    SerialPrintf("PMM: reserved framebuffer "
                                   "phys=0x%x size=0x%x (%u pages)\n",
                                   (u32)fb_phys,
                                   (u32)fb_size,
                                   (u32)(fb_end_page - fb_start_page));
                 } else {
-                    serial_printf("PMM: framebuffer phys=0x%x above "
+                    SerialPrintf("PMM: framebuffer phys=0x%x above "
                                   "tracked range (no reservation "
                                   "needed)\n",
                                   (u32)fb_phys);
@@ -381,13 +421,13 @@ void pmm_init(u64 mboot_addr, u64 kernel_end) {
     /* Step 10: Count free pages */
     s_free_pages = 0;
     for (u64 i = 0; i < s_total_pages; i++) {
-        if (!bitmap_test(i)) {
+        if (!BitmapTest(i)) {
             s_free_pages++;
         }
     }
 
     u64 free_mb = (s_free_pages * PAGE_SIZE) / (1024 * 1024);
-    serial_printf("PMM: Free: 0x%x pages (%u MB)\n", s_free_pages, free_mb);
+    SerialPrintf("PMM: Free: 0x%x pages (%u MB)\n", s_free_pages, free_mb);
 
     /* Self-check: if the machine has memory above 4GB, verify the 1GB
      * huge-page mapping (added by boot.asm) actually works by probing
@@ -397,69 +437,69 @@ void pmm_init(u64 mboot_addr, u64 kernel_end) {
         volatile u64 *probe = (volatile u64 *)(0x100000000ULL + KERNEL_VIRT_BASE);
         *probe              = 0xCAFEBABECAFEBABEULL;
         if (*probe == 0xCAFEBABECAFEBABEULL)
-            serial_puts("PMM: >4GB phys mapping verified\n");
+            SerialPuts("PMM: >4GB phys mapping verified\n");
         else
-            serial_puts("PMM: WARNING - >4GB phys mapping broken!\n");
+            SerialPuts("PMM: WARNING - >4GB phys mapping broken!\n");
     }
 
-    serial_puts("PMM: Initialized\n");
+    SerialPuts("PMM: Initialized\n");
 }
 
-u64 pmm_alloc_page(void) {
-    u64 idx = bitmap_find_free(1);
+u64 PmmAllocPage(void) {
+    u64 idx = BitmapFindFree(1);
     if (idx == 0) {
         return 0;
     }
-    bitmap_set(idx);
+    BitmapSet(idx);
     s_free_pages--;
     return idx * PAGE_SIZE;
 }
 
-void pmm_free_page(u64 phys) {
+void PmmFreePage(u64 phys) {
     if (phys == 0 || phys >= s_mem_end) {
         return;
     }
     u64 idx = phys / PAGE_SIZE;
-    if (idx >= s_total_pages || !bitmap_test(idx)) {
+    if (idx >= s_total_pages || !BitmapTest(idx)) {
         return; /* Out of range or already free */
     }
-    bitmap_clear(idx);
+    BitmapClear(idx);
     s_free_pages++;
 }
 
-u64 pmm_alloc_pages(u64 count) {
+u64 PmmAllocPages(u64 count) {
     if (count == 0) {
         return 0;
     }
-    u64 idx = bitmap_find_free(count);
+    u64 idx = BitmapFindFree(count);
     if (idx == 0) {
         return 0;
     }
     for (u64 i = 0; i < count; i++) {
-        bitmap_set(idx + i);
+        BitmapSet(idx + i);
     }
     s_free_pages -= count;
     return idx * PAGE_SIZE;
 }
 
-void pmm_free_pages(u64 phys, u64 count) {
+void PmmFreePages(u64 phys, u64 count) {
     if (phys == 0 || count == 0) {
         return;
     }
     u64 start_idx = phys / PAGE_SIZE;
     for (u64 i = 0; i < count; i++) {
         u64 idx = start_idx + i;
-        if (idx < s_total_pages && bitmap_test(idx)) {
-            bitmap_clear(idx);
+        if (idx < s_total_pages && BitmapTest(idx)) {
+            BitmapClear(idx);
             s_free_pages++;
         }
     }
 }
 
-u64 pmm_get_total_memory(void) {
+u64 PmmGetTotalMemory(void) {
     return s_total_pages * PAGE_SIZE;
 }
 
-u64 pmm_get_free_memory(void) {
+u64 PmmGetFreeMemory(void) {
     return s_free_pages * PAGE_SIZE;
 }

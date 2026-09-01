@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * gdt.h - Global Descriptor Table management
  * Copyright (c) 2026 OpSys Project
  */
@@ -18,14 +31,14 @@
 /**
  * Initialize the GDT with kernel and user segments.
  */
-void gdt_init(void);
+void GdtInit(void);
 
 /**
  * Set the TSS RSP0 field (ring-0 stack pointer on privilege change).
  * Must be called before any INT 0x80 from ring 3.
  * @param rsp  Kernel stack pointer (virtual address, must be mapped).
  */
-void gdt_set_tss_rsp0(u64 rsp);
+void GdtSetTssRsp0(u64 rsp);
 
 /**
  * Set an IST (Interrupt Stack Table) entry in the TSS.
@@ -33,6 +46,6 @@ void gdt_set_tss_rsp0(u64 rsp);
  * @param ist_num  IST entry number (1-7).
  * @param stack    Stack top pointer (virtual address, must be mapped).
  */
-void gdt_set_tss_ist(int ist_num, u64 stack);
+void GdtSetTssIst(int ist_num, u64 stack);
 
 #endif /* KERNEL_GDT_H */

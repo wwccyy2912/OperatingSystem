@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * signal.h - POSIX-style signal delivery (mechanism only)
  * Copyright (c) 2026 OpSys Project
  *
@@ -95,7 +108,7 @@ typedef struct {
  * (SIGKILL) never returns from the checkpoint itself.
  */
 bool signal_check_syscall(u64 *frame);                 /* syscall_entry.S frame (SF_* layout) */
-bool signal_check_interrupt(interrupt_frame_t *frame); /* isr_common_stub frame */
+bool SignalCheckInterrupt(interrupt_frame_t *frame); /* isr_common_stub frame */
 
 /*
  * SYS_SIGRETURN implementation.  Restores the user context from the
@@ -104,16 +117,16 @@ bool signal_check_interrupt(interrupt_frame_t *frame); /* isr_common_stub frame 
  * the executing thread's kstack_top - 160).  Returns the restored
  * user RAX, or an error code (< 0) when the frame pointer is invalid.
  */
-i64 signal_restore(u64 frame_ptr);
+i64 SignalRestore(u64 frame_ptr);
 
 /*
  * Force-kill support: set force_exit (+exit_code) on every thread of
  * the target process and wake blocked ones (unlinking them from their
  * IPC/mutex wait structures first).  The delivery checkpoints
- * (signal_check_*) notice force_exit and call thread_exit() with the
+ * (signal_check_*) notice force_exit and call ThreadExit() with the
  * recorded exit code, so the whole process dies within one checkpoint
  * round.  exit_code is the process exit code (e.g. 128 + signum).
  */
-void signal_kill_process(process_t *proc, int exit_code);
+void SignalKillProcess(process_t *proc, int exit_code);
 
 #endif /* KERNEL_SIGNAL_H */

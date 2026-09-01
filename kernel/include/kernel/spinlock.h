@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * spinlock.h - Kernel spinlock (single-CPU cli/sti)
  * Copyright (c) 2026 OpSys Project
  *
@@ -27,14 +40,14 @@ typedef struct {
 
 #define SPINLOCK_INIT {.locked = false, .saved_rflags = 0}
 
-static inline void spin_lock(spinlock_t *l) {
+static inline void SpinLock(spinlock_t *l) {
     u64 rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags)::"memory");
     l->saved_rflags = rflags;
     l->locked       = true;
 }
 
-static inline void spin_unlock(spinlock_t *l) {
+static inline void SpinUnlock(spinlock_t *l) {
     l->locked = false;
     if (l->saved_rflags & 0x200) /* IF was set before cli */
         __asm__ volatile("sti" ::: "memory");

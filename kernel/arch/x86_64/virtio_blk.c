@@ -1,13 +1,26 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * virtio_blk.c - Legacy virtio-blk disk driver (Phase 1)
  * Copyright (c) 2026 OpSys Project
  *
  * Exposes three block-device syscalls backed by a legacy (pre-1.0)
  * virtio-blk PCI adapter (vendor 0x1AF4, device 0x1001):
  *
- *   SYS_BLK_READ  (62) — sc_sys_blk_read  (disk, lba, count, buf)
- *   SYS_BLK_WRITE (63) — sc_sys_blk_write (disk, lba, count, buf)
- *   SYS_BLK_INFO  (64) — sc_sys_blk_info  (disk, out blk_info_t)
+ *   SYS_BLK_READ  (62) — sc_sys_blk_read(disk, lba, count, buf)
+ *   SYS_BLK_WRITE (63) — sc_sys_blk_write(disk, lba, count, buf)
+ *   SYS_BLK_INFO  (64) — sc_sys_blk_info(disk, out blk_info_t)
  *
  * Every handler is gated on the calling process holding a
  * CAP_TYPE_PCI_DEV capability whose obj_id equals the disk argument
@@ -26,10 +39,31 @@
  * unchanged — until then).
  *
  * I/O model: polled completion on used.idx (no IRQ binding), the
- * whole DMA window runs under spin_lock() — the kernel's irq
+ * whole DMA window runs under SpinLock() — the kernel's irq
  * save/restore primitive (cli + saved-IF restore), which masks the
  * PIT tick; the missed tick fires late after the unlock.  A busy flag
  * serializes concurrent SYS_BLK_* calls (ERR_BUSY).
+ *
+ * ------------------------------------------------------------------
+ * Structure (virtio_blk):
+ *   SYS_BLK_* -> cap gate -> BlkLazyInit: PciFind + BlkScanDevice
+ *   (bus 0, BAR0 I/O) -> BlkNegotiate (STATUS/features/QUEUE_SEL/PN)
+ *   -> DRIVER_OK; virtqueue in direct map: desc | avail | used,
+ *   2-3 pages; bounce page [16B hdr | data | status].
+ * How it works:
+ *   BlkIoOne under SpinLock: 3-desc chain (hdr, data NEXT|WRITE,
+ *   status WRITE), avail.idx++, QUEUE_NOTIFY, poll used.idx (two
+ *   windows), verify status S_OK, copy out; BlkIoLoop chunks <= 7
+ *   sectors per op. No IRQ — INTx masked, ISR register unused.
+ * Purpose:
+ *   Back SYS_BLK_READ/WRITE/INFO with one legacy virtio-blk adapter
+ *   using only direct-map DMA (no kernel heap) and capability-gated
+ *   access mirroring the io-port gate.
+ * Caveats:
+ *   Queue is single-flight (s_busy -> ERR_BUSY); SpinLock masks the
+ *   PIT tick. Timeout resets the device and forces re-negotiation;
+ *   QUEUE_PFN must never be 0 (that resets the device).
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/blk.h>
@@ -164,8 +198,8 @@ static spinlock_t s_vq_lock = SPINLOCK_INIT;
  * below USER_PTR_MAX, and mapped (writable iff need_write) in the
  * calling process's address space — the kernel then dereferences it
  * directly under the caller's CR3 (the repo-wide convention). */
-static bool blk_validate_user_ptr(u64 ptr, u64 size, bool need_write) {
-    return vmm_validate_user_ptr(ptr, size, need_write);
+static bool BlkValidateUserPtr(u64 ptr, u64 size, bool need_write) {
+    return VmmValidateUserPtr(ptr, size, need_write);
 }
 
 /* Convenience: cast a validated user pointer */
@@ -175,13 +209,13 @@ static bool blk_validate_user_ptr(u64 ptr, u64 size, bool need_write) {
  * Read one 32-bit dword from PCI config space.  Used only to decode
  * BAR0 of the adapter found by the (already lazily triggered) pci.c
  * enumeration; the scan order below mirrors pci.c's exactly so the
- * returned index is the same table index pci_find() returns.
+ * returned index is the same table index PciFind() returns.
  */
-static u32 blk_pci_config_read(u32 bus, u32 dev, u32 func, u32 reg) {
+static u32 BlkPciConfigRead(u32 bus, u32 dev, u32 func, u32 reg) {
     u32 addr = PCI_CONFIG_ENABLE | ((bus & 0xFF) << 16) | ((dev & 0x1F) << 11) |
                ((func & 0x07) << 8) | (reg & 0xFC);
-    io_outl(PCI_CONFIG_ADDR, addr);
-    return io_inl(PCI_CONFIG_DATA);
+    IoOutl(PCI_CONFIG_ADDR, addr);
+    return IoInl(PCI_CONFIG_DATA);
 }
 
 /*
@@ -193,27 +227,27 @@ static u32 blk_pci_config_read(u32 bus, u32 dev, u32 func, u32 reg) {
  *   -1          no matching device
  *   -2          found, but BAR0 is not an I/O BAR
  */
-static int blk_scan_device(u16 *out_io_base) {
+static int BlkScanDevice(u16 *out_io_base) {
     u32 bus, dev, func;
     int index = 0;
 
     for (bus = 0; bus < 1; bus++) {
         for (dev = 0; dev < 32; dev++) {
-            u32 id0 = blk_pci_config_read(bus, dev, 0, 0x00);
+            u32 id0 = BlkPciConfigRead(bus, dev, 0, 0x00);
             if ((u16)(id0 & 0xFFFF) == PCI_INVALID_VENDOR)
                 continue;
 
             for (func = 0; func < 8; func++) {
                 if (func > 0) {
-                    u32 fid = blk_pci_config_read(bus, dev, func, 0x00);
+                    u32 fid = BlkPciConfigRead(bus, dev, func, 0x00);
                     if ((u16)(fid & 0xFFFF) == PCI_INVALID_VENDOR)
                         continue;
                 }
 
-                u32 id = blk_pci_config_read(bus, dev, func, 0x00);
+                u32 id = BlkPciConfigRead(bus, dev, func, 0x00);
                 if ((u16)(id & 0xFFFF) == VIRTIO_VENDOR_ID &&
                     (u16)(id >> 16) == VIRTIO_DEV_ID_BLK) {
-                    u32 bar0 = blk_pci_config_read(bus, dev, func, 0x10);
+                    u32 bar0 = BlkPciConfigRead(bus, dev, func, 0x10);
                     if ((bar0 & 1u) == 0)
                         return -2;
                     *out_io_base = (u16)(bar0 & ~0x3u);
@@ -225,14 +259,14 @@ static int blk_scan_device(u16 *out_io_base) {
                      * unbinds its IRQ.  Mask our own line: polling never
                      * needs it. */
                     {
-                        u32 il = blk_pci_config_read(bus, dev, func, 0x3C);
+                        u32 il = BlkPciConfigRead(bus, dev, func, 0x3C);
                         u8  irq = (u8)(il & 0xFF);
                         if (irq < 16)
-                            irq_disable(irq); /* PIC mask */
-                        serial_puts("blk: masking virtio INTx irq=");
-                        serial_putchar('0' + irq / 10);
-                        serial_putchar('0' + irq % 10);
-                        serial_puts("\n");
+                            IrqDisable(irq); /* PIC mask */
+                        SerialPuts("blk: masking virtio INTx irq=");
+                        SerialPutchar('0' + irq / 10);
+                        SerialPutchar('0' + irq % 10);
+                        SerialPuts("\n");
                     }
                     return index;
                 }
@@ -246,9 +280,9 @@ static int blk_scan_device(u16 *out_io_base) {
 /* Reset the device: STATUS = 0, then wait one I/O cycle so the device
  * observes the reset before the next status write (virtio requires at
  * least one device read between status writes on real hardware). */
-static void blk_virtio_reset(u16 io_base) {
-    io_outb(io_base + VIRTIO_PCI_STATUS, 0);
-    io_delay();
+static void BlkVirtioReset(u16 io_base) {
+    IoOutb(io_base + VIRTIO_PCI_STATUS, 0);
+    IoDelay();
 }
 
 /*
@@ -261,33 +295,33 @@ static void blk_virtio_reset(u16 io_base) {
  *   device) -> |=DRIVER_OK.  DEVICE_CONFIG is only readable after
  *   DRIVER_OK; capacity (u64 sectors) is its first 8 bytes.
  */
-static error_t blk_negotiate(u16 io_base, u64 vq_phys, u16 *out_num, u64 *out_capacity) {
+static error_t BlkNegotiate(u16 io_base, u64 vq_phys, u16 *out_num, u64 *out_capacity) {
     if (vq_phys == 0 || (vq_phys & (PAGE_SIZE - 1)) != 0)
         return ERR_INVAL;
 
-    blk_virtio_reset(io_base);
+    BlkVirtioReset(io_base);
 
-    io_outb(io_base + VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
-    io_delay();
-    io_outb(io_base + VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
-    io_delay();
+    IoOutb(io_base + VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
+    IoDelay();
+    IoOutb(io_base + VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+    IoDelay();
 
-    (void)io_inl(io_base + VIRTIO_PCI_HOST_FEATURES); /* ignore */
-    io_outl(io_base + VIRTIO_PCI_GUEST_FEATURES, 0);  /* QEMU masks */
+    (void)IoInl(io_base + VIRTIO_PCI_HOST_FEATURES); /* ignore */
+    IoOutl(io_base + VIRTIO_PCI_GUEST_FEATURES, 0);  /* QEMU masks */
 
-    io_outw(io_base + VIRTIO_PCI_QUEUE_SEL, 0);
-    u16 num = io_inw(io_base + VIRTIO_PCI_QUEUE_NUM);
+    IoOutw(io_base + VIRTIO_PCI_QUEUE_SEL, 0);
+    u16 num = IoInw(io_base + VIRTIO_PCI_QUEUE_NUM);
     if (num < 2 || num > VQ_MAX_NUM)
         return ERR_INVAL;
 
-    io_outl(io_base + VIRTIO_PCI_QUEUE_PFN, (u32)(vq_phys >> 12));
+    IoOutl(io_base + VIRTIO_PCI_QUEUE_PFN, (u32)(vq_phys >> 12));
 
-    io_outb(io_base + VIRTIO_PCI_STATUS,
+    IoOutb(io_base + VIRTIO_PCI_STATUS,
             VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);
-    io_delay();
+    IoDelay();
 
-    u32 lo        = io_inl(io_base + VIRTIO_PCI_DEVICE_CONFIG);
-    u32 hi        = io_inl(io_base + VIRTIO_PCI_DEVICE_CONFIG + 4);
+    u32 lo        = IoInl(io_base + VIRTIO_PCI_DEVICE_CONFIG);
+    u32 hi        = IoInl(io_base + VIRTIO_PCI_DEVICE_CONFIG + 4);
     *out_capacity = ((u64)hi << 32) | lo;
     *out_num      = num;
     return OK;
@@ -299,25 +333,25 @@ static error_t blk_negotiate(u16 io_base, u64 vq_phys, u16 *out_num, u64 *out_ca
  * call; on failure the device is left reset and a later call retries
  * (reusing s_vq_phys if it was already allocated — no leak).
  */
-static error_t blk_lazy_init(void) {
+static error_t BlkLazyInit(void) {
     if (s_initialized)
         return OK;
 
-    /* pci_find() triggers pci.c's lazy bus scan and gives the
+    /* PciFind() triggers pci.c's lazy bus scan and gives the
      * authoritative table index (what capability obj_ids name). */
-    int idx = pci_find(VIRTIO_VENDOR_ID, VIRTIO_DEV_ID_BLK);
+    int idx = PciFind(VIRTIO_VENDOR_ID, VIRTIO_DEV_ID_BLK);
     if (idx < 0)
         return ERR_NOENT;
 
     u16 io_base = 0;
-    if (blk_scan_device(&io_base) != idx)
+    if (BlkScanDevice(&io_base) != idx)
         return ERR_NOENT; /* config-space view disagrees with pci.c */
 
     if (s_vq_phys == 0) {
         /* Allocate for the largest accepted queue size so the ring
          * layout never depends on the QUEUE_NUM read timing (the size
          * is device-dictated; 256 slots need 3 contiguous pages). */
-        s_vq_phys = pmm_alloc_pages(VQ_PAGES(VQ_MAX_NUM));
+        s_vq_phys = PmmAllocPages(VQ_PAGES(VQ_MAX_NUM));
         if (s_vq_phys == 0)
             return ERR_NOMEM;
     }
@@ -325,9 +359,9 @@ static error_t blk_lazy_init(void) {
 
     u16     num      = 0;
     u64     capacity = 0;
-    error_t err      = blk_negotiate(io_base, s_vq_phys, &num, &capacity);
+    error_t err      = BlkNegotiate(io_base, s_vq_phys, &num, &capacity);
     if (err != OK) {
-        blk_virtio_reset(io_base); /* leave the device clean */
+        BlkVirtioReset(io_base); /* leave the device clean */
         return err;
     }
 
@@ -338,7 +372,7 @@ static error_t blk_lazy_init(void) {
     s_last_used    = 0;
     s_initialized  = true;
 
-    serial_printf("blk: virtio-blk pci[%d] io=0x%x vq=%u slots=%u sectors=%u\n",
+    SerialPrintf("blk: virtio-blk pci[%d] io=0x%x vq=%u slots=%u sectors=%u\n",
                   idx,
                   (unsigned)io_base,
                   (unsigned)num,
@@ -348,8 +382,8 @@ static error_t blk_lazy_init(void) {
 }
 
 /* Ensure the driver is up AND the disk argument names this adapter. */
-static error_t blk_ensure_disk(u64 disk) {
-    error_t err = blk_lazy_init();
+static error_t BlkEnsureDisk(u64 disk) {
+    error_t err = BlkLazyInit();
     if (err != OK)
         return err;
     if (disk != (u64)s_device_index)
@@ -372,7 +406,7 @@ static error_t blk_ensure_disk(u64 disk) {
  * PIT tick landing mid-DMA would preempt into another thread sharing
  * the queue.  The bounce page is per-op so copies happen outside.
  */
-static error_t blk_io_one(u64 disk, bool is_write, u64 sector, u32 nsectors, void *user_buf) {
+static error_t BlkIoOne(u64 disk, bool is_write, u64 sector, u32 nsectors, void *user_buf) {
     if (disk != (u64)s_device_index)
         return ERR_INVAL;
 
@@ -380,7 +414,7 @@ static error_t blk_io_one(u64 disk, bool is_write, u64 sector, u32 nsectors, voi
         return ERR_BUSY;
     s_busy = true;
 
-    u64 bounce_phys = pmm_alloc_page();
+    u64 bounce_phys = PmmAllocPage();
     if (bounce_phys == 0) {
         s_busy = false;
         return ERR_NOMEM;
@@ -400,7 +434,7 @@ static error_t blk_io_one(u64 disk, bool is_write, u64 sector, u32 nsectors, voi
     vq_avail_t *avail = (vq_avail_t *)((u8 *)desc + VQ_AVAIL_OFF(s_queue_num));
     vq_used_t  *used  = (vq_used_t *)((u8 *)desc + VQ_USED_OFF(s_queue_num));
 
-    spin_lock(&s_vq_lock); /* cli + saved-IF restore (PIT masked) */
+    SpinLock(&s_vq_lock); /* cli + saved-IF restore (PIT masked) */
 
     desc[0].addr  = bounce_phys;
     desc[0].len   = BLK_HEADER_SIZE;
@@ -425,7 +459,7 @@ static error_t blk_io_one(u64 disk, bool is_write, u64 sector, u32 nsectors, voi
     avail->idx = avail_idx + 1;
     __asm__ volatile("" ::: "memory"); /* idx visible before notify */
 
-    io_outw(s_io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
+    IoOutw(s_io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
     /* Bounded poll with a retry window: QEMU completes a 7-sector
      * request in microseconds, but a host-scheduling spike (e.g. the
@@ -447,16 +481,16 @@ static error_t blk_io_one(u64 disk, bool is_write, u64 sector, u32 nsectors, voi
                  * a second, longer window before declaring a timeout. */
                 limit = VQ_POLL_LIMIT_RETRY;
                 spins = 0;
-                serial_puts("blk: I/O slow (retry window)\n");
-                io_outw(s_io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
+                SerialPuts("blk: I/O slow (retry window)\n");
+                IoOutw(s_io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
                 continue;
             }
             /* Both windows expired: the device is wedged. */
-            spin_unlock(&s_vq_lock);
-            blk_virtio_reset(s_io_base);
+            SpinUnlock(&s_vq_lock);
+            BlkVirtioReset(s_io_base);
             s_initialized = false; /* re-negotiate on the next call */
-            serial_puts("blk: I/O timeout, device reset\n");
-            pmm_free_page(bounce_phys);
+            SerialPuts("blk: I/O timeout, device reset\n");
+            PmmFreePage(bounce_phys);
             s_busy = false;
             return ERR_AGAIN;
         }
@@ -471,11 +505,11 @@ static error_t blk_io_one(u64 disk, bool is_write, u64 sector, u32 nsectors, voi
     u8   status = bounce[BLK_HEADER_SIZE + data_len];
     bool ok     = (used->ring[(used_idx - 1) % s_queue_num].id == 0) && (status == VIRTIO_BLK_S_OK);
 
-    spin_unlock(&s_vq_lock);
+    SpinUnlock(&s_vq_lock);
 
     if (!ok) {
-        serial_printf("blk: device status=%u\n", (unsigned)status);
-        pmm_free_page(bounce_phys);
+        SerialPrintf("blk: device status=%u\n", (unsigned)status);
+        PmmFreePage(bounce_phys);
         s_busy = false;
         return ERR_FAULT;
     }
@@ -483,20 +517,20 @@ static error_t blk_io_one(u64 disk, bool is_write, u64 sector, u32 nsectors, voi
     if (!is_write)
         memcpy(user_buf, bounce + BLK_HEADER_SIZE, data_len);
 
-    pmm_free_page(bounce_phys);
+    PmmFreePage(bounce_phys);
     s_busy = false;
     return OK;
 }
 
 /* Split a multi-sector request into <= BLK_MAX_SECTORS (7) chunks. */
-static error_t blk_io_loop(u64 disk, bool is_write, u64 lba, u64 count, void *user_buf) {
+static error_t BlkIoLoop(u64 disk, bool is_write, u64 lba, u64 count, void *user_buf) {
     u64 remaining = count;
     u64 cur       = lba;
     u8 *p         = (u8 *)user_buf;
 
     while (remaining > 0) {
         u32     n   = (remaining > BLK_MAX_SECTORS) ? BLK_MAX_SECTORS : (u32)remaining;
-        error_t err = blk_io_one(disk, is_write, cur, n, p);
+        error_t err = BlkIoOne(disk, is_write, cur, n, p);
         if (err != OK)
             return err;
         remaining -= n;
@@ -507,13 +541,13 @@ static error_t blk_io_loop(u64 disk, bool is_write, u64 lba, u64 count, void *us
 }
 
 /*
- * Gate: mirror proc_has_io_port_cap (syscall.c) — the calling process
+ * Gate: mirror ProcHasIoPortCap(syscall.c) — the calling process
  * must hold a CAP_TYPE_PCI_DEV capability naming PCI table index
  * `obj_id` with both RIGHT_READ and RIGHT_WRITE.  Returns false when
  * no cap matches; handlers then return ERR_NOCAP (the exact error the
  * I/O-port gate returns).
  */
-static bool proc_has_pci_dev_cap(u64 obj_id) {
+static bool ProcHasPciDevCap(u64 obj_id) {
     process_t *proc = process_current();
     if (!proc || !proc->cap_table)
         return false;
@@ -524,7 +558,7 @@ static bool proc_has_pci_dev_cap(u64 obj_id) {
          * syscall.c): an expired PCI_DEV cap must not grant access. */
         if (e->type == CAP_TYPE_NONE)
             continue;
-        if (e->expiry_ticks != 0 && e->expiry_ticks <= sched_get_ticks())
+        if (e->expiry_ticks != 0 && e->expiry_ticks <= SchedGetTicks())
             continue;
         if (e->type == CAP_TYPE_PCI_DEV && e->obj_id == obj_id &&
             (e->rights & (RIGHT_READ | RIGHT_WRITE)) == (RIGHT_READ | RIGHT_WRITE))
@@ -553,21 +587,21 @@ i64 sc_sys_blk_read(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     (void)a5;
     u64 disk = a1, lba = a2, count = a3, buf = a4;
 
-    if (!proc_has_pci_dev_cap(disk))
+    if (!ProcHasPciDevCap(disk))
         return (i64)ERR_NOCAP;
     if (count == 0)
         return (i64)ERR_INVAL;
 
-    error_t err = blk_ensure_disk(disk);
+    error_t err = BlkEnsureDisk(disk);
     if (err != OK)
         return (i64)err;
     if (lba > s_capacity || count > s_capacity - lba)
         return (i64)ERR_INVAL;
 
-    if (!blk_validate_user_ptr(buf, count * VIRTIO_BLK_SECTOR_SIZE, true))
+    if (!BlkValidateUserPtr(buf, count * VIRTIO_BLK_SECTOR_SIZE, true))
         return (i64)ERR_FAULT; /* kernel writes buf */
 
-    err = blk_io_loop(disk, false, lba, count, USER_PTR(buf));
+    err = BlkIoLoop(disk, false, lba, count, USER_PTR(buf));
     return (i64)err;
 }
 
@@ -580,21 +614,21 @@ i64 sc_sys_blk_write(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     (void)a5;
     u64 disk = a1, lba = a2, count = a3, buf = a4;
 
-    if (!proc_has_pci_dev_cap(disk))
+    if (!ProcHasPciDevCap(disk))
         return (i64)ERR_NOCAP;
     if (count == 0)
         return (i64)ERR_INVAL;
 
-    error_t err = blk_ensure_disk(disk);
+    error_t err = BlkEnsureDisk(disk);
     if (err != OK)
         return (i64)err;
     if (lba > s_capacity || count > s_capacity - lba)
         return (i64)ERR_INVAL;
 
-    if (!blk_validate_user_ptr(buf, count * VIRTIO_BLK_SECTOR_SIZE, false))
+    if (!BlkValidateUserPtr(buf, count * VIRTIO_BLK_SECTOR_SIZE, false))
         return (i64)ERR_FAULT; /* kernel reads buf */
 
-    err = blk_io_loop(disk, true, lba, count, USER_PTR(buf));
+    err = BlkIoLoop(disk, true, lba, count, USER_PTR(buf));
     return (i64)err;
 }
 
@@ -609,14 +643,14 @@ i64 sc_sys_blk_info(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     (void)a5;
     u64 disk = a1, out = a2;
 
-    if (!proc_has_pci_dev_cap(disk))
+    if (!ProcHasPciDevCap(disk))
         return (i64)ERR_NOCAP;
 
-    error_t err = blk_ensure_disk(disk);
+    error_t err = BlkEnsureDisk(disk);
     if (err != OK)
         return (i64)err;
 
-    if (!blk_validate_user_ptr(out, sizeof(blk_info_t), true))
+    if (!BlkValidateUserPtr(out, sizeof(blk_info_t), true))
         return (i64)ERR_FAULT; /* kernel writes out */
 
     blk_info_t info;

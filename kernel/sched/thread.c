@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * thread.c - Thread creation and management
  * Copyright (c) 2026 OpSys Project
  *
@@ -6,7 +19,38 @@
  * free list provides O(1) allocation.  Each new kernel thread gets
  * an 8-page (32 KiB) kernel stack allocated from the PMM.  The
  * initial stack frame is laid out so that the first context_switch
- * into the thread will pop straight into thread_trampoline().
+ * into the thread will pop straight into ThreadTrampoline().
+ *
+ * ------------------------------------------------------------------
+ * Structure (thread):
+ *   s_thread_table[MAX_THREADS] -- static table indexed by TID
+ *     +-- s_free_list: free slots (O(1) alloc; tid 0 = idle excluded)
+ *   per thread:
+ *     +-- kernel stack: 8 pages (32 KiB) from PMM; initial frame at
+ *     |   kstack_top: rbx..r15, rflags=0x200, rip=ThreadTrampoline
+ *     +-- user threads: per-TID user stack at as->stack_base + tid*...
+ *     `-- entry/arg kept in s_start_entry[]/s_start_arg[]; trampoline:
+ *         entry(arg) in ring 0, or IRETQ (CS=0x1B) into ring 3
+ * How it works:
+ *   ThreadCreateKernel()/ThreadCreateUser() take a slot, lay out the
+ *   stack + fake context (rip/rflags also stored in the TCB), record
+ *   the real entry/arg, then SchedEnqueue().  The first context_switch
+ *   lands in ThreadTrampoline(), which calls entry(arg) directly or
+ *   IRETQes a ring-3 frame (SS=0x23, RSP=top-8, RFLAGS=0x202).
+ *   ThreadExit() marks FINISHED, wakes the joiner, does process
+ *   bookkeeping and reschedules; a reaper (ThreadRelease/FreeThread)
+ *   later frees both stacks and recycles the slot.
+ * Purpose:
+ *   Uniform O(1) thread-slot allocation and one creation path for
+ *   kernel and user threads, with per-thread TCB and stacks.
+ * Caveats:
+ *   - context_switch restores RIP/RFLAGS from the TCB fields, NOT the
+ *     stack frame; SetupThreadStack() must set both.
+ *   - Recycled slots are fully re-zeroed by alloc_thread(): a stale
+ *     force_exit would kill the new thread at its first checkpoint.
+ *   - ThreadRelease() refuses to free the current thread's own stack
+ *     and only recycles THREAD_STATE_FINISHED slots.
+ * ------------------------------------------------------------------
  */
 
 #include <kernel/thread.h>
@@ -51,7 +95,7 @@ static void *s_start_arg[MAX_THREADS];
  * NOTE: this function takes NO arguments via registers; everything
  *       is looked up through sched_get_current().
  */
-static void thread_trampoline(void) {
+static void ThreadTrampoline(void) {
     thread_t *t = sched_get_current();
     if (!t)
         return;
@@ -102,7 +146,7 @@ static void thread_trampoline(void) {
     entry(arg);
 
     /* If the entry returns, exit the thread */
-    thread_exit(0);
+    ThreadExit(0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -113,7 +157,7 @@ static void thread_trampoline(void) {
  * The idle thread runs at the lowest priority and simply halts the
  * CPU until the next interrupt arrives.
  */
-static void idle_thread_func(void *arg) {
+static void IdleThreadFunc(void *arg) {
     (void)arg;
     for (;;) {
         __asm__ volatile("sti; hlt");
@@ -128,7 +172,7 @@ static void idle_thread_func(void *arg) {
  * Build the free list from indices 1 .. MAX_THREADS-1.
  * Index 0 is reserved for the idle thread and is NOT on the free list.
  */
-static void init_free_list(void) {
+static void InitFreeList(void) {
     s_free_list = NULL;
     for (int i = MAX_THREADS - 1; i >= 1; i--) {
         s_thread_table[i].next = s_free_list;
@@ -182,35 +226,35 @@ static thread_t *alloc_thread(void) {
     t->user_rsp         = 0;
     t->user_stack_phys  = 0;
     t->vruntime         = 0;
-    rb_init_node(&t->rb);
+    RbInitNode(&t->rb);
 
     /* TID = index in the static table */
     t->tid = (tid_t)(t - s_thread_table);
 
     /* Seed the FPU/SSE slot to x86 defaults (fresh AND recycled
      * slots): fpu_switch's fxrstor must always see valid state. */
-    fpu_state_init(t->tid);
+    FpuStateInit(t->tid);
 
     return t;
 }
 
 /* Forward declaration — defined below. */
-static void free_thread(thread_t *t);
+static void FreeThread(thread_t *t);
 
 /*
  * Release a FINISHED thread's slot back to the free list.  Public
- * wrapper around free_thread() for reapers (thread_join, process_reap)
+ * wrapper around FreeThread() for reapers (thread_join, ProcessReap)
  * that run in a different thread's context.  Guards against releasing
  * the current thread (would free the stack we run on), NULL, and
  * slots that are still live (RUNNING/BLOCKED) — those must never be
  * recycled.
  */
-void thread_release(thread_t *t) {
+void ThreadRelease(thread_t *t) {
     if (!t || t == thread_current())
         return;
     if (t->state != THREAD_STATE_FINISHED)
         return;
-    free_thread(t);
+    FreeThread(t);
 }
 
 /* ------------------------------------------------------------------ */
@@ -218,7 +262,7 @@ void thread_release(thread_t *t) {
 /*
  * Return a thread_t to the free list.
  */
-static void free_thread(thread_t *t) {
+static void FreeThread(thread_t *t) {
     if (!t)
         return;
 
@@ -229,26 +273,26 @@ static void free_thread(thread_t *t) {
      * so convert it back to physical for pmm_free_pages.
      */
     if (t->kstack_base) {
-        pmm_free_pages(t->kstack_base - KERNEL_VIRT_BASE, KSTACK_PAGES);
+        PmmFreePages(t->kstack_base - KERNEL_VIRT_BASE, KSTACK_PAGES);
         t->kstack_base = 0;
         t->kstack_top  = 0;
     }
 
     /*
      * Release the per-thread user-stack mapping.  The page was mapped
-     * at as->stack_base + tid * PAGE_SIZE by thread_create_user(); if
+     * at as->stack_base + tid * PAGE_SIZE by ThreadCreateUser(); if
      * it is left in place, a recycled TID re-maps the same virtual
-     * address and vmm_map() refuses with ERR_BUSY (stale PTE).  Unmap
+     * address and VmmMap() refuses with ERR_BUSY (stale PTE).  Unmap
      * it and hand the physical page back to the PMM.  Kernel threads
      * and threads that never reached the mapping (setup failed before
      * vmm_map) have user_stack_phys == 0 and are skipped.
      */
     if (t->user_stack_phys) {
         if (t->user_rsp && t->addr_space)
-            vmm_unmap_range(t->addr_space,
+            VmmUnmapRange(t->addr_space,
                             t->user_rsp - (u64)USER_STACK_PAGES * PAGE_SIZE,
                             USER_STACK_PAGES);
-        pmm_free_pages(t->user_stack_phys, USER_STACK_PAGES);
+        PmmFreePages(t->user_stack_phys, USER_STACK_PAGES);
         t->user_stack_phys = 0;
         t->user_rsp        = 0;
     }
@@ -285,9 +329,9 @@ static void free_thread(thread_t *t) {
  *
  * rsp is set to kstack_top - 64.
  */
-static int setup_thread_stack(thread_t *t, void (*entry)(void *), void *arg) {
+static int SetupThreadStack(thread_t *t, void (*entry)(void *), void *arg) {
     /* Allocate physical pages for the kernel stack */
-    u64 stack_phys = pmm_alloc_pages(KSTACK_PAGES);
+    u64 stack_phys = PmmAllocPages(KSTACK_PAGES);
     if (!stack_phys)
         return ERR_NOMEM;
 
@@ -308,7 +352,7 @@ static int setup_thread_stack(thread_t *t, void (*entry)(void *), void *arg) {
     *(--sp) = 0;                      /* r14  */
     *(--sp) = 0;                      /* r15  */
     *(--sp) = 0x200;                  /* rflags (IF set) */
-    *(--sp) = (u64)thread_trampoline; /* rip  */
+    *(--sp) = (u64)ThreadTrampoline; /* rip  */
 
     t->rsp = (u64)sp;
 
@@ -318,7 +362,7 @@ static int setup_thread_stack(thread_t *t, void (*entry)(void *), void *arg) {
      * is only consumed if context_switch restored from the stack (which
      * it doesn't).  So we must also set these fields here.
      */
-    t->rip    = (u64)thread_trampoline;
+    t->rip    = (u64)ThreadTrampoline;
     t->rflags = 0x200; /* IF enabled */
 
     /* Record the real entry point for the trampoline */
@@ -332,12 +376,12 @@ static int setup_thread_stack(thread_t *t, void (*entry)(void *), void *arg) {
 /*  PUBLIC API                                                         */
 /* ================================================================== */
 
-void thread_init(void) {
+void ThreadInit(void) {
     /*
      * Step 1-2: Initialise table and free list.
      * Index 0 is excluded from the free list (reserved for idle).
      */
-    init_free_list();
+    InitFreeList();
 
     /* Step 3: Create the idle thread at TID 0 (manually). */
     thread_t *idle = &s_thread_table[0];
@@ -348,20 +392,20 @@ void thread_init(void) {
     idle->priority   = 0;
     idle->affinity   = -1; /* any CPU */
     idle->addr_space = vmm_get_kernel_addr_space();
-    fpu_state_init(0);     /* idle's FPU slot: valid for fxrstor */
+    FpuStateInit(0);     /* idle's FPU slot: valid for fxrstor */
 
-    if (setup_thread_stack(idle, idle_thread_func, NULL) != OK) {
+    if (SetupThreadStack(idle, IdleThreadFunc, NULL) != OK) {
         panic("thread: cannot allocate idle stack");
     }
 
     /* Step 4: Make idle the current thread for CPU 0. */
-    /* Note: sched_init() is called by kernel_main before thread_init() */
-    sched_switch_to(idle);
+    /* Note: SchedInit() is called by kernel_main before ThreadInit() */
+    SchedSwitchTo(idle);
 }
 
 /* ------------------------------------------------------------------ */
 
-tid_t thread_create_kernel(void (*entry)(void *), void *arg, int priority) {
+tid_t ThreadCreateKernel(void (*entry)(void *), void *arg, int priority) {
     thread_t *t = alloc_thread();
     if (!t)
         return ERR_NOMEM;
@@ -372,19 +416,19 @@ tid_t thread_create_kernel(void (*entry)(void *), void *arg, int priority) {
     t->affinity   = -1;
     t->addr_space = vmm_get_kernel_addr_space();
 
-    int rc = setup_thread_stack(t, entry, arg);
+    int rc = SetupThreadStack(t, entry, arg);
     if (rc != OK) {
-        free_thread(t);
+        FreeThread(t);
         return rc;
     }
 
-    sched_enqueue(t);
+    SchedEnqueue(t);
     return t->tid;
 }
 
 /* ------------------------------------------------------------------ */
 
-tid_t thread_create_user(u64 entry, u64 arg, addr_space_t *as, int priority) {
+tid_t ThreadCreateUser(u64 entry, u64 arg, addr_space_t *as, int priority) {
     thread_t *t = alloc_thread();
     if (!t)
         return ERR_NOMEM;
@@ -403,39 +447,39 @@ tid_t thread_create_user(u64 entry, u64 arg, addr_space_t *as, int priority) {
      * guarantees threads of one process never collide.  Top of stack
      * (RSP starts here, grows downward).
      */
-    u64 user_stack_phys = pmm_alloc_pages(USER_STACK_PAGES);
+    u64 user_stack_phys = PmmAllocPages(USER_STACK_PAGES);
     if (!user_stack_phys) {
-        free_thread(t);
+        FreeThread(t);
         return ERR_NOMEM;
     }
     t->user_stack_phys      = user_stack_phys;
     u64     user_stack_virt =
         as->stack_base + (u64)t->tid * USER_STACK_PAGES * PAGE_SIZE;
-    error_t err             = vmm_map_range(as,
+    error_t err             = VmmMapRange(as,
                                             user_stack_virt,
                                             user_stack_phys,
                                             USER_STACK_PAGES,
                                             PTE_PRESENT | PTE_WRITABLE | PTE_USER |
                                                 PTE_NO_EXECUTE);
     if (err != OK) {
-        free_thread(t);
+        FreeThread(t);
         return err;
     }
     t->user_rsp = user_stack_virt + (u64)USER_STACK_PAGES * PAGE_SIZE; /* top */
 
-    int rc = setup_thread_stack(t, (void (*)(void *))entry, (void *)(uptr)arg);
+    int rc = SetupThreadStack(t, (void (*)(void *))entry, (void *)(uptr)arg);
     if (rc != OK) {
-        free_thread(t);
+        FreeThread(t);
         return rc;
     }
 
-    sched_enqueue(t);
+    SchedEnqueue(t);
     return t->tid;
 }
 
 /* ------------------------------------------------------------------ */
 
-void thread_exit(int code) {
+void ThreadExit(int code) {
     thread_t *cur = thread_current();
     if (!cur)
         return;
@@ -443,10 +487,10 @@ void thread_exit(int code) {
     /*
      * Hand every mutex this thread still holds to the next waiter (or
      * free it).  Must happen while we are still RUNNING: the waiters
-     * get woken via sched_enqueue(), which is safe because the running
+     * get woken via SchedEnqueue(), which is safe because the running
      * thread is never in the CFS tree.
      */
-    mutex_release_all(cur);
+    MutexReleaseAll(cur);
 
     cur->exit_code = code;
     cur->state     = THREAD_STATE_FINISHED;
@@ -456,7 +500,7 @@ void thread_exit(int code) {
         thread_t *joiner = thread_get(cur->joiner_tid);
         if (joiner && joiner->state == THREAD_STATE_BLOCKED) {
             joiner->state = THREAD_STATE_READY;
-            sched_enqueue(joiner);
+            SchedEnqueue(joiner);
         }
         cur->joiner_tid = -1;
     }
@@ -467,14 +511,14 @@ void thread_exit(int code) {
     if (cur->pid > 0) {
         process_t *proc = process_get(cur->pid);
         if (proc)
-            process_thread_exited(proc, code);
+            ProcessThreadExited(proc, code);
     }
 
     /* Remove from the scheduler if it was queued */
-    sched_dequeue(cur);
+    SchedDequeue(cur);
 
     /* Give up the CPU — this must never return */
-    sched_reschedule();
+    SchedReschedule();
 
     /* Should be unreachable — sched_reschedule never returns for FINISHED threads */
     panic("thread: sched_reschedule returned for FINISHED thread TID=%d", cur->tid);
@@ -482,8 +526,8 @@ void thread_exit(int code) {
 
 /* ------------------------------------------------------------------ */
 
-void thread_yield(void) {
-    sched_reschedule();
+void ThreadYield(void) {
+    SchedReschedule();
 }
 
 /* ------------------------------------------------------------------ */
@@ -511,7 +555,7 @@ thread_t *thread_get(tid_t tid) {
 
 /* ------------------------------------------------------------------ */
 
-error_t thread_set_affinity(tid_t tid, i32 cpu) {
+error_t ThreadSetAffinity(tid_t tid, i32 cpu) {
     thread_t *t = thread_get(tid);
     if (!t)
         return ERR_INVAL;

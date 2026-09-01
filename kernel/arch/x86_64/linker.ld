@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 /* =============================================================================
  * linker.ld - Kernel linker script for x86_64 higher-half kernel
  * Copyright (c) 2026 OpSys Project

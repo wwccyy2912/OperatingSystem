@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * complex.h - Complex arithmetic (C11 §7.3)
  * Copyright (c) 2026 OpSys Project
  *
@@ -49,107 +62,107 @@
  * ==================================================================== */
 
 /* Trigonometric (§7.3.5) */
-double complex cacos(double complex z);
-double complex casin(double complex z);
-double complex catan(double complex z);
-double complex ccos(double complex z);
-double complex csin(double complex z);
-double complex ctan(double complex z);
+double complex Cacos(double complex z);
+double complex Casin(double complex z);
+double complex Catan(double complex z);
+double complex Ccos(double complex z);
+double complex Csin(double complex z);
+double complex Ctan(double complex z);
 
 /* Hyperbolic (§7.3.6) */
-double complex cacosh(double complex z);
-double complex casinh(double complex z);
-double complex catanh(double complex z);
-double complex ccosh(double complex z);
-double complex csinh(double complex z);
-double complex ctanh(double complex z);
+double complex Cacosh(double complex z);
+double complex Casinh(double complex z);
+double complex Catanh(double complex z);
+double complex Ccosh(double complex z);
+double complex Csinh(double complex z);
+double complex Ctanh(double complex z);
 
 /* Exponential and logarithmic (§7.3.7) */
-double complex cexp(double complex z);
-double complex clog(double complex z);
+double complex Cexp(double complex z);
+double complex Clog(double complex z);
 
 /* Power and absolute value (§7.3.8) */
-double         cabs(double complex z);
-double complex cpow(double complex x, double complex z);
-double complex csqrt(double complex z);
+double         Cabs(double complex z);
+double complex Cpow(double complex x, double complex z);
+double complex Csqrt(double complex z);
 
 /* Manipulation (§7.3.9) — these return real or complex results. */
-double         carg(double complex z);
-double         cimag(double complex z);
-double complex conj(double complex z);
-double complex cproj(double complex z);
-double         creal(double complex z);
+double         Carg(double complex z);
+double         Cimag(double complex z);
+double complex Conj(double complex z);
+double complex Cproj(double complex z);
+double         Creal(double complex z);
 
 /* ====================================================================
  * Functions — float complex
  * ==================================================================== */
 
 /* Trigonometric */
-float complex cacosf(float complex z);
-float complex casinf(float complex z);
-float complex catanf(float complex z);
-float complex ccosf(float complex z);
-float complex csinf(float complex z);
-float complex ctanf(float complex z);
+float complex Cacosf(float complex z);
+float complex Casinf(float complex z);
+float complex Catanf(float complex z);
+float complex Ccosf(float complex z);
+float complex Csinf(float complex z);
+float complex Ctanf(float complex z);
 
 /* Hyperbolic */
-float complex cacoshf(float complex z);
-float complex casinhf(float complex z);
-float complex catanhf(float complex z);
-float complex ccoshf(float complex z);
-float complex csinhf(float complex z);
-float complex ctanhf(float complex z);
+float complex Cacoshf(float complex z);
+float complex Casinhf(float complex z);
+float complex Catanhf(float complex z);
+float complex Ccoshf(float complex z);
+float complex Csinhf(float complex z);
+float complex Ctanhf(float complex z);
 
 /* Exponential and logarithmic */
-float complex cexpf(float complex z);
-float complex clogf(float complex z);
+float complex Cexpf(float complex z);
+float complex Clogf(float complex z);
 
 /* Power and absolute value */
-float         cabsf(float complex z);
-float complex cpowf(float complex x, float complex z);
-float complex csqrtf(float complex z);
+float         Cabsf(float complex z);
+float complex Cpowf(float complex x, float complex z);
+float complex Csqrtf(float complex z);
 
 /* Manipulation */
-float         cargf(float complex z);
-float         cimagf(float complex z);
-float complex conjf(float complex z);
-float complex cprojf(float complex z);
-float         crealf(float complex z);
+float         Cargf(float complex z);
+float         Cimagf(float complex z);
+float complex Conjf(float complex z);
+float complex Cprojf(float complex z);
+float         Crealf(float complex z);
 
 /* ====================================================================
  * Functions — long double complex
  * ==================================================================== */
 
 /* Trigonometric */
-long double complex cacosl(long double complex z);
-long double complex casinl(long double complex z);
-long double complex catanl(long double complex z);
-long double complex ccosl(long double complex z);
-long double complex csinl(long double complex z);
-long double complex ctanl(long double complex z);
+long double complex Cacosl(long double complex z);
+long double complex Casinl(long double complex z);
+long double complex Catanl(long double complex z);
+long double complex Ccosl(long double complex z);
+long double complex Csinl(long double complex z);
+long double complex Ctanl(long double complex z);
 
 /* Hyperbolic */
-long double complex cacoshl(long double complex z);
-long double complex casinhl(long double complex z);
-long double complex catanhl(long double complex z);
-long double complex ccoshl(long double complex z);
-long double complex csinhl(long double complex z);
-long double complex ctanhl(long double complex z);
+long double complex Cacoshl(long double complex z);
+long double complex Casinhl(long double complex z);
+long double complex Catanhl(long double complex z);
+long double complex Ccoshl(long double complex z);
+long double complex Csinhl(long double complex z);
+long double complex Ctanhl(long double complex z);
 
 /* Exponential and logarithmic */
-long double complex cexpl(long double complex z);
-long double complex clogl(long double complex z);
+long double complex Cexpl(long double complex z);
+long double complex Clogl(long double complex z);
 
 /* Power and absolute value */
-long double         cabsl(long double complex z);
-long double complex cpowl(long double complex x, long double complex z);
-long double complex csqrtl(long double complex z);
+long double         Cabsl(long double complex z);
+long double complex Cpowl(long double complex x, long double complex z);
+long double complex Csqrtl(long double complex z);
 
 /* Manipulation */
-long double         cargl(long double complex z);
-long double         cimagl(long double complex z);
-long double complex conjl(long double complex z);
-long double complex cprojl(long double complex z);
-long double         creall(long double complex z);
+long double         Cargl(long double complex z);
+long double         Cimagl(long double complex z);
+long double complex Conjl(long double complex z);
+long double complex Cprojl(long double complex z);
+long double         Creall(long double complex z);
 
 #endif /* LIBC_COMPLEX_H */

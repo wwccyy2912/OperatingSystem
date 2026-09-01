@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * user.h - User account service protocol
  * Copyright (c) 2026 OpSys Project
  *
@@ -14,7 +27,7 @@
  *     password storage — documented limitation.
  *   - Account management ops (USERADD/USERDEL/PASSWD-other/STOP/HALT)
  *     require the caller's bound account role to be OWNER/ADMIN.
- *   - The caller identity always comes from ipc_recv_from (kernel-
+ *   - The caller identity always comes from IpcRecvFrom(kernel-
  *     filled subject), never from request bytes.
  *
  * Port name: "user"
@@ -129,7 +142,7 @@ typedef struct {
  * re-checks the caller is OWNER/ADMIN, exactly like KILL/POLICY_SET. */
 typedef struct {
     uint32_t op;      /* USER_OP_DISK_* */
-    char     volume[64]; /* mount name ("Disk") */
+    char     volume[64]; /* mount name("Disk") */
     uint32_t size;    /* FILL: byte budget (0 = fill until NOSPC) */
 } user_req_disk_t;
 

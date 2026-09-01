@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * libwm - Window Manager client library (v0.4)
  * Copyright (c) 2026 OpSys Project
  *
@@ -12,19 +25,19 @@
 
 static int s_wm_port = -2; /* -2 unresolved, -1 failed, >=0 port */
 
-int wm_port_get(void) {
+int WmPortGet(void) {
     if (s_wm_port >= -1)
         return s_wm_port;
-    s_wm_port = port_get(WM_PORT_NAME);
+    s_wm_port = PortGet(WM_PORT_NAME);
     return s_wm_port;
 }
 
-static int wm_call(wm_req_t *req, wm_resp_t *resp) {
-    int port = wm_port_get();
+static int WmCall(wm_req_t *req, wm_resp_t *resp) {
+    int port = WmPortGet();
     if (port < 0)
         return port;
     int resp_len = (int)sizeof(*resp);
-    int r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     if (resp_len < 4)
@@ -32,7 +45,7 @@ static int wm_call(wm_req_t *req, wm_resp_t *resp) {
     return resp->ret;
 }
 
-int wm_create(const char *title, uint32_t x, uint32_t y,
+int WmCreate(const char *title, uint32_t x, uint32_t y,
               uint32_t w, uint32_t h, uint32_t *win_id) {
     wm_req_t req;
     memset(&req, 0, sizeof(req));
@@ -45,29 +58,29 @@ int wm_create(const char *title, uint32_t x, uint32_t y,
     req.h = h;
     wm_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    int r = wm_call(&req, &resp);
+    int r = WmCall(&req, &resp);
     if (r == 0 && win_id)
         *win_id = resp.win_id;
     return r;
 }
 
-int wm_destroy(uint32_t win_id) {
+int WmDestroy(uint32_t win_id) {
     wm_req_t req;
     memset(&req, 0, sizeof(req));
     req.op     = WM_OP_DESTROY;
     req.win_id = win_id;
     wm_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    return wm_call(&req, &resp);
+    return WmCall(&req, &resp);
 }
 
-int wm_list(char lines[WM_MAX_WINDOWS][WM_TITLE_MAX + 24], uint32_t *count) {
+int WmList(char lines[WM_MAX_WINDOWS][WM_TITLE_MAX + 24], uint32_t *count) {
     wm_req_t req;
     memset(&req, 0, sizeof(req));
     req.op = WM_OP_LIST;
     wm_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    int r = wm_call(&req, &resp);
+    int r = WmCall(&req, &resp);
     if (r == 0) {
         if (count)
             *count = resp.count;
@@ -79,17 +92,17 @@ int wm_list(char lines[WM_MAX_WINDOWS][WM_TITLE_MAX + 24], uint32_t *count) {
     return r;
 }
 
-int wm_focus(uint32_t win_id) {
+int WmFocus(uint32_t win_id) {
     wm_req_t req;
     memset(&req, 0, sizeof(req));
     req.op     = WM_OP_FOCUS;
     req.win_id = win_id;
     wm_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    return wm_call(&req, &resp);
+    return WmCall(&req, &resp);
 }
 
-int wm_move(uint32_t win_id, uint32_t x, uint32_t y) {
+int WmMove(uint32_t win_id, uint32_t x, uint32_t y) {
     wm_req_t req;
     memset(&req, 0, sizeof(req));
     req.op     = WM_OP_MOVE;
@@ -98,10 +111,10 @@ int wm_move(uint32_t win_id, uint32_t x, uint32_t y) {
     req.my     = y;
     wm_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    return wm_call(&req, &resp);
+    return WmCall(&req, &resp);
 }
 
-int wm_write(uint32_t win_id, uint32_t row, const char *text) {
+int WmWrite(uint32_t win_id, uint32_t row, const char *text) {
     wm_req_t req;
     memset(&req, 0, sizeof(req));
     req.op     = WM_OP_WRITE;
@@ -111,34 +124,34 @@ int wm_write(uint32_t win_id, uint32_t row, const char *text) {
         strncpy(req.text, text, sizeof(req.text) - 1);
     wm_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    return wm_call(&req, &resp);
+    return WmCall(&req, &resp);
 }
 
-int wm_activate(void) {
+int WmActivate(void) {
     wm_req_t req;
     memset(&req, 0, sizeof(req));
     req.op = WM_OP_ACTIVATE;
     wm_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    return wm_call(&req, &resp);
+    return WmCall(&req, &resp);
 }
 
-int wm_deactivate(void) {
+int WmDeactivate(void) {
     wm_req_t req;
     memset(&req, 0, sizeof(req));
     req.op = WM_OP_DEACTIVATE;
     wm_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    return wm_call(&req, &resp);
+    return WmCall(&req, &resp);
 }
 
-int wm_get_state(uint32_t *active, uint32_t *focus, uint32_t *count) {
+int WmGetState(uint32_t *active, uint32_t *focus, uint32_t *count) {
     wm_req_t req;
     memset(&req, 0, sizeof(req));
     req.op = WM_OP_GET_STATE;
     wm_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    int r = wm_call(&req, &resp);
+    int r = WmCall(&req, &resp);
     if (r == 0) {
         if (active)
             *active = resp.active;

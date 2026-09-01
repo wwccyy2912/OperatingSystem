@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * stdlib.h - Standard library utilities
  * Copyright (c) 2026 OpSys Project
  *
@@ -65,7 +78,7 @@ void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, co
 _Noreturn void abort(void);
 _Noreturn void exit(int status);
 _Noreturn void _Exit(int status);
-int            atexit(void (*func)(void));
+int            Atexit(void (*func)(void));
 int            at_quick_exit(void (*func)(void));
 _Noreturn void quick_exit(int status);
 
@@ -85,17 +98,17 @@ char *getenv(const char *name);
 /* Set NAME=value, replacing an existing entry (overwrite != 0) or
  * failing with -1 when NAME exists and overwrite == 0.  Strings are
  * copied into libc-owned storage.  Returns 0 on success. */
-int setenv(const char *name, const char *value, int overwrite);
+int Setenv(const char *name, const char *value, int overwrite);
 
 /* Remove NAME from the environment.  Returns 0 on success (also when
  * NAME was not set), -1 on invalid NAME. */
-int unsetenv(const char *name);
+int Unsetenv(const char *name);
 
 /* Install "NAME=value" (string must remain valid; not copied).
  * Replaces any existing NAME entry.  Returns 0 on success. */
-int putenv(char *string);
+int Putenv(char *string);
 
-int system(const char *string);
+int System(const char *string);
 
 /* ====================================================================
  * Memory (C11 §7.22.3)

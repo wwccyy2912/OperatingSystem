@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * elf_parse.h - User-space ELF64 parser (Roadmap P1)
  * Copyright (c) 2026 OpSys Project
  *
@@ -13,7 +26,7 @@
  * (kernel/proc_image.h, dual-compatible via stdint).  The kernel's
  * SYS_PROCESS_CREATE expects the descriptor to be immediately followed
  * in memory by its segment table — build them contiguously (see
- * process_create() in syscalls.c).
+ * ProcessCreate() in syscalls.c).
  */
 
 #ifndef LIBOS_ELF_PARSE_H
@@ -49,7 +62,7 @@
  * @return 0 on success (desc_out->seg_count segments written), or a
  *         negative errno (ERR_INVAL for malformed/oversized ELF).
  */
-int elf_parse(const void        *elf,
+int ElfParse(const void        *elf,
               unsigned long      size,
               proc_image_desc_t *desc_out,
               proc_seg_desc_t   *segs,

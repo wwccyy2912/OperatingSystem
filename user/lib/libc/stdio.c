@@ -9,8 +9,26 @@
  *   Precision:   %.3s %.6d
  *   Flags:       0 - + space #
  *
- * Output goes through debug_log() for printf/fprintf.
+ * Output goes through DebugLog() for printf/fprintf.
  * sprintf/snprintf write into caller buffers.
+ 
+ *
+ * ------------------------------------------------------------------
+ * Structure (stdio):
+ *   printf/snprintf/vsnprintf -> FormatString(spec scan, width/flag,
+ *   %d/%x/%s/... -> format_number/format_string) -> out buffer ->
+ *   SYS_DEBUG_LOG (serial), a kernel-owned rate-limited channel.
+ * How it works:
+ *   A single bounded formatter renders into a caller buffer; vprintf
+ *   targets the debug-log syscall, which the kernel copies to COM1
+ *   under a token bucket.
+ * Purpose:
+ *   Debug/console output for user services (the term screen is a
+ *   separate service channel).
+ * Caveats:
+ *   No FILE streams; %f unsupported; output is rate-limited by the
+ *   kernel token bucket, so hot loops can drop bytes.
+ * ------------------------------------------------------------------
  */
 
 #include <stdarg.h>
@@ -38,28 +56,28 @@ struct fmt_spec {
     int has_precision;
 };
 
-static void emit_char(char *buf, int bufsize, int *pos, char ch) {
+static void EmitChar(char *buf, int bufsize, int *pos, char ch) {
     if (buf && *pos < bufsize - 1)
         buf[*pos] = ch;
     (*pos)++;
 }
 
-static void emit_str(char *buf, int bufsize, int *pos, const char *s) {
+static void EmitStr(char *buf, int bufsize, int *pos, const char *s) {
     if (!s)
         s = "(null)";
     while (*s) {
-        emit_char(buf, bufsize, pos, *s);
+        EmitChar(buf, bufsize, pos, *s);
         s++;
     }
 }
 
-static void emit_pad(char *buf, int bufsize, int *pos, char ch, int count) {
+static void EmitPad(char *buf, int bufsize, int *pos, char ch, int count) {
     for (int i = 0; i < count; i++)
-        emit_char(buf, bufsize, pos, ch);
+        EmitChar(buf, bufsize, pos, ch);
 }
 
 /* Convert unsigned to string, returns length. */
-static int u2str(unsigned long long val, int base, int upper, char *out) {
+static int U2str(unsigned long long val, int base, int upper, char *out) {
     const char *digits_lo = "0123456789abcdef";
     const char *digits_up = "0123456789ABCDEF";
     const char *digits    = upper ? digits_up : digits_lo;
@@ -81,7 +99,7 @@ static int u2str(unsigned long long val, int base, int upper, char *out) {
     return len;
 }
 
-static void format_number(
+static void FormatNumber(
     char *buf, int bufsize, int *pos, unsigned long long val, int neg, const struct fmt_spec *s) {
     char numbuf[32];
     int  numlen;
@@ -90,7 +108,7 @@ static void format_number(
         /* negative: value already negated */
     }
 
-    numlen = u2str(val, s->base, s->upper, numbuf);
+    numlen = U2str(val, s->base, s->upper, numbuf);
 
     /* Apply precision (minimum digits). */
     int zeros = 0;
@@ -134,39 +152,39 @@ static void format_number(
         if (s->zero_pad && !s->has_precision) {
             /* Zero-pad after sign/prefix. */
             if (sign)
-                emit_char(buf, bufsize, pos, sign);
-            emit_str(buf, bufsize, pos, prefix);
-            emit_pad(buf, bufsize, pos, '0', pad);
+                EmitChar(buf, bufsize, pos, sign);
+            EmitStr(buf, bufsize, pos, prefix);
+            EmitPad(buf, bufsize, pos, '0', pad);
         } else {
-            emit_pad(buf, bufsize, pos, ' ', pad);
+            EmitPad(buf, bufsize, pos, ' ', pad);
             if (sign)
-                emit_char(buf, bufsize, pos, sign);
-            emit_str(buf, bufsize, pos, prefix);
+                EmitChar(buf, bufsize, pos, sign);
+            EmitStr(buf, bufsize, pos, prefix);
         }
     } else {
         if (sign)
-            emit_char(buf, bufsize, pos, sign);
-        emit_str(buf, bufsize, pos, prefix);
+            EmitChar(buf, bufsize, pos, sign);
+        EmitStr(buf, bufsize, pos, prefix);
     }
 
     /* Precision zeros. */
-    emit_pad(buf, bufsize, pos, '0', zeros);
+    EmitPad(buf, bufsize, pos, '0', zeros);
 
     /* The number itself. */
     for (int i = 0; i < numlen; i++)
-        emit_char(buf, bufsize, pos, numbuf[i]);
+        EmitChar(buf, bufsize, pos, numbuf[i]);
 
     /* Right padding for left-align. */
     if (s->left_align && pad > 0)
-        emit_pad(buf, bufsize, pos, ' ', pad);
+        EmitPad(buf, bufsize, pos, ' ', pad);
 }
 
-static int format_string(char *buf, int bufsize, const char *fmt, va_list args) {
+static int FormatString(char *buf, int bufsize, const char *fmt, va_list args) {
     int pos = 0;
 
     while (*fmt) {
         if (*fmt != '%') {
-            emit_char(buf, bufsize, &pos, *fmt);
+            EmitChar(buf, bufsize, &pos, *fmt);
             fmt++;
             continue;
         }
@@ -174,7 +192,7 @@ static int format_string(char *buf, int bufsize, const char *fmt, va_list args) 
         fmt++; /* skip '%' */
 
         if (*fmt == '%') {
-            emit_char(buf, bufsize, &pos, '%');
+            EmitChar(buf, bufsize, &pos, '%');
             fmt++;
             continue;
         }
@@ -284,7 +302,7 @@ static int format_string(char *buf, int bufsize, const char *fmt, va_list args) 
 
             s.base      = 10;
             s.is_signed = 1;
-            format_number(buf, bufsize, &pos, uval, neg, &s);
+            FormatNumber(buf, bufsize, &pos, uval, neg, &s);
             break;
         }
         case 'u': {
@@ -301,7 +319,7 @@ static int format_string(char *buf, int bufsize, const char *fmt, va_list args) 
                 val = (unsigned char)val;
             s.base      = 10;
             s.is_signed = 0;
-            format_number(buf, bufsize, &pos, val, 0, &s);
+            FormatNumber(buf, bufsize, &pos, val, 0, &s);
             break;
         }
         case 'x':
@@ -320,7 +338,7 @@ static int format_string(char *buf, int bufsize, const char *fmt, va_list args) 
             s.base      = 16;
             s.is_signed = 0;
             s.upper     = (*fmt == 'X');
-            format_number(buf, bufsize, &pos, val, 0, &s);
+            FormatNumber(buf, bufsize, &pos, val, 0, &s);
             break;
         }
         case 'o': {
@@ -337,7 +355,7 @@ static int format_string(char *buf, int bufsize, const char *fmt, va_list args) 
                 val = (unsigned char)val;
             s.base      = 8;
             s.is_signed = 0;
-            format_number(buf, bufsize, &pos, val, 0, &s);
+            FormatNumber(buf, bufsize, &pos, val, 0, &s);
             break;
         }
         case 'p': {
@@ -348,17 +366,17 @@ static int format_string(char *buf, int bufsize, const char *fmt, va_list args) 
             if (s.width == 0)
                 s.width = 18;
             s.zero_pad = 1;
-            format_number(buf, bufsize, &pos, val, 0, &s);
+            FormatNumber(buf, bufsize, &pos, val, 0, &s);
             break;
         }
         case 'c': {
             int c   = va_arg(args, int);
             int pad = s.width - 1;
             if (!s.left_align && pad > 0)
-                emit_pad(buf, bufsize, &pos, ' ', pad);
-            emit_char(buf, bufsize, &pos, (char)c);
+                EmitPad(buf, bufsize, &pos, ' ', pad);
+            EmitChar(buf, bufsize, &pos, (char)c);
             if (s.left_align && pad > 0)
-                emit_pad(buf, bufsize, &pos, ' ', pad);
+                EmitPad(buf, bufsize, &pos, ' ', pad);
             break;
         }
         case 's': {
@@ -374,11 +392,11 @@ static int format_string(char *buf, int bufsize, const char *fmt, va_list args) 
             }
             int pad = s.width - slen;
             if (!s.left_align && pad > 0)
-                emit_pad(buf, bufsize, &pos, ' ', pad);
+                EmitPad(buf, bufsize, &pos, ' ', pad);
             for (int i = 0; i < slen; i++)
-                emit_char(buf, bufsize, &pos, str[i]);
+                EmitChar(buf, bufsize, &pos, str[i]);
             if (s.left_align && pad > 0)
-                emit_pad(buf, bufsize, &pos, ' ', pad);
+                EmitPad(buf, bufsize, &pos, ' ', pad);
             break;
         }
         case 'n': {
@@ -388,8 +406,8 @@ static int format_string(char *buf, int bufsize, const char *fmt, va_list args) 
             break;
         }
         default:
-            emit_char(buf, bufsize, &pos, '%');
-            emit_char(buf, bufsize, &pos, *fmt);
+            EmitChar(buf, bufsize, &pos, '%');
+            EmitChar(buf, bufsize, &pos, *fmt);
             break;
         }
 
@@ -412,7 +430,7 @@ static int format_string(char *buf, int bufsize, const char *fmt, va_list args) 
  * ==================================================================== */
 
 int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
-    return format_string(buf, (int)n, fmt, ap);
+    return FormatString(buf, (int)n, fmt, ap);
 }
 
 int snprintf(char *buf, size_t n, const char *fmt, ...) {
@@ -424,7 +442,7 @@ int snprintf(char *buf, size_t n, const char *fmt, ...) {
 }
 
 int vsprintf(char *buf, const char *fmt, va_list ap) {
-    return format_string(buf, 0x7FFFFFFF, fmt, ap);
+    return FormatString(buf, 0x7FFFFFFF, fmt, ap);
 }
 
 int sprintf(char *buf, const char *fmt, ...) {
@@ -439,7 +457,7 @@ int vprintf(const char *fmt, va_list ap) {
     char buf[512];
     int  len = vsnprintf(buf, sizeof(buf), fmt, ap);
     if (len > 0)
-        debug_log(buf);
+        DebugLog(buf);
     return len;
 }
 
@@ -467,17 +485,17 @@ int fprintf(void *stream, const char *fmt, ...) {
 
 int puts(const char *str) {
     if (!str)
-        return debug_log("(null)\n");
-    int r = debug_log(str);
-    debug_log("\n");
+        return DebugLog("(null)\n");
+    int r = DebugLog(str);
+    DebugLog("\n");
     return r;
 }
 
 int putchar(int c) {
     char buf[2] = {(char)c, '\0'};
-    return debug_log(buf);
+    return DebugLog(buf);
 }
 
 int getchar(void) {
-    return debug_getchar();
+    return DebugGetchar();
 }

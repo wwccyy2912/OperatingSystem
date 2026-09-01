@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * ipc_client.h - Higher-level IPC client library
  * Copyright (c) 2026 OpSys Project
  *
@@ -12,10 +25,10 @@
 /**
  * Connect to a named service port.
  * Looks up the port by name via the port registry.
- * @param service_name  Name of the service to connect to.
+ * @param service_name  name of the service to connect to.
  * @return Port handle (>= 0), or negative error code.
  */
-int ipc_connect(const char *service_name);
+int IpcConnect(const char *service_name);
 
 /**
  * Send a request and wait for a response (synchronous call).
@@ -26,6 +39,6 @@ int ipc_connect(const char *service_name);
  * @param resp_len In: buffer capacity, Out: actual response size.
  * @return 0 on success, negative error code on failure.
  */
-int ipc_request(int port, const void *req, int req_len, void *resp, int resp_len);
+int IpcRequest(int port, const void *req, int req_len, void *resp, int resp_len);
 
 #endif /* LIBIPC_IPC_CLIENT_H */

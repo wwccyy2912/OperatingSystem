@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * wchar.h - Wide character and string utilities (C11 §7.29)
  * Copyright (c) 2026 OpSys Project
  *
@@ -90,30 +103,30 @@ unsigned long long wcstoull(const wchar_t *s, wchar_t **endptr, int base);
  * Wide formatted I/O (C11 §7.29.2) — declarations only
  * ==================================================================== */
 
-int fwprintf(void *stream, const wchar_t *fmt, ...);
-int fwscanf(void *stream, const wchar_t *fmt, ...);
-int wprintf(const wchar_t *fmt, ...);
-int wscanf(const wchar_t *fmt, ...);
-int swprintf(wchar_t *s, size_t n, const wchar_t *fmt, ...);
-int swscanf(const wchar_t *s, const wchar_t *fmt, ...);
+int Fwprintf(void *stream, const wchar_t *fmt, ...);
+int Fwscanf(void *stream, const wchar_t *fmt, ...);
+int Wprintf(const wchar_t *fmt, ...);
+int Wscanf(const wchar_t *fmt, ...);
+int Swprintf(wchar_t *s, size_t n, const wchar_t *fmt, ...);
+int Swscanf(const wchar_t *s, const wchar_t *fmt, ...);
 
-int vfwprintf(void *stream, const wchar_t *fmt, va_list ap);
-int vwprintf(const wchar_t *fmt, va_list ap);
-int vswprintf(wchar_t *s, size_t n, const wchar_t *fmt, va_list ap);
+int Vfwprintf(void *stream, const wchar_t *fmt, va_list ap);
+int Vwprintf(const wchar_t *fmt, va_list ap);
+int Vswprintf(wchar_t *s, size_t n, const wchar_t *fmt, va_list ap);
 
 /* ====================================================================
  * Wide character I/O (C11 §7.29.3) — declarations only
  * ==================================================================== */
 
-wint_t   fgetwc(void *stream);
+wint_t   Fgetwc(void *stream);
 wchar_t *fgetws(wchar_t *s, int n, void *stream);
-wint_t   fputwc(wchar_t c, void *stream);
-int      fputws(const wchar_t *s, void *stream);
-wint_t   getwc(void *stream);
-wint_t   getwchar(void);
-wint_t   putwc(wchar_t c, void *stream);
-wint_t   putwchar(wchar_t c);
-wint_t   ungetwc(wint_t c, void *stream);
+wint_t   Fputwc(wchar_t c, void *stream);
+int      Fputws(const wchar_t *s, void *stream);
+wint_t   Getwc(void *stream);
+wint_t   Getwchar(void);
+wint_t   Putwc(wchar_t c, void *stream);
+wint_t   Putwchar(wchar_t c);
+wint_t   Ungetwc(wint_t c, void *stream);
 
 /* ====================================================================
  * Multibyte <-> wchar conversion (C11 §7.29.6) — declarations only
@@ -134,6 +147,6 @@ int wcwidth(wchar_t wc);
  * Time formatting (C11 §7.29.5.1) — declaration only
  * ==================================================================== */
 
-size_t wcsftime(wchar_t *s, size_t max, const wchar_t *fmt, const struct tm *t);
+size_t Wcsftime(wchar_t *s, size_t max, const wchar_t *fmt, const struct tm *t);
 
 #endif /* LIBC_WCHAR_H */

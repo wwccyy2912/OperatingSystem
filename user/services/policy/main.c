@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * policy.c - Command policy service (v0.5)
  * Copyright (c) 2026 OpSys Project
  *
@@ -23,6 +36,24 @@
  *
  * Spawned by the manager before the shell; the shell queries it at
  * startup to build its command filter.
+ *
+ * ------------------------------------------------------------------
+ * Structure (PolicyMain):
+ *   main() spawns PolicyServerMain -> "policy" port, ipc_recv loop
+ *     role -> command -> verdict table (in-memory)
+ *     POLICY_OP_SET admin maintenance (OWNER/ADMIN, via user service)
+ *   capability (kernel) -> policy DB -> shell override (3 tiers)
+ * How it works:
+ *   A command not in a role's table is POLICY_UNSET = default allow.
+ *   POLICY_OP_SET updates a verdict; admin identity comes from the
+ *   caller's role queried through the user service by subject.
+ * Purpose:
+ *   Command policy service: the middle tier of the three-tier command
+ *   access architecture, consulted by the shell at startup.
+ * Caveats:
+ *   Table is in-memory only (VFS persistence is future work).  Never
+ *   touches environment variables — those are process-local preferences.
+ * ------------------------------------------------------------------
  */
 
 #include "policy.h"
@@ -79,7 +110,7 @@ static const struct {
      * sensitive ops are still capability-gated. */
 };
 
-static void seed_table(void) {
+static void SeedTable(void) {
     memset(s_table, 0, sizeof(s_table));
     memset(s_count, 0, sizeof(s_count));
     for (u32 i = 0; i < sizeof(s_seeds) / sizeof(s_seeds[0]); i++) {
@@ -94,7 +125,7 @@ static void seed_table(void) {
 }
 
 /* Verdict for (role, cmd); POLICY_UNSET when not in the table. */
-static u8 policy_lookup(u32 role, const char *cmd) {
+static u8 PolicyLookup(u32 role, const char *cmd) {
     if (role >= POLICY_ROLES)
         return POLICY_UNSET;
     for (u32 i = 0; i < s_count[role]; i++) {
@@ -112,15 +143,15 @@ static u8 policy_lookup(u32 role, const char *cmd) {
  * definition management-plane.  (Querying the user service's WHOAMI
  * here would resolve the policy service's OWN subject, not the
  * caller's — wrong.  Atom check is direct and unforgeable.) */
-static int caller_is_admin(u64 subject) {
-    return cap_has_atom(subject, ATOM_SERVICE_MANAGE) == 1;
+static int CallerIsAdmin(u64 subject) {
+    return CapHasAtom(subject, ATOM_SERVICE_MANAGE) == 1;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Handlers                                                          */
 /* ------------------------------------------------------------------ */
 
-static void do_query(int token, int msg_len, policy_req_query_t *req) {
+static void DoQuery(int token, int msg_len, policy_req_query_t *req) {
     policy_resp_query_t resp;
     memset(&resp, 0, sizeof(resp));
     if (msg_len < (int)sizeof(policy_req_query_t)) {
@@ -134,21 +165,21 @@ static void do_query(int token, int msg_len, policy_req_query_t *req) {
     resp.count = req->count;
     for (u32 i = 0; i < req->count; i++) {
         req->cmds[i][POLICY_CMD_MAX - 1] = '\0';
-        resp.verdicts[i]                 = policy_lookup(req->role, req->cmds[i]);
+        resp.verdicts[i]                 = PolicyLookup(req->role, req->cmds[i]);
     }
     resp.ret = 0;
 out:
-    (void)ipc_reply(token, &resp, (int)sizeof(resp));
+    (void)IpcReply(token, &resp, (int)sizeof(resp));
 }
 
-static void do_set(int token, int msg_len, u64 caller, policy_req_set_t *req) {
+static void DoSet(int token, int msg_len, u64 caller, policy_req_set_t *req) {
     policy_resp_set_t resp;
     memset(&resp, 0, sizeof(resp));
     if (msg_len < (int)sizeof(policy_req_set_t)) {
         resp.ret = -2;
         goto out;
     }
-    if (!caller_is_admin(caller)) {
+    if (!CallerIsAdmin(caller)) {
         resp.ret = -9; /* ERR_DENIED: admin only */
         goto out;
     }
@@ -191,14 +222,14 @@ static void do_set(int token, int msg_len, u64 caller, policy_req_set_t *req) {
     e->verdict                 = req->verdict;
     resp.ret                   = 0;
 out:
-    (void)ipc_reply(token, &resp, (int)sizeof(resp));
+    (void)IpcReply(token, &resp, (int)sizeof(resp));
 }
 
-static void do_dump(int token, u64 caller, policy_req_dump_t *req) {
+static void DoDump(int token, u64 caller, policy_req_dump_t *req) {
     (void)req;
     policy_resp_dump_t resp;
     memset(&resp, 0, sizeof(resp));
-    if (!caller_is_admin(caller)) {
+    if (!CallerIsAdmin(caller)) {
         resp.ret = -9;
         goto out;
     }
@@ -215,25 +246,25 @@ static void do_dump(int token, u64 caller, policy_req_dump_t *req) {
     resp.count = n;
     resp.ret   = 0;
 out:
-    (void)ipc_reply(token, &resp, (int)sizeof(resp));
+    (void)IpcReply(token, &resp, (int)sizeof(resp));
 }
 
 /* ------------------------------------------------------------------ */
 /*  Server                                                            */
 /* ------------------------------------------------------------------ */
 
-static void policy_server_main(void *arg) {
+static void PolicyServerMain(void *arg) {
     (void)arg;
 
-    int port = ipc_port_create();
+    int port = IpcPortCreate();
     if (port < 0) {
         printf("policy: ipc_port_create failed (%d)\n", port);
-        thread_exit(1);
+        ThreadExit(1);
     }
-    int ret = port_register(POLICY_PORT_NAME, port);
+    int ret = PortRegister(POLICY_PORT_NAME, port);
     if (ret < 0) {
-        printf("policy: port_register('%s') failed (%d)\n", POLICY_PORT_NAME, ret);
-        thread_exit(1);
+        printf("policy: PortRegister('%s') failed (%d)\n", POLICY_PORT_NAME, ret);
+        ThreadExit(1);
     }
     printf("policy: port %d registered as '%s'\n", port, POLICY_PORT_NAME);
 
@@ -244,7 +275,7 @@ static void policy_server_main(void *arg) {
         int msg_len = (int)sizeof(s_req);
         int token   = 0;
         u64 caller  = 0;
-        int r       = ipc_recv_from(port, s_req, &msg_len, &token, &caller);
+        int r       = IpcRecvFrom(port, s_req, &msg_len, &token, &caller);
         if (r < 0) {
             printf("policy: ipc_recv failed (%d)\n", r);
             continue;
@@ -252,18 +283,18 @@ static void policy_server_main(void *arg) {
         u32 op = ((policy_req_query_t *)s_req)->op;
         switch (op) {
         case POLICY_OP_QUERY:
-            do_query(token, msg_len, (policy_req_query_t *)s_req);
+            DoQuery(token, msg_len, (policy_req_query_t *)s_req);
             break;
         case POLICY_OP_SET:
-            do_set(token, msg_len, caller, (policy_req_set_t *)s_req);
+            DoSet(token, msg_len, caller, (policy_req_set_t *)s_req);
             break;
         case POLICY_OP_DUMP:
-            do_dump(token, caller, (policy_req_dump_t *)s_req);
+            DoDump(token, caller, (policy_req_dump_t *)s_req);
             break;
         default:
         {
             i32 err = -2;
-            (void)ipc_reply(token, &err, (int)sizeof(err));
+            (void)IpcReply(token, &err, (int)sizeof(err));
             break;
         }
         }
@@ -276,16 +307,16 @@ static void policy_server_main(void *arg) {
 
 int main(void) {
     printf("policy: starting command policy service\n");
-    seed_table();
+    SeedTable();
     printf("policy: seeded %u entries\n",
            (u32)(sizeof(s_seeds) / sizeof(s_seeds[0])));
 
-    if (thread_create(policy_server_main, NULL, 10) < 0) {
+    if (ThreadCreate(PolicyServerMain, NULL, 10) < 0) {
         printf("policy: server thread_create failed\n");
         return 1;
     }
 
     for (;;)
-        thread_yield();
+        ThreadYield();
     return 0;
 }

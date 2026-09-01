@@ -14,8 +14,23 @@
  *   [frame_base - 8] = 0 -> NEVER return; exit via SYS_SIGRETURN
  *   (context restore) or exit() (default terminate).
  *
- * signal() is pure user space: swapping table slots touches no
+ * Signal() is pure user space: swapping table slots touches no
  * supervisor state, so no syscall is involved.
+ 
+ *
+ * ------------------------------------------------------------------
+ * Structure (signal_user):
+ *   syscall/interrupt signal frames -> SignalRaise/SignalRestore ->
+ *   user dispatcher trampoline on the user stack.
+ * How it works:
+ *   The kernel parks pending signals; the user stub saves context to
+ *   a sigframe, runs the handler, then restores via syscall.
+ * Purpose:
+ *   Deliver kernel-raised signals (SIGSEGV etc.) into user handlers.
+ * Caveats:
+ *   One delivery per signal per check point (no queuing); handlers
+ *   must not block on kernel IPC that re-enters the signal path.
+ * ------------------------------------------------------------------
  */
 
 #include <runtime.h>         /* exit() */
@@ -40,7 +55,7 @@ static sighandler_t s_handlers[NSIG];
 /* POSIX default action for a signal: terminate (SIGSEGV/SIGPIPE/
  * SIGALRM/SIGTERM) or ignore.  SIGKILL never reaches the dispatcher:
  * the kernel force-exits before delivery (process lifecycle). */
-static int s_default_terminates(int signum) {
+static int SDefaultTerminates(int signum) {
     switch (signum) {
     case SIGSEGV:
     case SIGPIPE:
@@ -74,7 +89,7 @@ void __sig_dispatcher(unsigned long frame_base) {
     if (h == SIG_IGN) {
         s_sig_return(frame_base);
     } else if (h == SIG_DFL) {
-        if (s_default_terminates(signum))
+        if (SDefaultTerminates(signum))
             exit(128 + signum); /* runs atexit handlers, then dies */
         s_sig_return(frame_base); /* default = ignore */
     } else {
@@ -90,7 +105,7 @@ void __sig_dispatcher(unsigned long frame_base) {
  * @return Previous handler (SIG_DFL if never set), or SIG_ERR when
  *         signum is invalid or uncatchable (SIGKILL/SIGSTOP).
  */
-sighandler_t signal(int signum, sighandler_t handler) {
+sighandler_t Signal(int signum, sighandler_t handler) {
     if (signum <= 0 || signum >= NSIG || signum == SIGKILL || signum == SIGSTOP)
         return SIG_ERR;
     sighandler_t old   = s_handlers[signum];

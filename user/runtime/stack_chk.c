@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * stack_chk.c - User-space stack canary support (GCC -fstack-protector-strong)
  * Copyright (c) 2026 OpSys Project
  *
@@ -20,13 +33,13 @@
  */
 
 #include <runtime.h>        /* exit() */
-#include <libos/syscalls.h> /* get_time, get_heap_base, get_pid, debug_log */
+#include <libos/syscalls.h> /* get_time, GetHeapBase, GetPid, debug_log */
 
 __attribute__((used)) unsigned long __stack_chk_guard = 0xDEADBEEF0BADF00DUL;
 
 /* Simple avalanche mixer (rng_mix style): fold the entropy words into
  * the guard without needing a syscall-provided PRNG. */
-static unsigned long mix(unsigned long h, unsigned long x) {
+static unsigned long Mix(unsigned long h, unsigned long x) {
     h ^= x;
     h *= 0x9E3779B97F4A7C15UL; /* golden-ratio constant */
     h ^= h >> 29;
@@ -36,10 +49,10 @@ static unsigned long mix(unsigned long h, unsigned long x) {
 /* Seed the per-process canary.  Called from _init() before any
  * constructor: no instrumented frame is live across the change. */
 __attribute__((no_stack_protector)) void __stack_chk_init(void) {
-    unsigned long g = mix(0x243F6A8885A308D3UL, (unsigned long)get_time());
-    g               = mix(g, get_heap_base());
-    g               = mix(g, (unsigned long)get_pid());
-    g               = mix(g, (unsigned long)&g); /* stack address (ASLR-ish) */
+    unsigned long g = Mix(0x243F6A8885A308D3UL, (unsigned long)GetTime());
+    g               = Mix(g, GetHeapBase());
+    g               = Mix(g, (unsigned long)GetPid());
+    g               = Mix(g, (unsigned long)&g); /* stack address (ASLR-ish) */
     g &= ~0xFFUL;                                /* low byte NUL */
     if (g == 0)
         g = 0x9E3779B97F4A7C00UL; /* nonzero fallback */
@@ -51,7 +64,7 @@ __attribute__((no_stack_protector)) void __stack_chk_init(void) {
  * and terminate the process; do NOT attempt to unwind.
  */
 __attribute__((noreturn, no_stack_protector)) void __stack_chk_fail(void) {
-    (void)debug_log("STACK SMASHING DETECTED: user stack canary mismatch\n");
+    (void)DebugLog("STACK SMASHING DETECTED: user stack canary mismatch\n");
     exit(128 + 6); /* SIGABRT */
 }
 

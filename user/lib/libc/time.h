@@ -1,9 +1,22 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * time.h - Date and time (C11 §7.27)
  * Copyright (c) 2026 OpSys Project
  *
  * Provides time_t, struct tm, clock_t and the standard time functions.
- * Backed by the kernel's get_time() (tick count) and os_get_rtc_time()
+ * Backed by the kernel's GetTime() (tick count) and OsGetRtcTime()
  * (wall clock) syscalls.
  */
 

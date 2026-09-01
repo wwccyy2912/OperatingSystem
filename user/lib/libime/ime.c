@@ -1,6 +1,37 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * ime.c - Pinyin IME engine (see ime.h)
  * Copyright (c) 2026 OpSys Project
+ *
+ * ------------------------------------------------------------------
+ * Structure (lookup):
+ *   ImeLookup(pinyin) -> binary search ime_tab[] -> UTF-8 candidates
+ *   ImePrefix(pinyin) -> lower-bound search -> prefix match check
+ * How it works:
+ *   Both functions rely on ime_tab being sorted by pinyin.  ImeLookup
+ *   finds an exact match and splits the candidate string on UTF-8
+ *   sequence boundaries into chars_out (up to IME_MAX_CAND).  ImePrefix
+ *   locates the first entry >= pinyin and tests whether it starts with it.
+ * Purpose:
+ *   Pinyin input-method candidate lookup and prefix completion testing
+ *   for the IME service.
+ * Caveats:
+ *   The table must stay pinyin-sorted or the binary searches are wrong.
+ *   ImePrefix checks only the first entry >= prefix, not the whole range;
+ *   malformed UTF-8 in a candidate stops decoding.
+ * ------------------------------------------------------------------
  */
 
 #include "ime.h"
@@ -8,7 +39,7 @@
 #include "../libc/string.h"
 #include "../libc/utf8.h"
 
-int ime_lookup(const char *pinyin, const char **chars_out) {
+int ImeLookup(const char *pinyin, const char **chars_out) {
     if (!pinyin || !chars_out)
         return 0;
 
@@ -21,7 +52,7 @@ int ime_lookup(const char *pinyin, const char **chars_out) {
             const char *s = ime_tab[mid].chars;
             int         n = 0;
             while (*s && n < IME_MAX_CAND) {
-                int len = utf8_seq_len(s);
+                int len = Utf8SeqLen(s);
                 if (len <= 0)
                     break;
                 chars_out[n++] = s;
@@ -37,7 +68,7 @@ int ime_lookup(const char *pinyin, const char **chars_out) {
     return 0;
 }
 
-int ime_prefix(const char *pinyin) {
+int ImePrefix(const char *pinyin) {
     if (!pinyin || pinyin[0] == '\0')
         return 0;
 

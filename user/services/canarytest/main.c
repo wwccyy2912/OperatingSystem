@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * canarytest.c - User stack-canary self-test service
  * Copyright (c) 2026 OpSys Project
  *
@@ -19,10 +32,10 @@ int main(void) {
     volatile char buf[8];
     volatile int  i;
     /* Delay before overflowing: the init selftest spawns us and then
-     * blocks in process_wait().  We must not die before its waiting_tid
+     * blocks in ProcessWait().  We must not die before its waiting_tid
      * is registered, or the kernel reaps us as an orphan and the wait
      * fails with ERR_NOENT.  ~0.5 s at the 100 Hz PIT tick. */
-    sleep(50);
+    Sleep(50);
     /* Overrun the 8-byte buffer by 24 bytes: the compiler places the
      * canary slot right after the locals (rsp+0x18 here), so writing
      * past buf[] by ~16-24 bytes clobbers it.  Keep the total well

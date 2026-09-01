@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * elf_parse.c - User-space ELF64 parser (Roadmap P1)
  * Copyright (c) 2026 OpSys Project
  *
@@ -11,6 +24,36 @@
  *
  * The ELF64 structures are defined here privately: the kernel no
  * longer exposes a general elf.h to user space.
+ *
+ * ------------------------------------------------------------------
+ * Structure (single entry point):
+ *   ELF blob (ET_EXEC, ELF64, little-endian, x86-64)
+ *     |
+ *     v
+ *   ElfParse(): header magic/class/machine checks
+ *     |  bounds-check phdr table, iterate PT_LOAD only
+ *     +--> proc_image_desc_t { entry, seg_count }
+ *     +--> proc_seg_desc_t[]   { vaddr, filesz, memsz, src_offset, prot }
+ *     v
+ *   ProcessCreate()  (kernel treats blob as opaque bytes)
+ *
+ * How it works:
+ *   The ELF64 structs are defined locally; ElfParse validates the
+ *   blob, strides the program header table by sizeof(elf64_phdr_t),
+ *   copies each PT_LOAD into a proc_seg_desc_t, and maps p_flags to
+ *   the PROT_* values.
+ *
+ * Purpose:
+ *   User-side ELF parser that turns a built executable into the
+ *   process-image description consumed by SYS_PROCESS_CREATE, keeping
+ *   the kernel free of any file-format logic.
+ *
+ * Caveats:
+ *   Only ELF64 little-endian x86-64 ET_EXEC blobs (non-PIE, linked at
+ *   0x400000).  Section headers and non-PT_LOAD segments are ignored;
+ *   segments must fit the caller's max_segs array and every file range
+ *   must lie inside the blob.
+ * ------------------------------------------------------------------
  */
 
 #include "elf_parse.h"
@@ -64,7 +107,7 @@ typedef struct {
     unsigned long p_align;  /* Alignment */
 } elf64_phdr_t;
 
-int elf_parse(const void        *elf,
+int ElfParse(const void        *elf,
               unsigned long      size,
               proc_image_desc_t *desc_out,
               proc_seg_desc_t   *segs,
@@ -77,43 +120,43 @@ int elf_parse(const void        *elf,
 
     /* ---- Blob must at least hold the ELF header ---- */
     if (size < sizeof(elf64_ehdr_t)) {
-        debug_log("elf_parse: truncated header\n");
+        DebugLog("elf_parse: truncated header\n");
         return ERR_INVAL;
     }
 
     /* ---- Validate ELF magic ---- */
     if (ehdr->e_ident[0] != ELFMAG0 || ehdr->e_ident[1] != ELFMAG1 || ehdr->e_ident[2] != ELFMAG2 ||
         ehdr->e_ident[3] != ELFMAG3) {
-        debug_log("elf_parse: bad magic\n");
+        DebugLog("elf_parse: bad magic\n");
         return ERR_INVAL;
     }
 
     /* ---- Validate class (64-bit) and data encoding (little-endian) ---- */
     if (ehdr->e_ident[4] != ELFCLASS64 || ehdr->e_ident[5] != ELFDATA2LSB) {
-        debug_log("elf_parse: not ELFCLASS64/little-endian\n");
+        DebugLog("elf_parse: not ELFCLASS64/little-endian\n");
         return ERR_INVAL;
     }
 
     /* ---- Validate machine (x86-64) ---- */
     if (ehdr->e_machine != EM_X86_64) {
-        debug_log("elf_parse: not EM_X86_64\n");
+        DebugLog("elf_parse: not EM_X86_64\n");
         return ERR_INVAL;
     }
 
     /* ---- Bounds-check the program header table ---- */
     if (ehdr->e_phnum == 0) {
-        debug_log("elf_parse: no program headers\n");
+        DebugLog("elf_parse: no program headers\n");
         return ERR_INVAL;
     }
     if (ehdr->e_phentsize < sizeof(elf64_phdr_t)) {
-        debug_log("elf_parse: phentsize too small\n");
+        DebugLog("elf_parse: phentsize too small\n");
         return ERR_INVAL;
     }
     /* The parser strides phdrs by sizeof(elf64_phdr_t); the whole table
      * it will read must lie within the blob. */
     unsigned long phdr_bytes = (unsigned long)ehdr->e_phnum * (unsigned long)sizeof(elf64_phdr_t);
     if (ehdr->e_phoff > size || phdr_bytes > size - ehdr->e_phoff) {
-        debug_log("elf_parse: program header table out of bounds\n");
+        DebugLog("elf_parse: program header table out of bounds\n");
         return ERR_INVAL;
     }
 
@@ -126,19 +169,19 @@ int elf_parse(const void        *elf,
             continue;
 
         if (nsegs >= max_segs) {
-            debug_log("elf_parse: too many PT_LOAD segments\n");
+            DebugLog("elf_parse: too many PT_LOAD segments\n");
             return ERR_INVAL;
         }
 
         /* ---- Bounds-check the segment itself ---- */
         /* File data [p_offset, p_offset+p_filesz) must lie in the blob. */
         if (phdr[i].p_filesz > size || phdr[i].p_offset > size - phdr[i].p_filesz) {
-            debug_log("elf_parse: PT_LOAD file range out of bounds\n");
+            DebugLog("elf_parse: PT_LOAD file range out of bounds\n");
             return ERR_INVAL;
         }
         /* ELF spec: memsz >= filesz. */
         if (phdr[i].p_memsz < phdr[i].p_filesz) {
-            debug_log("elf_parse: PT_LOAD memsz < filesz\n");
+            DebugLog("elf_parse: PT_LOAD memsz < filesz\n");
             return ERR_INVAL;
         }
 
@@ -163,7 +206,7 @@ int elf_parse(const void        *elf,
     }
 
     if (nsegs == 0) {
-        debug_log("elf_parse: no PT_LOAD segments\n");
+        DebugLog("elf_parse: no PT_LOAD segments\n");
         return ERR_INVAL;
     }
 

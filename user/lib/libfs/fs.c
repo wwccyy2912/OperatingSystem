@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * fs.c - libfs: user-space VFS client library implementation
  * Copyright (c) 2026 OpSys Project
  *
@@ -11,6 +24,29 @@
  * clobber each other.  The only Phase 0 client (the shell) is
  * single-threaded, so this is fine; a multi-threaded client would need
  * per-thread buffers.
+ *
+ * ------------------------------------------------------------------
+ * Structure (VFS client, one port, shared buffers):
+ *   app -> FsOpenItem/FsRead/FsWrite/FsEnum* ...
+ *        -> build vfs_req_* in static s_req -> IpcCall(s_vfs_port)
+ *        -> parse vfs_resp_* from static s_resp -> return to app
+ *   FsRead/FsWrite: transparent chunked loop (VFS_MAX_READ/WRITE)
+ *
+ * How it works:
+ *   FsPort() lazily resolves and caches the "vfs" port; each op packs
+ *   one protocol request into s_req and does one ipc_call (or a
+ *   chunked loop for large reads/writes), translating server errors.
+ *
+ * Purpose:
+ *   User-space filesystem API: open/read/write/close, directory enum,
+ *   volumes, bookmarks and whoami, all over the vfs.h wire protocol.
+ *
+ * Caveats:
+ *   Single-threaded only: s_req/s_resp are shared statics, so
+ *   concurrent callers clobber each other (Phase 0 limitation).
+ *   Names are bounded 255-byte fields (UTF-8-safe truncation); short
+ *   reads mean EOF and short writes are reported as NOSPC.
+ * ------------------------------------------------------------------
  */
 
 #include "fs.h"
@@ -25,7 +61,7 @@ static int s_vfs_port = -1; /* resolved once, cached */
 
 /* UTF-8-safe bounded copy into a fixed field: never cuts a multi-byte
  * character at the 255-byte field edge. */
-static void fs_strncpy_utf8(char *dst, const char *src, int cap) {
+static void FsStrncpyUtf8(char *dst, const char *src, int cap) {
     int len = (int)strlen(src);
     if (len >= cap)
         len = cap - 1;
@@ -34,7 +70,7 @@ static void fs_strncpy_utf8(char *dst, const char *src, int cap) {
            ((unsigned char)src[len - 1 - back] & 0xC0) == 0x80)
         back++;
     if (back > 0) {
-        int need = utf8_seq_len(src + (len - 1 - back));
+        int need = Utf8SeqLen(src + (len - 1 - back));
         if (need == 0 || need > back + 1)
             len -= back; /* drop the incomplete trailing character */
     }
@@ -42,19 +78,19 @@ static void fs_strncpy_utf8(char *dst, const char *src, int cap) {
     dst[len] = '\0';
 }
 
-static int fs_port(void) {
+static int FsPort(void) {
     if (s_vfs_port < 0) {
-        s_vfs_port = port_get("vfs");
+        s_vfs_port = PortGet("vfs");
         if (s_vfs_port < 0)
             return s_vfs_port;
     }
     return s_vfs_port;
 }
 
-int fs_get_item(const char *url, vfs_item_info_t *out_item) {
+int FsGetItem(const char *url, vfs_item_info_t *out_item) {
     if (!url || !out_item)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -65,7 +101,7 @@ int fs_get_item(const char *url, vfs_item_info_t *out_item) {
 
     vfs_resp_get_item_t *resp     = (vfs_resp_get_item_t *)s_resp;
     int                  resp_len = (int)sizeof(*resp);
-    int                  r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int                  r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     if (resp->ret < 0)
@@ -74,10 +110,10 @@ int fs_get_item(const char *url, vfs_item_info_t *out_item) {
     return 0;
 }
 
-int fs_create_dir(const char *url) {
+int FsCreateDir(const char *url) {
     if (!url)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -88,16 +124,16 @@ int fs_create_dir(const char *url) {
 
     vfs_resp_create_dir_t *resp     = (vfs_resp_create_dir_t *)s_resp;
     int                    resp_len = (int)sizeof(*resp);
-    int                    r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int                    r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     return resp->ret;
 }
 
-int fs_delete_item(const char *url, int recursive) {
+int FsDeleteItem(const char *url, int recursive) {
     if (!url)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -109,16 +145,16 @@ int fs_delete_item(const char *url, int recursive) {
 
     vfs_resp_delete_t *resp     = (vfs_resp_delete_t *)s_resp;
     int                resp_len = (int)sizeof(*resp);
-    int                r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int                r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     return resp->ret;
 }
 
-int fs_open_item(const char *url, u32 flags, u32 access, vfs_handle_t *out_handle) {
+int FsOpenItem(const char *url, u32 flags, u32 access, vfs_handle_t *out_handle) {
     if (!url || !out_handle)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -131,7 +167,7 @@ int fs_open_item(const char *url, u32 flags, u32 access, vfs_handle_t *out_handl
 
     vfs_resp_open_t *resp     = (vfs_resp_open_t *)s_resp;
     int              resp_len = (int)sizeof(*resp);
-    int              r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int              r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     if (resp->ret < 0)
@@ -140,10 +176,10 @@ int fs_open_item(const char *url, u32 flags, u32 access, vfs_handle_t *out_handl
     return 0;
 }
 
-int fs_read(vfs_handle_t handle, u64 offset, void *buf, u32 len, u32 *got) {
+int FsRead(vfs_handle_t handle, u64 offset, void *buf, u32 len, u32 *got) {
     if (!buf && len > 0)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -163,7 +199,7 @@ int fs_read(vfs_handle_t handle, u64 offset, void *buf, u32 len, u32 *got) {
 
         vfs_resp_read_t *resp     = (vfs_resp_read_t *)s_resp;
         int              resp_len = (int)sizeof(*resp);
-        int              r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+        int              r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
         if (r < 0)
             return r;
         if (resp->ret < 0)
@@ -182,10 +218,10 @@ int fs_read(vfs_handle_t handle, u64 offset, void *buf, u32 len, u32 *got) {
     return 0;
 }
 
-int fs_write(vfs_handle_t handle, u64 offset, const void *buf, u32 len) {
+int FsWrite(vfs_handle_t handle, u64 offset, const void *buf, u32 len) {
     if (!buf && len > 0)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -208,7 +244,7 @@ int fs_write(vfs_handle_t handle, u64 offset, const void *buf, u32 len) {
         int               resp_len = (int)sizeof(*resp);
         /* Header = { u32 op; u32 handle; u64 offset; u32 len } */
         int req_len = (int)(sizeof(u32) * 3 + sizeof(u64)) + (int)chunk;
-        int r       = ipc_call(port, req, req_len, resp, &resp_len);
+        int r       = IpcCall(port, req, req_len, resp, &resp_len);
         if (r < 0)
             return r;
         if (resp->ret < 0)
@@ -220,8 +256,8 @@ int fs_write(vfs_handle_t handle, u64 offset, const void *buf, u32 len) {
     return 0;
 }
 
-int fs_close(vfs_handle_t handle) {
-    int port = fs_port();
+int FsClose(vfs_handle_t handle) {
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -232,16 +268,16 @@ int fs_close(vfs_handle_t handle) {
 
     vfs_resp_close_t *resp     = (vfs_resp_close_t *)s_resp;
     int               resp_len = (int)sizeof(*resp);
-    int               r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int               r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     return resp->ret;
 }
 
-int fs_enum_begin(const char *url, vfs_handle_t *out_handle) {
+int FsEnumBegin(const char *url, vfs_handle_t *out_handle) {
     if (!url || !out_handle)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -252,7 +288,7 @@ int fs_enum_begin(const char *url, vfs_handle_t *out_handle) {
 
     vfs_resp_enum_begin_t *resp     = (vfs_resp_enum_begin_t *)s_resp;
     int                    resp_len = (int)sizeof(*resp);
-    int                    r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int                    r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     if (resp->ret < 0)
@@ -261,10 +297,10 @@ int fs_enum_begin(const char *url, vfs_handle_t *out_handle) {
     return 0;
 }
 
-int fs_enum_next(vfs_handle_t enum_handle, vfs_enum_batch_t *batch) {
+int FsEnumNext(vfs_handle_t enum_handle, vfs_enum_batch_t *batch) {
     if (!batch)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -281,7 +317,7 @@ int fs_enum_next(vfs_handle_t enum_handle, vfs_enum_batch_t *batch) {
 
         vfs_resp_enum_next_t *resp     = (vfs_resp_enum_next_t *)s_resp;
         int                   resp_len = (int)sizeof(*resp);
-        int                   r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+        int                   r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
         if (r < 0)
             return r;
         if (resp->ret < 0)
@@ -301,14 +337,14 @@ int fs_enum_next(vfs_handle_t enum_handle, vfs_enum_batch_t *batch) {
     return (int)batch->batch_count;
 }
 
-int fs_enum_end(vfs_handle_t enum_handle) {
-    return fs_close(enum_handle);
+int FsEnumEnd(vfs_handle_t enum_handle) {
+    return FsClose(enum_handle);
 }
 
-int fs_stat_volume(const char *url, u64 *total_bytes, u64 *used_bytes, u32 *read_only) {
+int FsStatVolume(const char *url, u64 *total_bytes, u64 *used_bytes, u32 *read_only) {
     if (!url)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -319,7 +355,7 @@ int fs_stat_volume(const char *url, u64 *total_bytes, u64 *used_bytes, u32 *read
 
     vfs_resp_stat_volume_t *resp     = (vfs_resp_stat_volume_t *)s_resp;
     int                     resp_len = (int)sizeof(*resp);
-    int                     r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int                     r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     if (resp->ret < 0)
@@ -333,10 +369,10 @@ int fs_stat_volume(const char *url, u64 *total_bytes, u64 *used_bytes, u32 *read
     return 0;
 }
 
-int fs_whoami(u64 *out_subject) {
+int FsWhoami(u64 *out_subject) {
     if (!out_subject)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -346,7 +382,7 @@ int fs_whoami(u64 *out_subject) {
 
     vfs_resp_whoami_t *resp     = (vfs_resp_whoami_t *)s_resp;
     int                resp_len = (int)sizeof(*resp);
-    int                r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int                r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     if (resp->ret < 0)
@@ -355,10 +391,10 @@ int fs_whoami(u64 *out_subject) {
     return 0;
 }
 
-int fs_list_volumes(vfs_vol_info_t *out_vols, u32 *out_count) {
+int FsListVolumes(vfs_vol_info_t *out_vols, u32 *out_count) {
     if (!out_vols || !out_count)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -368,7 +404,7 @@ int fs_list_volumes(vfs_vol_info_t *out_vols, u32 *out_count) {
 
     vfs_resp_list_volumes_t *resp     = (vfs_resp_list_volumes_t *)s_resp;
     int                      resp_len = (int)sizeof(*resp);
-    int                      r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int                      r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     if (resp->ret < 0)
@@ -386,11 +422,11 @@ int fs_list_volumes(vfs_vol_info_t *out_vols, u32 *out_count) {
  * Phase 2: security-scoped bookmarks + move (design §5, §8)
  * ==================================================================== */
 
-int fs_create_bookmark(
+int FsCreateBookmark(
     const char *url, u32 access, u64 expiry_ticks, u8 *out_blob, u32 *out_blob_len) {
     if (!url || !out_blob || !out_blob_len)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -403,7 +439,7 @@ int fs_create_bookmark(
 
     vfs_resp_create_bookmark_t *resp     = (vfs_resp_create_bookmark_t *)s_resp;
     int                         resp_len = (int)sizeof(*resp);
-    int                         r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int                         r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     if (resp->ret < 0)
@@ -415,14 +451,14 @@ int fs_create_bookmark(
     return 0;
 }
 
-int fs_resolve_bookmark(const u8        *blob,
+int FsResolveBookmark(const u8        *blob,
                         u32              bk_len,
                         vfs_handle_t    *out_handle,
                         vfs_item_info_t *out_item,
                         u32             *out_access) {
     if (!blob || !out_handle || bk_len == 0 || bk_len > VFS_BOOKMARK_MAX)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -434,7 +470,7 @@ int fs_resolve_bookmark(const u8        *blob,
 
     vfs_resp_resolve_bookmark_t *resp     = (vfs_resp_resolve_bookmark_t *)s_resp;
     int                          resp_len = (int)sizeof(*resp);
-    int                          r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int                          r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     if (resp->ret < 0)
@@ -447,10 +483,10 @@ int fs_resolve_bookmark(const u8        *blob,
     return 0;
 }
 
-int fs_revoke_bookmark(const u8 *blob, u32 bk_len) {
+int FsRevokeBookmark(const u8 *blob, u32 bk_len) {
     if (!blob || bk_len == 0 || bk_len > VFS_BOOKMARK_MAX)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -462,33 +498,33 @@ int fs_revoke_bookmark(const u8 *blob, u32 bk_len) {
 
     vfs_resp_revoke_bookmark_t *resp     = (vfs_resp_revoke_bookmark_t *)s_resp;
     int                         resp_len = (int)sizeof(*resp);
-    int                         r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int                         r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     return resp->ret;
 }
 
-int fs_move_item(const char      *src,
+int FsMoveItem(const char      *src,
                  const char      *dst_dir,
                  const char      *new_name,
                  vfs_item_info_t *out_item) {
     if (!src || !dst_dir)
         return ERR_INVAL;
-    int port = fs_port();
+    int port = FsPort();
     if (port < 0)
         return port;
 
     vfs_req_move_t *req = (vfs_req_move_t *)s_req;
     memset(req, 0, sizeof(*req));
     req->op = VFS_OP_MOVE;
-    fs_strncpy_utf8(req->src, src, (int)sizeof(req->src));
-    fs_strncpy_utf8(req->dst_dir, dst_dir, (int)sizeof(req->dst_dir));
+    FsStrncpyUtf8(req->src, src, (int)sizeof(req->src));
+    FsStrncpyUtf8(req->dst_dir, dst_dir, (int)sizeof(req->dst_dir));
     if (new_name)
-        fs_strncpy_utf8(req->new_name, new_name, (int)sizeof(req->new_name));
+        FsStrncpyUtf8(req->new_name, new_name, (int)sizeof(req->new_name));
 
     vfs_resp_move_t *resp     = (vfs_resp_move_t *)s_resp;
     int              resp_len = (int)sizeof(*resp);
-    int              r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int              r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     if (resp->ret < 0)
@@ -502,9 +538,9 @@ int fs_move_item(const char      *src,
  * into the caller at `map_virt` (a vspace_alloc()'d range).  Returns
  * the mapped size in bytes (>= 0), or a negative error — ERR_NOENT
  * means the file is not pool-backed and the caller should fall back to
- * chunked fs_read(). */
-int fs_read_map(vfs_handle_t handle, void *map_virt, u32 *mapped_size) {
-    int port = fs_port();
+ * chunked FsRead(). */
+int FsReadMap(vfs_handle_t handle, void *map_virt, u32 *mapped_size) {
+    int port = FsPort();
     if (port < 0)
         return port;
 
@@ -516,7 +552,7 @@ int fs_read_map(vfs_handle_t handle, void *map_virt, u32 *mapped_size) {
 
     vfs_resp_read_map_t *resp     = (vfs_resp_read_map_t *)s_resp;
     int                  resp_len = (int)sizeof(*resp);
-    int                  r        = ipc_call(port, req, (int)sizeof(*req), resp, &resp_len);
+    int                  r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
     if (r < 0)
         return r;
     if (resp->ret < 0)

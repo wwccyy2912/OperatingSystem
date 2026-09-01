@@ -1,7 +1,20 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * ime_tab.h - pinyin -> hanzi candidate table for the pinyin IME
  * Auto-generated (gen_ime.py + pypinyin).  Sorted by pinyin;
- * binary-search with ime_lookup().  Only code points present in
+ * binary-search with ImeLookup().  Only code points present in
  * font_cjk.h are listed, so every candidate is renderable.
  */
 #ifndef USER_LIB_LIBIME_IME_TAB_H

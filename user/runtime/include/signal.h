@@ -1,15 +1,28 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * signal.h - POSIX-style signal definitions for user-space
  * Copyright (c) 2026 OpSys Project
  *
  * Compatibility header.  The canonical signal API (constants, types,
- * signal()/kill()) lives in <libos/syscalls.h>, which mirrors
+ * Signal()/Kill()) lives in <libos/syscalls.h>, which mirrors
  * kernel/include/kernel/signal.h.  This header exists so code written
  * against the POSIX name <signal.h> still compiles unchanged.
  *
  * Note: only the kernel-implemented signal subset is exposed.  In
  * particular SIGCHLD/SIGCONT are NOT defined — the kernel has no
- * child-status tracking, and kill(pid, SIGCHLD) would return ERR_INVAL.
+ * child-status tracking, and Kill(pid, SIGCHLD) would return ERR_INVAL.
  */
 
 #ifndef SIGNAL_H
@@ -24,7 +37,7 @@
 /*
  * Signal-safe functions:
  *   - write()
- *   - signal(), kill()
+ *   - Signal(), Kill()
  *   - exit(), _exit()
  *   - Async-safe list per POSIX 1003.1-2004
  *

@@ -5,6 +5,21 @@
  * Uses x87 FPU instructions (inline asm) for hardware-accelerated
  * operations (sqrt, fabs, sin, cos, etc.) and software algorithms
  * for the rest.  Float and long-double variants delegate to double.
+ 
+ *
+ * ------------------------------------------------------------------
+ * Structure (math):
+ *   MATH_FN(name) macro instantiates fabs/sqrt/floor/ceil/pow/... as
+ *   soft-float or SSE-scalar helpers per target flags.
+ * How it works:
+ *   Each standard function is a tiny wrapper; unsupported operations
+ *   degrade to approximations or the FPU instruction.
+ * Purpose:
+ *   Minimal libm for the user runtime.
+ * Caveats:
+ *   Precision is not IEEE-754-perfect; errno/domain errors are not
+ *   fully modelled.
+ * ------------------------------------------------------------------
  */
 
 #include "math.h"
@@ -13,53 +28,53 @@
  * x87 FPU helpers (inline assembly)
  * ==================================================================== */
 
-static inline double fpu_fabs(double x) {
+static inline double FpuFabs(double x) {
     __asm__ volatile("fabs" : "+t"(x));
     return x;
 }
 
-static inline double fpu_sqrt(double x) {
+static inline double FpuSqrt(double x) {
     __asm__ volatile("fsqrt" : "+t"(x));
     return x;
 }
 
-static inline double fpu_fchsn(double x) {
+static inline double FpuFchsn(double x) {
     __asm__ volatile("fchs" : "+t"(x));
     return x;
 }
 
-static inline double fpu_sin(double x) {
+static inline double FpuSin(double x) {
     __asm__ volatile("fsin" : "+t"(x));
     return x;
 }
 
-static inline double fpu_cos(double x) {
+static inline double FpuCos(double x) {
     __asm__ volatile("fcos" : "+t"(x));
     return x;
 }
 
-static inline double fpu_frndint(double x) {
+static inline double FpuFrndint(double x) {
     __asm__ volatile("frndint" : "+t"(x));
     return x;
 }
 
-static inline double fpu_scale(double x, double s) {
+static inline double FpuScale(double x, double s) {
     __asm__ volatile("fscale" : "+t"(x) : "u"(s));
     return x;
 }
 
-static inline double fpu_f2xm1(double x) {
+static inline double FpuF2xm1(double x) {
     __asm__ volatile("f2xm1" : "+t"(x));
     return x;
 }
 
-static inline double fpu_fyl2x(double x, double y) {
+static inline double FpuFyl2x(double x, double y) {
     double result;
     __asm__ volatile("fyl2x" : "=t"(result) : "0"(x), "u"(y) : "st(1)");
     return result;
 }
 
-static inline double fpu_fpatan(double x, double y) {
+static inline double FpuFpatan(double x, double y) {
     double result;
     __asm__ volatile("fpatan" : "=t"(result) : "0"(x), "u"(y) : "st(1)");
     return result;
@@ -70,48 +85,48 @@ static inline double fpu_fpatan(double x, double y) {
  * ==================================================================== */
 
 double fabs(double x) {
-    return fpu_fabs(x);
+    return FpuFabs(x);
 }
 double sqrt(double x) {
-    return x < 0.0 ? NAN : fpu_sqrt(x);
+    return x < 0.0 ? NAN : FpuSqrt(x);
 }
 
 double ceil(double x) {
-    double r = fpu_frndint(x);
+    double r = FpuFrndint(x);
     return r < x ? r + 1.0 : r;
 }
 
 double floor(double x) {
-    double r = fpu_frndint(x);
+    double r = FpuFrndint(x);
     return r > x ? r - 1.0 : r;
 }
 
-double trunc(double x) {
+double Trunc(double x) {
     return x >= 0.0 ? floor(x) : ceil(x);
 }
 
-double round(double x) {
+double Round(double x) {
     return x >= 0.0 ? floor(x + 0.5) : ceil(x - 0.5);
 }
 
-long lround(double x) {
-    return (long)round(x);
+long Lround(double x) {
+    return (long)Round(x);
 }
-long long llround(double x) {
-    return (long long)round(x);
+long long Llround(double x) {
+    return (long long)Round(x);
 }
 
-double nearbyint(double x) {
-    return fpu_frndint(x);
+double Nearbyint(double x) {
+    return FpuFrndint(x);
 }
-double rint(double x) {
-    return fpu_frndint(x);
+double Rint(double x) {
+    return FpuFrndint(x);
 }
-long lrint(double x) {
-    return (long)fpu_frndint(x);
+long Lrint(double x) {
+    return (long)FpuFrndint(x);
 }
-long long llrint(double x) {
-    return (long long)fpu_frndint(x);
+long long Llrint(double x) {
+    return (long long)FpuFrndint(x);
 }
 
 double fmod(double x, double y) {
@@ -121,42 +136,42 @@ double fmod(double x, double y) {
     return x - (double)q * y;
 }
 
-double remainder(double x, double y) {
+double Remainder(double x, double y) {
     if (y == 0.0)
         return NAN;
-    double r = x - y * round(x / y);
+    double r = x - y * Round(x / y);
     return r;
 }
 
-double remquo(double x, double y, int *quo) {
+double Remquo(double x, double y, int *quo) {
     if (quo)
-        *quo = (int)trunc(x / y) & 7;
-    return remainder(x, y);
+        *quo = (int)Trunc(x / y) & 7;
+    return Remainder(x, y);
 }
 
-double copysign(double x, double y) {
-    double ax = fpu_fabs(x);
-    return y >= 0.0 ? ax : fpu_fchsn(ax);
+double Copysign(double x, double y) {
+    double ax = FpuFabs(x);
+    return y >= 0.0 ? ax : FpuFchsn(ax);
 }
 
-double fdim(double x, double y) {
+double Fdim(double x, double y) {
     return x > y ? x - y : 0.0;
 }
 
-double fmax(double x, double y) {
+double Fmax(double x, double y) {
     return x > y ? x : y;
 }
-double fmin(double x, double y) {
+double Fmin(double x, double y) {
     return x < y ? x : y;
 }
 
-double fma(double x, double y, double z) {
+double Fma(double x, double y, double z) {
     return x * y + z;
 }
 
-double hypot(double x, double y) {
-    x = fpu_fabs(x);
-    y = fpu_fabs(y);
+double Hypot(double x, double y) {
+    x = FpuFabs(x);
+    y = FpuFabs(y);
     if (x < y) {
         double t = x;
         x        = y;
@@ -165,15 +180,15 @@ double hypot(double x, double y) {
     if (x == 0.0)
         return 0.0;
     double r = y / x;
-    return x * fpu_sqrt(1.0 + r * r);
+    return x * FpuSqrt(1.0 + r * r);
 }
 
-double nan(const char *tagp) {
+double Nan(const char *tagp) {
     (void)tagp;
     return NAN;
 }
 
-double nextafter(double x, double y) {
+double Nextafter(double x, double y) {
     if (isnan(x) || isnan(y))
         return NAN;
     if (x == y)
@@ -191,23 +206,23 @@ double nextafter(double x, double y) {
     return u.d;
 }
 
-double nexttoward(double x, long double y) {
-    return nextafter(x, (double)y);
+double Nexttoward(double x, long double y) {
+    return Nextafter(x, (double)y);
 }
 
-double scalbn(double x, int n) {
-    return fpu_scale(x, (double)n);
+double Scalbn(double x, int n) {
+    return FpuScale(x, (double)n);
 }
 
-double scalbln(double x, long n) {
-    return fpu_scale(x, (double)n);
+double Scalbln(double x, long n) {
+    return FpuScale(x, (double)n);
 }
 
-double ldexp(double x, int exp) {
-    return fpu_scale(x, (double)exp);
+double Ldexp(double x, int exp) {
+    return FpuScale(x, (double)exp);
 }
 
-double frexp(double value, int *exp) {
+double Frexp(double value, int *exp) {
     if (value == 0.0) {
         if (exp)
             *exp = 0;
@@ -225,8 +240,8 @@ double frexp(double value, int *exp) {
     return u.d;
 }
 
-double modf(double value, double *iptr) {
-    double i = trunc(value);
+double Modf(double value, double *iptr) {
+    double i = Trunc(value);
     if (iptr)
         *iptr = i;
     return value - i;
@@ -237,10 +252,10 @@ double modf(double value, double *iptr) {
  * ==================================================================== */
 
 double sin(double x) {
-    return fpu_sin(x);
+    return FpuSin(x);
 }
 double cos(double x) {
-    return fpu_cos(x);
+    return FpuCos(x);
 }
 
 double tan(double x) {
@@ -253,49 +268,49 @@ double tan(double x) {
     return r;
 }
 
-double asin(double x) {
+double Asin(double x) {
     if (x < -1.0 || x > 1.0)
         return NAN;
     if (x == 0.0)
         return 0.0;
-    /* asin(x) = atan(x / sqrt(1 - x^2)) */
-    return fpu_fpatan(x, fpu_sqrt(1.0 - x * x));
+    /* Asin(x) = atan(x / sqrt(1 - x^2)) */
+    return FpuFpatan(x, FpuSqrt(1.0 - x * x));
 }
 
-double acos(double x) {
+double Acos(double x) {
     if (x < -1.0 || x > 1.0)
         return NAN;
-    /* acos(x) = atan2(sqrt(1-x^2), x) */
-    return fpu_fpatan(fpu_sqrt(1.0 - x * x), x);
+    /* Acos(x) = atan2(sqrt(1-x^2), x) */
+    return FpuFpatan(FpuSqrt(1.0 - x * x), x);
 }
 
 double atan(double x) {
-    return fpu_fpatan(x, 1.0);
+    return FpuFpatan(x, 1.0);
 }
 
 double atan2(double y, double x) {
-    return fpu_fpatan(y, x);
+    return FpuFpatan(y, x);
 }
 
 /* ====================================================================
  * Hyperbolic functions (software)
  * ==================================================================== */
 
-double sinh(double x) {
+double Sinh(double x) {
     if (isinf(x))
         return x;
     double ex = exp(x);
     return (ex - 1.0 / ex) / 2.0;
 }
 
-double cosh(double x) {
+double Cosh(double x) {
     if (isinf(x))
-        return fpu_fabs(x);
+        return FpuFabs(x);
     double ex = exp(x);
     return (ex + 1.0 / ex) / 2.0;
 }
 
-double tanh(double x) {
+double Tanh(double x) {
     if (isinf(x))
         return x > 0 ? 1.0 : -1.0;
     double ex = exp(2.0 * x);
@@ -314,24 +329,24 @@ double exp(double x) {
     if (x == 0.0)
         return 1.0;
 
-    /* exp(x) = 2^(x * log2(e))
-     *        = 2^k * 2^r   where k = round(x*log2(e)), r = fractional */
+    /* exp(x) = 2^(x * Log2(e))
+     *        = 2^k * 2^r   where k = Round(x*Log2(e)), r = fractional */
     double t = x * M_LOG2E;
-    double k = round(t);
+    double k = Round(t);
     double r = t - k;
     /* 2^r - 1 via f2xm1, then scale by 2^k */
-    return fpu_scale(fpu_f2xm1(r) + 1.0, k);
+    return FpuScale(FpuF2xm1(r) + 1.0, k);
 }
 
-double exp2(double x) {
+double Exp2(double x) {
     if (x == 0.0)
         return 1.0;
-    double k = round(x);
+    double k = Round(x);
     double r = x - k;
-    return fpu_scale(fpu_f2xm1(r) + 1.0, k);
+    return FpuScale(FpuF2xm1(r) + 1.0, k);
 }
 
-double expm1(double x) {
+double Expm1(double x) {
     if (x == 0.0)
         return 0.0;
     return exp(x) - 1.0;
@@ -346,23 +361,23 @@ double log(double x) {
         return -INFINITY;
     if (isinf(x))
         return INFINITY;
-    /* log(x) = log2(x) / log2(e) = log2(x) * ln(2) */
-    return fpu_fyl2x(x, M_LN2);
+    /* log(x) = Log2(x) / Log2(e) = Log2(x) * ln(2) */
+    return FpuFyl2x(x, M_LN2);
 }
 
-double log2(double x) {
+double Log2(double x) {
     if (x <= 0.0)
         return (x == 0.0) ? -INFINITY : NAN;
-    return fpu_fyl2x(x, 1.0);
+    return FpuFyl2x(x, 1.0);
 }
 
 double log10(double x) {
     if (x <= 0.0)
         return (x == 0.0) ? -INFINITY : NAN;
-    return fpu_fyl2x(x, M_LN10 / M_LN2);
+    return FpuFyl2x(x, M_LN10 / M_LN2);
 }
 
-double log1p(double x) {
+double Log1p(double x) {
     if (x == 0.0)
         return 0.0;
     return log(1.0 + x);
@@ -381,19 +396,19 @@ double pow(double x, double y) {
         /* Integer exponent only for negative base. */
         long long yi = (long long)y;
         if ((double)yi == y) {
-            double r = exp(y * log(fpu_fabs(x)));
+            double r = exp(y * log(FpuFabs(x)));
             return (yi & 1) ? -r : r;
         }
         return NAN;
     }
-    /* x^y = exp(y * log(x)) = 2^(y * log2(x)) */
+    /* x^y = exp(y * log(x)) = 2^(y * Log2(x)) */
     return exp(y * log(x));
 }
 
-double cbrt(double x) {
+double Cbrt(double x) {
     if (x == 0.0)
         return 0.0;
-    double ax = fpu_fabs(x);
+    double ax = FpuFabs(x);
     double r  = exp(log(ax) / 3.0);
     return x < 0.0 ? -r : r;
 }
@@ -402,9 +417,9 @@ double cbrt(double x) {
  * Special functions (simplified)
  * ==================================================================== */
 
-double erf(double x) {
+double Erf(double x) {
     /* Abramowitz & Stegun approximation 7.1.26 */
-    double ax = fpu_fabs(x);
+    double ax = FpuFabs(x);
     double t  = 1.0 / (1.0 + 0.3275911 * ax);
     double y  = 1.0 -
                 (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t +
@@ -413,11 +428,11 @@ double erf(double x) {
     return x < 0.0 ? -y : y;
 }
 
-double erfc(double x) {
-    return 1.0 - erf(x);
+double Erfc(double x) {
+    return 1.0 - Erf(x);
 }
 
-double tgamma(double x) {
+double Tgamma(double x) {
     /* Lanczos approximation. */
     static const double g[] = {6.938676328e-11,
                                3.7021161e-10,
@@ -444,12 +459,12 @@ double tgamma(double x) {
     return pow(x / 2.718281828459045, x) * sum;
 }
 
-double lgamma(double x) {
+double Lgamma(double x) {
     /* Stirling series (good for x > 0.5). */
     if (x <= 0.0)
         return INFINITY;
     if (x < 0.5)
-        return log(M_PI / sin(M_PI * x)) - lgamma(1.0 - x);
+        return log(M_PI / sin(M_PI * x)) - Lgamma(1.0 - x);
     x -= 1.0;
     double r = 0.99999999999980993 + 676.5203681218851 / (x + 1) - 1259.1392167224028 / (x + 2) +
                771.32342877765313 / (x + 3) - 176.61502916214059 / (x + 4) +
@@ -468,330 +483,330 @@ double lgamma(double x) {
     }
 
 /* Simple delegation pattern for float functions. */
-float acosf(float x) {
-    return (float)acos((double)x);
+float Acosf(float x) {
+    return (float)Acos((double)x);
 }
-float asinf(float x) {
-    return (float)asin((double)x);
+float Asinf(float x) {
+    return (float)Asin((double)x);
 }
-float atanf(float x) {
+float Atanf(float x) {
     return (float)atan((double)x);
 }
-float atan2f(float y, float x) {
+float Atan2f(float y, float x) {
     return (float)atan2((double)y, (double)x);
 }
-float cosf(float x) {
+float Cosf(float x) {
     return (float)cos((double)x);
 }
-float sinf(float x) {
+float Sinf(float x) {
     return (float)sin((double)x);
 }
-float tanf(float x) {
+float Tanf(float x) {
     return (float)tan((double)x);
 }
-float coshf(float x) {
-    return (float)cosh((double)x);
+float Coshf(float x) {
+    return (float)Cosh((double)x);
 }
-float sinhf(float x) {
-    return (float)sinh((double)x);
+float Sinhf(float x) {
+    return (float)Sinh((double)x);
 }
-float tanhf(float x) {
-    return (float)tanh((double)x);
+float Tanhf(float x) {
+    return (float)Tanh((double)x);
 }
-float expf(float x) {
+float Expf(float x) {
     return (float)exp((double)x);
 }
-float exp2f(float x) {
-    return (float)exp2((double)x);
+float Exp2f(float x) {
+    return (float)Exp2((double)x);
 }
-float expm1f(float x) {
-    return (float)expm1((double)x);
+float Expm1f(float x) {
+    return (float)Expm1((double)x);
 }
-float frexpf(float v, int *e) {
-    double r = frexp((double)v, e);
+float Frexpf(float v, int *e) {
+    double r = Frexp((double)v, e);
     return (float)r;
 }
-float ldexpf(float x, int e) {
-    return (float)ldexp((double)x, e);
+float Ldexpf(float x, int e) {
+    return (float)Ldexp((double)x, e);
 }
-float logf(float x) {
+float Logf(float x) {
     return (float)log((double)x);
 }
-float log10f(float x) {
+float Log10f(float x) {
     return (float)log10((double)x);
 }
-float log2f(float x) {
-    return (float)log2((double)x);
+float Log2f(float x) {
+    return (float)Log2((double)x);
 }
-float log1pf(float x) {
-    return (float)log1p((double)x);
+float Log1pf(float x) {
+    return (float)Log1p((double)x);
 }
-float modff(float v, float *i) {
-    double d, r = modf((double)v, &d);
+float Modff(float v, float *i) {
+    double d, r = Modf((double)v, &d);
     *i = (float)d;
     return (float)r;
 }
-float scalbnf(float x, int n) {
-    return (float)scalbn((double)x, n);
+float Scalbnf(float x, int n) {
+    return (float)Scalbn((double)x, n);
 }
-float scalblnf(float x, long n) {
-    return (float)scalbln((double)x, n);
+float Scalblnf(float x, long n) {
+    return (float)Scalbln((double)x, n);
 }
-float cbrtf(float x) {
-    return (float)cbrt((double)x);
+float Cbrtf(float x) {
+    return (float)Cbrt((double)x);
 }
-float fabsf(float x) {
+float Fabsf(float x) {
     return (float)fabs((double)x);
 }
-float hypotf(float x, float y) {
-    return (float)hypot((double)x, (double)y);
+float Hypotf(float x, float y) {
+    return (float)Hypot((double)x, (double)y);
 }
-float powf(float x, float y) {
+float Powf(float x, float y) {
     return (float)pow((double)x, (double)y);
 }
-float sqrtf(float x) {
+float Sqrtf(float x) {
     return (float)sqrt((double)x);
 }
-float erff(float x) {
-    return (float)erf((double)x);
+float Erff(float x) {
+    return (float)Erf((double)x);
 }
-float erfcf(float x) {
-    return (float)erfc((double)x);
+float Erfcf(float x) {
+    return (float)Erfc((double)x);
 }
-float lgammaf(float x) {
-    return (float)lgamma((double)x);
+float Lgammaf(float x) {
+    return (float)Lgamma((double)x);
 }
-float tgammaf(float x) {
-    return (float)tgamma((double)x);
+float Tgammaf(float x) {
+    return (float)Tgamma((double)x);
 }
-float ceilf(float x) {
+float Ceilf(float x) {
     return (float)ceil((double)x);
 }
-float floorf(float x) {
+float Floorf(float x) {
     return (float)floor((double)x);
 }
-float nearbyintf(float x) {
-    return (float)nearbyint((double)x);
+float Nearbyintf(float x) {
+    return (float)Nearbyint((double)x);
 }
-float rintf(float x) {
-    return (float)rint((double)x);
+float Rintf(float x) {
+    return (float)Rint((double)x);
 }
-long lrintf(float x) {
-    return lrint((double)x);
+long Lrintf(float x) {
+    return Lrint((double)x);
 }
-long long llrintf(float x) {
-    return llrint((double)x);
+long long Llrintf(float x) {
+    return Llrint((double)x);
 }
-float roundf(float x) {
-    return (float)round((double)x);
+float Roundf(float x) {
+    return (float)Round((double)x);
 }
-long lroundf(float x) {
-    return lround((double)x);
+long Lroundf(float x) {
+    return Lround((double)x);
 }
-long long llroundf(float x) {
-    return llround((double)x);
+long long Llroundf(float x) {
+    return Llround((double)x);
 }
-float truncf(float x) {
-    return (float)trunc((double)x);
+float Truncf(float x) {
+    return (float)Trunc((double)x);
 }
-float fmodf(float x, float y) {
+float Fmodf(float x, float y) {
     return (float)fmod((double)x, (double)y);
 }
-float remainderf(float x, float y) {
-    return (float)remainder((double)x, (double)y);
+float Remainderf(float x, float y) {
+    return (float)Remainder((double)x, (double)y);
 }
-float remquof(float x, float y, int *q) {
-    double r = remquo((double)x, (double)y, q);
+float Remquof(float x, float y, int *q) {
+    double r = Remquo((double)x, (double)y, q);
     return (float)r;
 }
-float copysignf(float x, float y) {
-    return (float)copysign((double)x, (double)y);
+float Copysignf(float x, float y) {
+    return (float)Copysign((double)x, (double)y);
 }
-float nanf(const char *t) {
+float Nanf(const char *t) {
     (void)t;
     return NAN;
 }
-float nextafterf(float x, float y) {
-    return (float)nextafter((double)x, (double)y);
+float Nextafterf(float x, float y) {
+    return (float)Nextafter((double)x, (double)y);
 }
-float nexttowardf(float x, long double y) {
-    return (float)nextafter((double)x, (double)y);
+float Nexttowardf(float x, long double y) {
+    return (float)Nextafter((double)x, (double)y);
 }
-float fdimf(float x, float y) {
-    return (float)fdim((double)x, (double)y);
+float Fdimf(float x, float y) {
+    return (float)Fdim((double)x, (double)y);
 }
-float fmaxf(float x, float y) {
-    return (float)fmax((double)x, (double)y);
+float Fmaxf(float x, float y) {
+    return (float)Fmax((double)x, (double)y);
 }
-float fminf(float x, float y) {
-    return (float)fmin((double)x, (double)y);
+float Fminf(float x, float y) {
+    return (float)Fmin((double)x, (double)y);
 }
-float fmaf(float x, float y, float z) {
-    return (float)fma((double)x, (double)y, (double)z);
+float Fmaf(float x, float y, float z) {
+    return (float)Fma((double)x, (double)y, (double)z);
 }
 
 /* ====================================================================
  * long double variants (alias to double in v0.1)
  * ==================================================================== */
 
-long double acosl(long double x) {
-    return (long double)acos((double)x);
+long double Acosl(long double x) {
+    return (long double)Acos((double)x);
 }
-long double asinl(long double x) {
-    return (long double)asin((double)x);
+long double Asinl(long double x) {
+    return (long double)Asin((double)x);
 }
-long double atanl(long double x) {
+long double Atanl(long double x) {
     return (long double)atan((double)x);
 }
-long double atan2l(long double y, long double x) {
+long double Atan2l(long double y, long double x) {
     return (long double)atan2((double)y, (double)x);
 }
-long double cosl(long double x) {
+long double Cosl(long double x) {
     return (long double)cos((double)x);
 }
-long double sinl(long double x) {
+long double Sinl(long double x) {
     return (long double)sin((double)x);
 }
-long double tanl(long double x) {
+long double Tanl(long double x) {
     return (long double)tan((double)x);
 }
-long double coshl(long double x) {
-    return (long double)cosh((double)x);
+long double Coshl(long double x) {
+    return (long double)Cosh((double)x);
 }
-long double sinhl(long double x) {
-    return (long double)sinh((double)x);
+long double Sinhl(long double x) {
+    return (long double)Sinh((double)x);
 }
-long double tanhl(long double x) {
-    return (long double)tanh((double)x);
+long double Tanhl(long double x) {
+    return (long double)Tanh((double)x);
 }
-long double expl(long double x) {
+long double Expl(long double x) {
     return (long double)exp((double)x);
 }
-long double exp2l(long double x) {
-    return (long double)exp2((double)x);
+long double Exp2l(long double x) {
+    return (long double)Exp2((double)x);
 }
-long double expm1l(long double x) {
-    return (long double)expm1((double)x);
+long double Expm1l(long double x) {
+    return (long double)Expm1((double)x);
 }
-long double frexpl(long double v, int *e) {
-    double r = frexp((double)v, e);
+long double Frexpl(long double v, int *e) {
+    double r = Frexp((double)v, e);
     return (long double)r;
 }
-long double ldexpl(long double x, int e) {
-    return (long double)ldexp((double)x, e);
+long double Ldexpl(long double x, int e) {
+    return (long double)Ldexp((double)x, e);
 }
-long double logl(long double x) {
+long double Logl(long double x) {
     return (long double)log((double)x);
 }
-long double log10l(long double x) {
+long double Log10l(long double x) {
     return (long double)log10((double)x);
 }
-long double log2l(long double x) {
-    return (long double)log2((double)x);
+long double Log2l(long double x) {
+    return (long double)Log2((double)x);
 }
-long double log1pl(long double x) {
-    return (long double)log1p((double)x);
+long double Log1pl(long double x) {
+    return (long double)Log1p((double)x);
 }
-long double modfl(long double v, long double *i) {
-    double d, r = modf((double)v, &d);
+long double Modfl(long double v, long double *i) {
+    double d, r = Modf((double)v, &d);
     *i = (long double)d;
     return (long double)r;
 }
-long double scalbnl(long double x, int n) {
-    return (long double)scalbn((double)x, n);
+long double Scalbnl(long double x, int n) {
+    return (long double)Scalbn((double)x, n);
 }
-long double scalblnl(long double x, long n) {
-    return (long double)scalbln((double)x, n);
+long double Scalblnl(long double x, long n) {
+    return (long double)Scalbln((double)x, n);
 }
-long double cbrtl(long double x) {
-    return (long double)cbrt((double)x);
+long double Cbrtl(long double x) {
+    return (long double)Cbrt((double)x);
 }
-long double fabsl(long double x) {
+long double Fabsl(long double x) {
     return (long double)fabs((double)x);
 }
-long double hypotl(long double x, long double y) {
-    return (long double)hypot((double)x, (double)y);
+long double Hypotl(long double x, long double y) {
+    return (long double)Hypot((double)x, (double)y);
 }
-long double powl(long double x, long double y) {
+long double Powl(long double x, long double y) {
     return (long double)pow((double)x, (double)y);
 }
-long double sqrtl(long double x) {
+long double Sqrtl(long double x) {
     return (long double)sqrt((double)x);
 }
-long double erfl(long double x) {
-    return (long double)erf((double)x);
+long double Erfl(long double x) {
+    return (long double)Erf((double)x);
 }
-long double erfcl(long double x) {
-    return (long double)erfc((double)x);
+long double Erfcl(long double x) {
+    return (long double)Erfc((double)x);
 }
-long double lgammal(long double x) {
-    return (long double)lgamma((double)x);
+long double Lgammal(long double x) {
+    return (long double)Lgamma((double)x);
 }
-long double tgammal(long double x) {
-    return (long double)tgamma((double)x);
+long double Tgammal(long double x) {
+    return (long double)Tgamma((double)x);
 }
-long double ceill(long double x) {
+long double Ceill(long double x) {
     return (long double)ceil((double)x);
 }
-long double floorl(long double x) {
+long double Floorl(long double x) {
     return (long double)floor((double)x);
 }
-long double nearbyintl(long double x) {
-    return (long double)nearbyint((double)x);
+long double Nearbyintl(long double x) {
+    return (long double)Nearbyint((double)x);
 }
-long double rintl(long double x) {
-    return (long double)rint((double)x);
+long double Rintl(long double x) {
+    return (long double)Rint((double)x);
 }
-long lrintl(long double x) {
-    return lrint((double)x);
+long Lrintl(long double x) {
+    return Lrint((double)x);
 }
-long long llrintl(long double x) {
-    return llrint((double)x);
+long long Llrintl(long double x) {
+    return Llrint((double)x);
 }
-long double roundl(long double x) {
-    return (long double)round((double)x);
+long double Roundl(long double x) {
+    return (long double)Round((double)x);
 }
-long lroundl(long double x) {
-    return lround((double)x);
+long Lroundl(long double x) {
+    return Lround((double)x);
 }
-long long llroundl(long double x) {
-    return llround((double)x);
+long long Llroundl(long double x) {
+    return Llround((double)x);
 }
-long double truncl(long double x) {
-    return (long double)trunc((double)x);
+long double Truncl(long double x) {
+    return (long double)Trunc((double)x);
 }
-long double fmodl(long double x, long double y) {
+long double Fmodl(long double x, long double y) {
     return (long double)fmod((double)x, (double)y);
 }
-long double remainderl(long double x, long double y) {
-    return (long double)remainder((double)x, (double)y);
+long double Remainderl(long double x, long double y) {
+    return (long double)Remainder((double)x, (double)y);
 }
-long double remquol(long double x, long double y, int *q) {
-    double r = remquo((double)x, (double)y, q);
+long double Remquol(long double x, long double y, int *q) {
+    double r = Remquo((double)x, (double)y, q);
     return (long double)r;
 }
-long double copysignl(long double x, long double y) {
-    return (long double)copysign((double)x, (double)y);
+long double Copysignl(long double x, long double y) {
+    return (long double)Copysign((double)x, (double)y);
 }
-long double nanl(const char *t) {
+long double Nanl(const char *t) {
     (void)t;
     return NAN;
 }
-long double nextafterl(long double x, long double y) {
-    return (long double)nextafter((double)x, (double)y);
+long double Nextafterl(long double x, long double y) {
+    return (long double)Nextafter((double)x, (double)y);
 }
-long double nexttowardl(long double x, long double y) {
-    return (long double)nextafter((double)x, (double)y);
+long double Nexttowardl(long double x, long double y) {
+    return (long double)Nextafter((double)x, (double)y);
 }
-long double fdiml(long double x, long double y) {
-    return (long double)fdim((double)x, (double)y);
+long double Fdiml(long double x, long double y) {
+    return (long double)Fdim((double)x, (double)y);
 }
-long double fmaxl(long double x, long double y) {
-    return (long double)fmax((double)x, (double)y);
+long double Fmaxl(long double x, long double y) {
+    return (long double)Fmax((double)x, (double)y);
 }
-long double fminl(long double x, long double y) {
-    return (long double)fmin((double)x, (double)y);
+long double Fminl(long double x, long double y) {
+    return (long double)Fmin((double)x, (double)y);
 }
-long double fmal(long double x, long double y, long double z) {
-    return (long double)fma((double)x, (double)y, (double)z);
+long double Fmal(long double x, long double y, long double z) {
+    return (long double)Fma((double)x, (double)y, (double)z);
 }

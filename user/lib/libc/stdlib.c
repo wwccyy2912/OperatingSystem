@@ -4,6 +4,22 @@
  *
  * Numeric conversion, random numbers, searching, sorting.
  * String/memory functions now live in string.c.
+ 
+ *
+ * ------------------------------------------------------------------
+ * Structure (stdlib):
+ *   atoi/strtol family -> ParseNumber; malloc/calloc/realloc/free ->
+ *   runtime heap (malloc.c); getenv/setenv -> static environ table.
+ * How it works:
+ *   Numeric parsers delegate to a shared digit reader; memory calls
+ *   forward to the runtime allocator; environ is a fixed-size array
+ *   copied from the process image.
+ * Purpose:
+ *   C standard-library basics for user services.
+ * Caveats:
+ *   environ has a fixed cap; strtol overflow follows C99 (clamped,
+ *   errno-style).
+ * ------------------------------------------------------------------
  */
 
 /* Limits for strtol/strtoll — defined here because GCC freestanding
@@ -50,7 +66,7 @@ long long atoll(const char *s) {
  * If base == 0, auto-detect: 0x → 16, 0 → 8, else → 10.
  * Skips leading whitespace and handles an optional +/- sign.
  */
-static unsigned long long parse_int(const char *s, char **endptr, int base, int *neg) {
+static unsigned long long ParseInt(const char *s, char **endptr, int base, int *neg) {
     *neg = 0;
 
     /* Skip whitespace */
@@ -112,7 +128,7 @@ static unsigned long long parse_int(const char *s, char **endptr, int base, int 
 
 long strtol(const char *s, char **endptr, int base) {
     int                neg;
-    unsigned long long val = parse_int(s, endptr, base, &neg);
+    unsigned long long val = ParseInt(s, endptr, base, &neg);
 
     /* Clamp to LONG_MAX/LONG_MIN on overflow */
     if (val > (unsigned long long)(neg ? -(unsigned long long)LONG_MIN : LONG_MAX)) {
@@ -124,7 +140,7 @@ long strtol(const char *s, char **endptr, int base) {
 
 unsigned long strtoul(const char *s, char **endptr, int base) {
     int                neg;
-    unsigned long long val = parse_int(s, endptr, base, &neg);
+    unsigned long long val = ParseInt(s, endptr, base, &neg);
     if (neg)
         val = -val;
     return (unsigned long)val;
@@ -132,7 +148,7 @@ unsigned long strtoul(const char *s, char **endptr, int base) {
 
 long long strtoll(const char *s, char **endptr, int base) {
     int                neg;
-    unsigned long long val = parse_int(s, endptr, base, &neg);
+    unsigned long long val = ParseInt(s, endptr, base, &neg);
 
     if (val > (unsigned long long)(neg ? -((unsigned long long)LLONG_MIN) : LLONG_MAX))
         val = neg ? -((unsigned long long)LLONG_MIN) : (unsigned long long)LLONG_MAX;
@@ -142,7 +158,7 @@ long long strtoll(const char *s, char **endptr, int base) {
 
 unsigned long long strtoull(const char *s, char **endptr, int base) {
     int                neg;
-    unsigned long long val = parse_int(s, endptr, base, &neg);
+    unsigned long long val = ParseInt(s, endptr, base, &neg);
     if (neg)
         val = -val;
     return val;
@@ -209,7 +225,7 @@ void *bsearch(const void *key,
  * Quick sort (simple Hoare partition, unoptimised)
  * ==================================================================== */
 
-static void swap(char *a, char *b, size_t size) {
+static void Swap(char *a, char *b, size_t size) {
     for (size_t i = 0; i < size; i++) {
         char t = a[i];
         a[i]   = b[i];
@@ -217,7 +233,7 @@ static void swap(char *a, char *b, size_t size) {
     }
 }
 
-static void qsort_range(
+static void QsortRange(
     char *base, size_t lo, size_t hi, size_t size, int (*compar)(const void *, const void *)) {
     if (lo >= hi)
         return;
@@ -234,7 +250,7 @@ static void qsort_range(
             j--;
         if (i >= j)
             break;
-        swap(base + i * size, base + j * size, size);
+        Swap(base + i * size, base + j * size, size);
         /* If we swapped the pivot, update pivot_ptr */
         if (i == pivot)
             pivot_ptr = base + j * size;
@@ -245,15 +261,15 @@ static void qsort_range(
     }
 
     if (j > lo)
-        qsort_range(base, lo, j, size, compar);
+        QsortRange(base, lo, j, size, compar);
     if (i < hi)
-        qsort_range(base, i, hi, size, compar);
+        QsortRange(base, i, hi, size, compar);
 }
 
 void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *)) {
     if (nmemb <= 1)
         return;
-    qsort_range((char *)base, 0, nmemb - 1, size, compar);
+    QsortRange((char *)base, 0, nmemb - 1, size, compar);
 }
 
 /* ====================================================================
@@ -275,12 +291,12 @@ static int s_quick_atexit_count = 0;
 
 _Noreturn void abort(void) {
     /* No SIGABRT delivery in v0.1 — terminate directly. */
-    thread_exit(134); /* 128 + SIGABRT(6) per POSIX */
+    ThreadExit(134); /* 128 + SIGABRT(6) per POSIX */
     __builtin_unreachable();
 }
 
 _Noreturn void _Exit(int status) {
-    thread_exit(status);
+    ThreadExit(status);
     __builtin_unreachable();
 }
 
@@ -304,7 +320,7 @@ _Noreturn void quick_exit(int status) {
  *
  * Process-local environment: a NULL-terminated array of "NAME=value"
  * strings.  The array is heap-allocated and grown on demand; entries
- * are strdup'd on setenv (putenv installs the caller's string as-is,
+ * are strdup'd on Setenv(putenv installs the caller's string as-is,
  * matching POSIX).  Thread-safety: the shell is single-threaded at
  * env-mutation points; concurrent setenv from multiple threads is not
  * a supported pattern (documented).
@@ -325,7 +341,7 @@ static size_t s_env_count = 0; /* entries in use (excl. NULL terminator) */
 static size_t s_env_cap   = 0; /* allocated slots (incl. NULL terminator) */
 
 /* NAME is valid iff non-empty and contains no '='. */
-static int env_name_valid(const char *name) {
+static int EnvNameValid(const char *name) {
     if (!name || name[0] == '\0')
         return 0;
     for (const char *p = name; *p; p++)
@@ -335,7 +351,7 @@ static int env_name_valid(const char *name) {
 }
 
 /* Index of the entry whose NAME matches (returns -1 when absent). */
-static long env_find(const char *name) {
+static long EnvFind(const char *name) {
     size_t nlen = strlen(name);
     for (size_t i = 0; i < s_env_count; i++) {
         if (strncmp(environ[i], name, nlen) == 0 && environ[i][nlen] == '=')
@@ -347,18 +363,18 @@ static long env_find(const char *name) {
 char *getenv(const char *name) {
     if (!name || !environ)
         return NULL;
-    long i = env_find(name);
+    long i = EnvFind(name);
     if (i < 0)
         return NULL;
     char *eq = strchr(environ[i], '=');
     return eq ? eq + 1 : NULL;
 }
 
-int setenv(const char *name, const char *value, int overwrite) {
-    if (!env_name_valid(name) || !value)
+int Setenv(const char *name, const char *value, int overwrite) {
+    if (!EnvNameValid(name) || !value)
         return -1;
 
-    long i = env_find(name);
+    long i = EnvFind(name);
     if (i >= 0 && !overwrite)
         return -1; /* already set and overwrite disallowed */
 
@@ -399,10 +415,10 @@ int setenv(const char *name, const char *value, int overwrite) {
     return 0;
 }
 
-int unsetenv(const char *name) {
-    if (!env_name_valid(name))
+int Unsetenv(const char *name) {
+    if (!EnvNameValid(name))
         return -1;
-    long i = env_find(name);
+    long i = EnvFind(name);
     if (i < 0)
         return 0; /* not set: success, nothing to do */
     free(environ[i]);
@@ -413,7 +429,7 @@ int unsetenv(const char *name) {
     return 0;
 }
 
-int putenv(char *string) {
+int Putenv(char *string) {
     if (!string)
         return -1;
     char *eq = strchr(string, '=');
@@ -423,7 +439,7 @@ int putenv(char *string) {
     /* NAME = [string, eq).  Temporarily split for the lookup. */
     char saved = *eq;
     *eq        = '\0';
-    long i     = env_find(string);
+    long i     = EnvFind(string);
     *eq        = saved;
 
     if (i >= 0) {
@@ -450,7 +466,7 @@ int putenv(char *string) {
     return 0;
 }
 
-int system(const char *string) {
+int System(const char *string) {
     /* No shell execution in v0.1.  Per C11: if string is NULL,
      * return 0 (no command processor available). */
     (void)string;

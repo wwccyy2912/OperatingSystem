@@ -1,6 +1,39 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * gui.c - Pixel graphics library implementation (see gui.h)
  * Copyright (c) 2026 OpSys Project
+ *
+ * ------------------------------------------------------------------
+ * Structure (canvas, drawing, text, blit):
+ *   GuiFbOpen -> fb_map() -> gui_canvas_t {w,h,pitch,bpp,buf}
+ *   Primitives (Pixel/Fill/Hline/Vline/Rect) -> GuiXrgb -> pitch-addressed writes
+ *   GuiText -> UTF-8 decode -> GuiTextCodepoint (8x16 ASCII | 16x16 CJK)
+ *   GuiBlit -> same-bpp region copy (src -> dst)
+ * How it works:
+ *   GuiFbOpen maps the framebuffer below 4 GiB and records its geometry
+ *   in the canvas; draw calls then write pixels directly into that
+ *   mapping.  GuiText rasterizes each decoded codepoint from bitmap
+ *   fonts (gui_font ASCII, font_cjk_lookup double-width CJK, '?' fallback).
+ * Purpose:
+ *   User-space pixel GUI: primitives, mixed ASCII/CJK text, region blits
+ *   for window compositing.
+ * Caveats:
+ *   Window buffers share the 32bpp xRGB layout; 24bpp canvases cannot be
+ *   blitted verbatim.  No unmap syscall exists, so GuiFbClose only
+ *   invalidates the descriptor and the mapping outlives the canvas.
+ * ------------------------------------------------------------------
  */
 
 #include "gui.h"
@@ -10,12 +43,12 @@
 
 /* ---- Framebuffer ---- */
 
-int gui_fb_open(gui_canvas_t *c) {
+int GuiFbOpen(gui_canvas_t *c) {
     if (!c)
         return -2; /* ERR_INVAL */
 
     fb_user_info_t info;
-    int            ret = fb_get_info(&info);
+    int            ret = FbGetInfo(&info);
     if (ret < 0)
         return ret;
 
@@ -43,7 +76,7 @@ int gui_fb_open(gui_canvas_t *c) {
     return 0;
 }
 
-void gui_fb_close(gui_canvas_t *c) {
+void GuiFbClose(gui_canvas_t *c) {
     /* No unmap syscall is exposed today; the mapping lives for the
      * process lifetime.  Zero the descriptor so it cannot be reused. */
     if (c)
@@ -56,21 +89,21 @@ void gui_fb_close(gui_canvas_t *c) {
  * the QEMU VGA 32bpp layout is [unused, R, G, B] in memory (little
  * endian byte1 = R), so a color's red byte must land at bit 8.  Window
  * buffers use the SAME xRGB words, so blits copy verbatim. */
-static u32 gui_xrgb(u32 color) {
+static u32 GuiXrgb(u32 color) {
     u8 r  = (u8)(color >> 16);
     u8 g  = (u8)(color >> 8);
     u8 b  = (u8)(color);
     return ((u32)b << 24) | ((u32)g << 16) | ((u32)r << 8);
 }
 
-void gui_pixel(gui_canvas_t *c, int x, int y, u32 color) {
+void GuiPixel(gui_canvas_t *c, int x, int y, u32 color) {
     if (!c || !c->buf)
         return;
     if (x < 0 || y < 0 || (u32)x >= c->w || (u32)y >= c->h)
         return;
 
     if (c->bpp == 32) {
-        *(volatile u32 *)(c->buf + (u64)y * c->pitch + (u64)x * 4) = gui_xrgb(color);
+        *(volatile u32 *)(c->buf + (u64)y * c->pitch + (u64)x * 4) = GuiXrgb(color);
     } else if (c->bpp == 24) {
         volatile u8 *p = c->buf + (u64)y * c->pitch + (u64)x * 3;
         p[0]           = (u8)(color);
@@ -79,7 +112,7 @@ void gui_pixel(gui_canvas_t *c, int x, int y, u32 color) {
     }
 }
 
-void gui_fill(gui_canvas_t *c, int x, int y, int w, int h, u32 color) {
+void GuiFill(gui_canvas_t *c, int x, int y, int w, int h, u32 color) {
     if (!c || !c->buf || w <= 0 || h <= 0)
         return;
     if (x < 0) {
@@ -100,7 +133,7 @@ void gui_fill(gui_canvas_t *c, int x, int y, int w, int h, u32 color) {
         return;
 
     if (c->bpp == 32) {
-        u32 px = gui_xrgb(color);
+        u32 px = GuiXrgb(color);
         for (int row = 0; row < h; row++) {
             volatile u32 *line = (volatile u32 *)(c->buf + (u64)(y + row) * c->pitch);
             for (int col = 0; col < w; col++)
@@ -122,29 +155,29 @@ void gui_fill(gui_canvas_t *c, int x, int y, int w, int h, u32 color) {
     }
 }
 
-void gui_hline(gui_canvas_t *c, int x, int y, int len, u32 color) {
+void GuiHline(gui_canvas_t *c, int x, int y, int len, u32 color) {
     if (len < 0) {
         x += len;
         len = -len;
     }
-    gui_fill(c, x, y, len, 1, color);
+    GuiFill(c, x, y, len, 1, color);
 }
 
-void gui_vline(gui_canvas_t *c, int x, int y, int len, u32 color) {
+void GuiVline(gui_canvas_t *c, int x, int y, int len, u32 color) {
     if (len < 0) {
         y += len;
         len = -len;
     }
-    gui_fill(c, x, y, 1, len, color);
+    GuiFill(c, x, y, 1, len, color);
 }
 
-void gui_rect(gui_canvas_t *c, int x, int y, int w, int h, u32 color) {
+void GuiRect(gui_canvas_t *c, int x, int y, int w, int h, u32 color) {
     if (w <= 0 || h <= 0)
         return;
-    gui_hline(c, x, y, w, color);
-    gui_hline(c, x, y + h - 1, w, color);
-    gui_vline(c, x, y, h, color);
-    gui_vline(c, x + w - 1, y, h, color);
+    GuiHline(c, x, y, w, color);
+    GuiHline(c, x, y + h - 1, w, color);
+    GuiVline(c, x, y, h, color);
+    GuiVline(c, x + w - 1, y, h, color);
 }
 
 /* ---- Text (8x16 VGA font + 16x16 CJK font, UTF-8) ---- */
@@ -153,7 +186,7 @@ void gui_rect(gui_canvas_t *c, int x, int y, int w, int h, u32 color) {
 #include "../../lib/font_cjk.h"
 
 /* Render one code point at *px (advanced by the glyph width). */
-static void gui_text_codepoint(gui_canvas_t *c, int *pxp, int y, u32 cp,
+static void GuiTextCodepoint(gui_canvas_t *c, int *pxp, int y, u32 cp,
                                u32 fg, u32 bg) {
     int px = *pxp;
     if (cp > 0x7F) {
@@ -165,15 +198,15 @@ static void gui_text_codepoint(gui_canvas_t *c, int *pxp, int y, u32 cp,
                 u8 lo = glyph[row * 2 + 1];
                 for (int col = 0; col < 8; col++) {
                     if (hi & (0x80 >> col))
-                        gui_pixel(c, px + col, y + row, fg);
+                        GuiPixel(c, px + col, y + row, fg);
                     else if (bg != 0)
-                        gui_pixel(c, px + col, y + row, bg);
+                        GuiPixel(c, px + col, y + row, bg);
                 }
                 for (int col = 0; col < 8; col++) {
                     if (lo & (0x80 >> col))
-                        gui_pixel(c, px + 8 + col, y + row, fg);
+                        GuiPixel(c, px + 8 + col, y + row, fg);
                     else if (bg != 0)
-                        gui_pixel(c, px + 8 + col, y + row, bg);
+                        GuiPixel(c, px + 8 + col, y + row, bg);
                 }
             }
             *pxp = px + 16;
@@ -190,16 +223,16 @@ static void gui_text_codepoint(gui_canvas_t *c, int *pxp, int y, u32 cp,
         u8 bits = glyph[row];
         for (int col = 0; col < 8; col++) {
             if (bits & (0x80 >> col)) {
-                gui_pixel(c, px + col, y + row, fg);
+                GuiPixel(c, px + col, y + row, fg);
             } else if (bg != 0) {
-                gui_pixel(c, px + col, y + row, bg);
+                GuiPixel(c, px + col, y + row, bg);
             }
         }
     }
     *pxp = px + 8;
 }
 
-void gui_text(gui_canvas_t *c, int x, int y, const char *s, u32 fg, u32 bg) {
+void GuiText(gui_canvas_t *c, int x, int y, const char *s, u32 fg, u32 bg) {
     if (!c || !c->buf || !s)
         return;
 
@@ -214,7 +247,7 @@ void gui_text(gui_canvas_t *c, int x, int y, const char *s, u32 fg, u32 bg) {
             if ((ch & 0xC0) == 0x80) {
                 cp = (cp << 6) | (ch & 0x3F);
                 if (--left == 0)
-                    gui_text_codepoint(c, &px, y, cp, fg, bg);
+                    GuiTextCodepoint(c, &px, y, cp, fg, bg);
             } else {
                 left = 0; /* malformed: drop */
             }
@@ -230,15 +263,15 @@ void gui_text(gui_canvas_t *c, int x, int y, const char *s, u32 fg, u32 bg) {
             cp = ch & 0x07;
             left = 3;
         } else if (ch < 0x80) {
-            gui_text_codepoint(c, &px, y, ch, fg, bg);
+            GuiTextCodepoint(c, &px, y, ch, fg, bg);
         } else {
-            gui_text_codepoint(c, &px, y, '?', fg, bg);
+            GuiTextCodepoint(c, &px, y, '?', fg, bg);
         }
     }
 }
 
 /* Pixel width of a UTF-8 string (ASCII 8px, CJK 16px). */
-int gui_text_width(const char *s) {
+int GuiTextWidth(const char *s) {
     if (!s)
         return 0;
     int  w = 0;
@@ -278,7 +311,7 @@ int gui_text_width(const char *s) {
 
 /* ---- Blit (same-bpp region copy) ---- */
 
-void gui_blit(gui_canvas_t *dst, int dx, int dy,
+void GuiBlit(gui_canvas_t *dst, int dx, int dy,
               const gui_canvas_t *src, int sx, int sy, int w, int h) {
     if (!dst || !dst->buf || !src || !src->buf)
         return;

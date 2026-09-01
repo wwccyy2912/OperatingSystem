@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * pkg.h - pkg-manager protocol (v0.3 沙盒应用容器, docs/ops_format.md)
  * Copyright (c) 2026 OpSys Project
  *
@@ -26,7 +39,7 @@
  * Contract status: FROZEN for Phase A (see docs/ops_format.md header).
  * Do not modify fields/ops in this file without orchestrator approval.
  *
- * Transport: flat structs over ipc_call()/ipc_recv()+ipc_reply() like
+ * Transport: flat structs over IpcCall()/IpcRecv()+IpcReply() like
  * the VFS/perm protocols; req[0] = op code, all messages < 4096.
  */
 
@@ -44,7 +57,7 @@ typedef uint64_t u64;
 #define PKG_PORT_NAME "pkg" /* service port */
 
 /* Bounds (docs/ops_format.md §2/§3) */
-#define PKG_NAME_MAX     64  /* app_id / blob name (incl NUL) */
+#define PKG_NAME_MAX     64  /* app_id / blob name(incl NUL) */
 #define PKG_PERMS_MAX    256 /* comma-separated atom names     */
 #define PKG_MANIFEST_MAX 512 /* manifest text length           */
 #define PKG_MAX_APPS     8   /* installed app listing cap      */
@@ -72,7 +85,7 @@ enum {
 
 typedef struct {
     u32  op;                   /* = PKG_OP_INSTALL */
-    char name[PKG_NAME_MAX];   /* kernel blob name (app_id) */
+    char name[PKG_NAME_MAX];   /* kernel blob name(app_id) */
     char perms[PKG_PERMS_MAX]; /* comma-separated atom names, "" = none */
 } pkg_req_install_t;
 
@@ -98,7 +111,7 @@ typedef struct {
  * RUN — spawn an installed app.
  *
  * pkg-manager reads the .ops back from VFS, parses the manifest, records
- * s_pending{pid → manifest atoms}, then process_create()s the payload
+ * s_pending{pid → manifest atoms}, then ProcessCreate()s the payload
  * ELF and returns the pid.  Grant issuance happens on APP_READY (the
  * app cannot receive atoms before it runs).
  * ==================================================================== */
@@ -129,11 +142,11 @@ typedef struct {
 /* ====================================================================
  * APP_READY — sandbox handshake from a freshly spawned app.
  *
- * pkg-manager derives the caller's REAL subject from ipc_recv_from (the
- * kernel — unforgeable), looks it up via proc_info_by_subject() to get
+ * pkg-manager derives the caller's REAL subject from IpcRecvFrom(the
+ * kernel — unforgeable), looks it up via ProcInfoBySubject() to get
  * pid + name, and cross-checks against the pending RUN record.  Only on
  * match does it sign the manifest atoms into that subject's kernel cap
- * table (cap_grant_to_subject, gated on pkg's ATOM_SERVICE_MANAGE).
+ * table (CapGrantToSubject, gated on pkg's ATOM_SERVICE_MANAGE).
  * Replies 0 on success; ERR_NOENT (no pending record / name mismatch)
  * or ERR_NOCAP otherwise — the app must treat non-zero as "no rights".
  * ==================================================================== */

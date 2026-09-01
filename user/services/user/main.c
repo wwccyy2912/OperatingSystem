@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * user.c - User account service (independent process)
  * Copyright (c) 2026 OpSys Project
  *
@@ -22,6 +35,26 @@
  *
  * Password hashing: FNV-1a-64 + per-account salt.  Integrity-only —
  * documented limitation (no crypto library in-tree).
+ *
+ * ------------------------------------------------------------------
+ * Structure (UserMain):
+ *   main() -> registers "user" port, single-threaded ipc_recv loop
+ *     account table: username, password hash+salt, role, subject bind
+ *   LOGIN  sets perm role via PERM_OP_ROLE_SET (ATOM_SERVICE_MANAGE)
+ *   STOP/VERIFY exit guard: stop user processes after TUI confirm
+ * How it works:
+ *   Owns accounts and the subject->account binding; LOGIN synchronizes
+ *   the caller's perm role with the account role.  USER_OP_STOP stops a
+ *   user-level process after a TUI confirm + OWNER/ADMIN password check,
+ *   because the shell lacks the atom to SYS_KILL directly.
+ * Purpose:
+ *   User account service: usernames, password hashes, roles, and the
+ *   exit guard that stops user-level processes under password control.
+ * Caveats:
+ *   Default "admin"/"admin" account is created on first boot — change
+ *   it with `passwd`.  Hashing is FNV-1a-64 + salt (integrity-only,
+ *   no crypto library in-tree).  System-critical services are refused.
+ * ------------------------------------------------------------------
  */
 
 #include <stdint.h>
@@ -64,7 +97,7 @@ static user_bind_t s_binds[USER_MAX_ACCOUNTS];
 /*  Password hashing (FNV-1a-64 + salt) — integrity only              */
 /* ------------------------------------------------------------------ */
 
-static uint64_t fnv1a64(const char *s) {
+static uint64_t Fnv1a64(const char *s) {
     uint64_t h = 0xcbf29ce484222325ULL;
     while (*s) {
         h ^= (uint8_t)*s++;
@@ -73,14 +106,14 @@ static uint64_t fnv1a64(const char *s) {
     return h;
 }
 
-static uint64_t pw_hash(const char *pw, uint64_t salt) {
-    return fnv1a64(pw) ^ (salt * 0x9E3779B97F4A7C15ULL);
+static uint64_t PwHash(const char *pw, uint64_t salt) {
+    return Fnv1a64(pw) ^ (salt * 0x9E3779B97F4A7C15ULL);
 }
 
 /* Not cryptographically random, but enough to decorrelate salts. */
-static uint64_t salt_gen(void) {
-    uint64_t t = (uint64_t)get_time();
-    uint64_t p = (uint64_t)get_pid();
+static uint64_t SaltGen(void) {
+    uint64_t t = (uint64_t)GetTime();
+    uint64_t p = (uint64_t)GetPid();
     return t ^ (p << 32) ^ 0xA5A5A5A5A5A5A5A5ULL;
 }
 
@@ -96,11 +129,11 @@ static user_acct_t *acct_find(const char *name) {
     return NULL;
 }
 
-static int acct_verify(const user_acct_t *a, const char *pw) {
-    return a && pw_hash(pw, a->salt) == a->pw_hash;
+static int AcctVerify(const user_acct_t *a, const char *pw) {
+    return a && PwHash(pw, a->salt) == a->pw_hash;
 }
 
-static int acct_count(void) {
+static int AcctCount(void) {
     int n = 0;
     for (int i = 0; i < USER_MAX_ACCOUNTS; i++)
         if (s_accts[i].in_use)
@@ -108,7 +141,7 @@ static int acct_count(void) {
     return n;
 }
 
-static int acct_admin_count(void) {
+static int AcctAdminCount(void) {
     int n = 0;
     for (int i = 0; i < USER_MAX_ACCOUNTS; i++)
         if (s_accts[i].in_use &&
@@ -118,7 +151,7 @@ static int acct_admin_count(void) {
 }
 
 /* Admin+: OWNER or ADMIN account role. */
-static int acct_is_admin(const user_acct_t *a) {
+static int AcctIsAdmin(const user_acct_t *a) {
     return a && (a->role == PERM_ROLE_OWNER || a->role == PERM_ROLE_ADMIN);
 }
 
@@ -135,8 +168,8 @@ static user_acct_t *acct_of_subject(uint64_t subject) {
 /*  Role sync into perm (PERM_OP_ROLE_SET)                            */
 /* ------------------------------------------------------------------ */
 
-static int perm_role_set(uint64_t subject, uint32_t role) {
-    int port = port_get(PERM_PORT_NAME);
+static int PermRoleSet(uint64_t subject, uint32_t role) {
+    int port = PortGet(PERM_PORT_NAME);
     if (port < 0)
         return port;
     perm_req_role_set_t req;
@@ -147,7 +180,7 @@ static int perm_role_set(uint64_t subject, uint32_t role) {
     perm_resp_role_set_t resp;
     memset(&resp, 0, sizeof(resp));
     int rlen = (int)sizeof(resp);
-    if (ipc_call(port, &req, (int)sizeof(req), &resp, &rlen) < 0)
+    if (IpcCall(port, &req, (int)sizeof(req), &resp, &rlen) < 0)
         return ERR_NOCAP;
     return resp.ret;
 }
@@ -156,7 +189,7 @@ static int perm_role_set(uint64_t subject, uint32_t role) {
 /*  Handlers                                                          */
 /* ------------------------------------------------------------------ */
 
-static void do_login(int token, int msg_len, uint64_t caller) {
+static void DoLogin(int token, int msg_len, uint64_t caller) {
     user_resp_login_t *resp = (user_resp_login_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
@@ -176,7 +209,7 @@ static void do_login(int token, int msg_len, uint64_t caller) {
         printf("user: login '%s' rejected (account disabled)\n", a->name);
         goto out;
     }
-    if (!acct_verify(a, req->password)) {
+    if (!AcctVerify(a, req->password)) {
         /* Lockout: N consecutive failures disables the account. */
         a->fail_count++;
         if (a->fail_count >= USER_MAX_LOGIN_ATTEMPTS) {
@@ -218,7 +251,7 @@ static void do_login(int token, int msg_len, uint64_t caller) {
     }
 
     /* Sync the account role into the permission engine. */
-    int r = perm_role_set(caller, a->role);
+    int r = PermRoleSet(caller, a->role);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -229,9 +262,9 @@ static void do_login(int token, int msg_len, uint64_t caller) {
      * user service holds ATOM_SERVICE_MANAGE (blob-seeded), so the
      * kernel accepts its grant.  Revoked on logout. */
     if (a->role == PERM_ROLE_OWNER || a->role == PERM_ROLE_ADMIN) {
-        (void)cap_grant_to_subject(caller, ATOM_SYS_SHUTDOWN, RIGHT_ALL, 0, 0);
+        (void)CapGrantToSubject(caller, ATOM_SYS_SHUTDOWN, RIGHT_ALL, 0, 0);
     } else {
-        (void)cap_revoke_by_atom(caller, ATOM_SYS_SHUTDOWN, 0);
+        (void)CapRevokeByAtom(caller, ATOM_SYS_SHUTDOWN, 0);
     }
     resp->role = a->role;
     strncpy(resp->name, a->name, sizeof(resp->name) - 1);
@@ -242,10 +275,10 @@ static void do_login(int token, int msg_len, uint64_t caller) {
            a->role,
            (unsigned long long)caller);
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_logout(int token, int msg_len, uint64_t caller) {
+static void DoLogout(int token, int msg_len, uint64_t caller) {
     user_resp_login_t *resp = (user_resp_login_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     (void)msg_len;
@@ -262,14 +295,14 @@ static void do_logout(int token, int msg_len, uint64_t caller) {
         }
     }
     /* Fall back to the default role and drop the shutdown capability. */
-    (void)perm_role_set(caller, PERM_ROLE_DEFAULT);
-    (void)cap_revoke_by_atom(caller, ATOM_SYS_SHUTDOWN, 0);
+    (void)PermRoleSet(caller, PERM_ROLE_DEFAULT);
+    (void)CapRevokeByAtom(caller, ATOM_SYS_SHUTDOWN, 0);
     resp->ret = 0;
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_whoami(int token, int msg_len, uint64_t caller) {
+static void DoWhoami(int token, int msg_len, uint64_t caller) {
     user_resp_login_t *resp = (user_resp_login_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     (void)msg_len;
@@ -283,12 +316,12 @@ static void do_whoami(int token, int msg_len, uint64_t caller) {
     resp->name[sizeof(resp->name) - 1] = '\0';
     resp->ret = 0;
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* Verify a name+password pair WITHOUT binding (exit guard pre-check).
  * The shell shows the TUI prompt, then calls this before stopping. */
-static void do_verify(int token, int msg_len) {
+static void DoVerify(int token, int msg_len) {
     user_resp_login_t *resp = (user_resp_login_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
@@ -298,17 +331,17 @@ static void do_verify(int token, int msg_len) {
     req->name[USER_NAME_MAX - 1]     = '\0';
     req->password[USER_PW_MAX - 1]   = '\0';
     user_acct_t *a = acct_find(req->name);
-    if (!a || !acct_verify(a, req->password)) {
+    if (!a || !AcctVerify(a, req->password)) {
         resp->ret = ERR_DENIED;
         goto out;
     }
     resp->role = a->role;
     resp->ret  = 0;
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_passwd(int token, int msg_len, uint64_t caller) {
+static void DoPasswd(int token, int msg_len, uint64_t caller) {
     user_resp_passwd_t *resp = (user_resp_passwd_t *)s_resp;
     resp->ret = ERR_INVAL;
     if (msg_len < (int)sizeof(user_req_passwd_t))
@@ -333,17 +366,17 @@ static void do_passwd(int token, int msg_len, uint64_t caller) {
             resp->ret = ERR_NOENT;
             goto out;
         }
-        if (target != me && !acct_is_admin(me)) {
+        if (target != me && !AcctIsAdmin(me)) {
             resp->ret = ERR_DENIED; /* only admin may change others */
             goto out;
         }
-        if (target != me && !acct_verify(me, req->old_password)) {
+        if (target != me && !AcctVerify(me, req->old_password)) {
             resp->ret = ERR_DENIED; /* admin re-auth for changing others */
             goto out;
         }
     }
 
-    if (target == me && !acct_verify(me, req->old_password)) {
+    if (target == me && !AcctVerify(me, req->old_password)) {
         resp->ret = ERR_DENIED; /* wrong current password */
         goto out;
     }
@@ -352,15 +385,15 @@ static void do_passwd(int token, int msg_len, uint64_t caller) {
         goto out;
     }
 
-    target->salt    = salt_gen();
-    target->pw_hash = pw_hash(req->new_password, target->salt);
+    target->salt    = SaltGen();
+    target->pw_hash = PwHash(req->new_password, target->salt);
     resp->ret       = 0;
     printf("user: password changed for '%s'\n", target->name);
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_useradd(int token, int msg_len, uint64_t caller) {
+static void DoUseradd(int token, int msg_len, uint64_t caller) {
     user_resp_login_t *resp = (user_resp_login_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
@@ -371,7 +404,7 @@ static void do_useradd(int token, int msg_len, uint64_t caller) {
     req->password[USER_PW_MAX - 1] = '\0';
 
     user_acct_t *me = acct_of_subject(caller);
-    if (!acct_is_admin(me)) {
+    if (!AcctIsAdmin(me)) {
         resp->ret = ERR_DENIED; /* admin only */
         goto out;
     }
@@ -388,7 +421,7 @@ static void do_useradd(int token, int msg_len, uint64_t caller) {
         resp->ret = ERR_INVAL;
         goto out;
     }
-    if (acct_count() >= USER_MAX_ACCOUNTS) {
+    if (AcctCount() >= USER_MAX_ACCOUNTS) {
         resp->ret = ERR_NOMEM;
         goto out;
     }
@@ -398,8 +431,8 @@ static void do_useradd(int token, int msg_len, uint64_t caller) {
             a->in_use        = 1;
             strncpy(a->name, req->name, sizeof(a->name) - 1);
             a->name[sizeof(a->name) - 1] = '\0';
-            a->salt          = salt_gen();
-            a->pw_hash       = pw_hash(req->password, a->salt);
+            a->salt          = SaltGen();
+            a->pw_hash       = PwHash(req->password, a->salt);
             a->role          = req->role;
             resp->ret        = 0;
             printf("user: account '%s' created (role=%u)\n", a->name, a->role);
@@ -408,10 +441,10 @@ static void do_useradd(int token, int msg_len, uint64_t caller) {
     }
     resp->ret = ERR_NOMEM;
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_userdel(int token, int msg_len, uint64_t caller) {
+static void DoUserdel(int token, int msg_len, uint64_t caller) {
     user_resp_login_t *resp = (user_resp_login_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
@@ -421,7 +454,7 @@ static void do_userdel(int token, int msg_len, uint64_t caller) {
     req->name[USER_NAME_MAX - 1] = '\0';
 
     user_acct_t *me = acct_of_subject(caller);
-    if (!acct_is_admin(me)) {
+    if (!AcctIsAdmin(me)) {
         resp->ret = ERR_DENIED;
         goto out;
     }
@@ -434,7 +467,7 @@ static void do_userdel(int token, int msg_len, uint64_t caller) {
         resp->ret = ERR_DENIED; /* cannot delete yourself */
         goto out;
     }
-    if (acct_is_admin(target) && acct_admin_count() <= 1) {
+    if (AcctIsAdmin(target) && AcctAdminCount() <= 1) {
         resp->ret = ERR_DENIED; /* cannot delete the last admin */
         goto out;
     }
@@ -449,12 +482,12 @@ static void do_userdel(int token, int msg_len, uint64_t caller) {
     resp->ret = 0;
     printf("user: account '%s' deleted\n", req->name);
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* LOCK/UNLOCK: admin disables or re-enables an account.  Cannot lock
  * yourself or the last admin (same guard as userdel). */
-static void do_lock(int token, int msg_len, uint64_t caller, int lock) {
+static void DoLock(int token, int msg_len, uint64_t caller, int lock) {
     user_resp_login_t *resp = (user_resp_login_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
@@ -464,7 +497,7 @@ static void do_lock(int token, int msg_len, uint64_t caller, int lock) {
     req->name[USER_NAME_MAX - 1] = '\0';
 
     user_acct_t *me = acct_of_subject(caller);
-    if (!acct_is_admin(me)) {
+    if (!AcctIsAdmin(me)) {
         resp->ret = ERR_DENIED;
         goto out;
     }
@@ -478,7 +511,7 @@ static void do_lock(int token, int msg_len, uint64_t caller, int lock) {
             resp->ret = ERR_DENIED; /* cannot lock yourself */
             goto out;
         }
-        if (acct_is_admin(target) && acct_admin_count() <= 1) {
+        if (AcctIsAdmin(target) && AcctAdminCount() <= 1) {
             resp->ret = ERR_DENIED; /* cannot lock the last admin */
             goto out;
         }
@@ -498,15 +531,15 @@ static void do_lock(int token, int msg_len, uint64_t caller, int lock) {
     }
     resp->ret = 0;
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_users(int token, int msg_len, uint64_t caller) {
+static void DoUsers(int token, int msg_len, uint64_t caller) {
     user_resp_login_t *resp = (user_resp_login_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     (void)msg_len;
     user_acct_t *me = acct_of_subject(caller);
-    if (!acct_is_admin(me)) {
+    if (!AcctIsAdmin(me)) {
         resp->ret = ERR_DENIED;
         goto out;
     }
@@ -531,7 +564,7 @@ static void do_users(int token, int msg_len, uint64_t caller) {
     }
     resp->ret = 0;
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* ------------------------------------------------------------------ */
@@ -543,7 +576,7 @@ static const char *const s_critical[] = {
     "fs_virtio_blk_driver", "perm", "manager", "user",
 };
 
-static int svc_is_critical(const char *name) {
+static int SvcIsCritical(const char *name) {
     for (unsigned i = 0; i < sizeof(s_critical) / sizeof(s_critical[0]); i++) {
         if (strcmp(s_critical[i], name) == 0)
             return 1;
@@ -551,7 +584,7 @@ static int svc_is_critical(const char *name) {
     return 0;
 }
 
-static void do_stop(int token, int msg_len, uint64_t caller) {
+static void DoStop(int token, int msg_len, uint64_t caller) {
     user_resp_stop_t *resp = (user_resp_stop_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
@@ -561,12 +594,12 @@ static void do_stop(int token, int msg_len, uint64_t caller) {
     req->svc[USER_NAME_MAX - 1] = '\0';
 
     user_acct_t *me = acct_of_subject(caller);
-    if (!acct_is_admin(me)) {
+    if (!AcctIsAdmin(me)) {
         resp->ret = ERR_DENIED;
         snprintf(resp->detail, sizeof(resp->detail), "requires OWNER/ADMIN");
         goto out;
     }
-    if (svc_is_critical(req->svc)) {
+    if (SvcIsCritical(req->svc)) {
         resp->ret = ERR_DENIED;
         snprintf(resp->detail, sizeof(resp->detail), "'%s' is a system-critical service",
                  req->svc);
@@ -576,7 +609,7 @@ static void do_stop(int token, int msg_len, uint64_t caller) {
     /* Resolve the process by name and SIGKILL it (this service holds
      * ATOM_SERVICE_MANAGE, so the kernel's kill gate passes). */
     proc_info_t list[64];
-    int         n = process_list(list, 64);
+    int         n = ProcessList(list, 64);
     if (n <= 0) {
         resp->ret = ERR_NOENT;
         goto out;
@@ -585,7 +618,7 @@ static void do_stop(int token, int msg_len, uint64_t caller) {
     for (int i = 0; i < n; i++) {
         if (strcmp(list[i].name, req->svc) == 0 && list[i].state != 3 &&
             list[i].state != 4) {
-            int r = kill(list[i].pid, SIGKILL);
+            int r = Kill(list[i].pid, SIGKILL);
             if (r == 0) {
                 resp->ret   = 0;
                 snprintf(resp->detail, sizeof(resp->detail), "'%s' (PID %d) stopped",
@@ -604,7 +637,7 @@ static void do_stop(int token, int msg_len, uint64_t caller) {
         snprintf(resp->detail, sizeof(resp->detail), "'%s' not running", req->svc);
     }
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* ------------------------------------------------------------------ */
@@ -622,7 +655,7 @@ static user_acct_t *caller_acct(uint64_t caller) {
     return acct_of_subject(caller);
 }
 
-static void do_policy_set(int token, int msg_len, uint64_t caller) {
+static void DoPolicySet(int token, int msg_len, uint64_t caller) {
     user_resp_policy_t *resp = (user_resp_policy_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
@@ -632,13 +665,13 @@ static void do_policy_set(int token, int msg_len, uint64_t caller) {
     req->cmd[sizeof(req->cmd) - 1] = '\0';
 
     user_acct_t *me = caller_acct(caller);
-    if (!acct_is_admin(me)) {
+    if (!AcctIsAdmin(me)) {
         resp->ret = ERR_DENIED; /* OWNER/ADMIN only */
         goto out;
     }
 
     /* Forward to the policy service (we hold ATOM_SERVICE_MANAGE). */
-    int pp = port_get(POLICY_PORT_NAME);
+    int pp = PortGet(POLICY_PORT_NAME);
     if (pp < 0) {
         resp->ret = ERR_NOENT;
         goto out;
@@ -653,29 +686,29 @@ static void do_policy_set(int token, int msg_len, uint64_t caller) {
     policy_resp_set_t prr;
     memset(&prr, 0, sizeof(prr));
     int rlen = (int)sizeof(prr);
-    int r    = ipc_call(pp, &pr, (int)sizeof(pr), &prr, &rlen);
+    int r    = IpcCall(pp, &pr, (int)sizeof(pr), &prr, &rlen);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
     resp->ret = prr.ret;
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_policy_dump(int token, int msg_len, uint64_t caller) {
+static void DoPolicyDump(int token, int msg_len, uint64_t caller) {
     user_resp_policy_t *resp = (user_resp_policy_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
     (void)msg_len;
 
     user_acct_t *me = caller_acct(caller);
-    if (!acct_is_admin(me)) {
+    if (!AcctIsAdmin(me)) {
         resp->ret = ERR_DENIED; /* OWNER/ADMIN only */
         goto out;
     }
 
-    int pp = port_get(POLICY_PORT_NAME);
+    int pp = PortGet(POLICY_PORT_NAME);
     if (pp < 0) {
         resp->ret = ERR_NOENT;
         goto out;
@@ -686,7 +719,7 @@ static void do_policy_dump(int token, int msg_len, uint64_t caller) {
     policy_resp_dump_t prr;
     memset(&prr, 0, sizeof(prr));
     int rlen = (int)sizeof(prr);
-    int r    = ipc_call(pp, &pr, (int)sizeof(pr), &prr, &rlen);
+    int r    = IpcCall(pp, &pr, (int)sizeof(pr), &prr, &rlen);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -698,7 +731,7 @@ static void do_policy_dump(int token, int msg_len, uint64_t caller) {
             strncpy(resp->lines[i], prr.lines[i], sizeof(resp->lines[0]) - 1);
     }
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* ------------------------------------------------------------------ */
@@ -712,7 +745,7 @@ out:
 /* ------------------------------------------------------------------ */
 
 /* Same critical list as do_stop. */
-static int svc_is_critical_name(const char *name) {
+static int SvcIsCriticalName(const char *name) {
     static const char *const crit[] = {
         "serial", "term", "keyboard", "vfs", "fs_mem_driver",
         "fs_virtio_blk_driver", "perm", "manager", "user", "policy"};
@@ -722,7 +755,7 @@ static int svc_is_critical_name(const char *name) {
     return 0;
 }
 
-static void do_kill(int token, int msg_len, uint64_t caller) {
+static void DoKill(int token, int msg_len, uint64_t caller) {
     user_resp_kill_t *resp = (user_resp_kill_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
@@ -731,7 +764,7 @@ static void do_kill(int token, int msg_len, uint64_t caller) {
     user_req_kill_t *req = (user_req_kill_t *)s_req;
 
     user_acct_t *me = acct_of_subject(caller);
-    if (!acct_is_admin(me)) {
+    if (!AcctIsAdmin(me)) {
         resp->ret = ERR_DENIED; /* OWNER/ADMIN only */
         snprintf(resp->detail, sizeof(resp->detail), "requires OWNER/ADMIN");
         goto out;
@@ -743,7 +776,7 @@ static void do_kill(int token, int msg_len, uint64_t caller) {
 
     /* Resolve the process name for the criticality check. */
     proc_info_t list[64];
-    int         n = process_list(list, 64);
+    int         n = ProcessList(list, 64);
     if (n <= 0) {
         resp->ret = ERR_NOENT;
         goto out;
@@ -752,13 +785,13 @@ static void do_kill(int token, int msg_len, uint64_t caller) {
     for (int i = 0; i < n; i++) {
         if (list[i].pid == req->pid) {
             found = 1;
-            if (svc_is_critical_name(list[i].name)) {
+            if (SvcIsCriticalName(list[i].name)) {
                 resp->ret = ERR_DENIED;
                 snprintf(resp->detail, sizeof(resp->detail),
                          "'%s' is system-critical", list[i].name);
                 goto out;
             }
-            int r = kill(list[i].pid, SIGKILL);
+            int r = Kill(list[i].pid, SIGKILL);
             if (r == 0) {
                 resp->ret = 0;
                 snprintf(resp->detail, sizeof(resp->detail), "'%s' (PID %d) killed",
@@ -776,7 +809,7 @@ static void do_kill(int token, int msg_len, uint64_t caller) {
         snprintf(resp->detail, sizeof(resp->detail), "PID %d not running", req->pid);
     }
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* ------------------------------------------------------------------ */
@@ -789,7 +822,7 @@ out:
 /*  re-checking the caller is OWNER/ADMIN — same pattern as KILL.       */
 /* ------------------------------------------------------------------ */
 
-static void do_disk(int token, int msg_len, uint64_t caller) {
+static void DoDisk(int token, int msg_len, uint64_t caller) {
     user_resp_disk_t *resp = (user_resp_disk_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
@@ -799,7 +832,7 @@ static void do_disk(int token, int msg_len, uint64_t caller) {
     req->volume[sizeof(req->volume) - 1] = '\0';
 
     user_acct_t *me = acct_of_subject(caller);
-    if (!acct_is_admin(me)) {
+    if (!AcctIsAdmin(me)) {
         resp->ret = ERR_DENIED; /* OWNER/ADMIN only */
         snprintf(resp->detail, sizeof(resp->detail), "requires OWNER/ADMIN");
         goto out;
@@ -811,7 +844,7 @@ static void do_disk(int token, int msg_len, uint64_t caller) {
         goto out;
     }
 
-    int dp = port_get("vfs.fs.virtio_blk");
+    int dp = PortGet("vfs.fs.virtio_blk");
     if (dp < 0) {
         resp->ret = ERR_NOENT;
         snprintf(resp->detail, sizeof(resp->detail), "block driver not running");
@@ -841,7 +874,7 @@ static void do_disk(int token, int msg_len, uint64_t caller) {
     static drv_resp_t drr; /* ~4 KB: keep off the small service stack */
     memset(&drr, 0, sizeof(drr));
     int rlen = (int)sizeof(drr);
-    int r    = ipc_call(dp, &dr, (int)sizeof(dr), &drr, &rlen);
+    int r    = IpcCall(dp, &dr, (int)sizeof(dr), &drr, &rlen);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -851,67 +884,67 @@ static void do_disk(int token, int msg_len, uint64_t caller) {
     if (drr.ret < 0)
         snprintf(resp->detail, sizeof(resp->detail), "driver error %d", drr.ret);
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* ------------------------------------------------------------------ */
 /*  Dispatch                                                          */
 /* ------------------------------------------------------------------ */
 
-static void user_handle(int token, u32 op, int msg_len, uint64_t caller) {
+static void UserHandle(int token, u32 op, int msg_len, uint64_t caller) {
     switch (op) {
     case USER_OP_LOGIN:
-        do_login(token, msg_len, caller);
+        DoLogin(token, msg_len, caller);
         break;
     case USER_OP_LOGOUT:
-        do_logout(token, msg_len, caller);
+        DoLogout(token, msg_len, caller);
         break;
     case USER_OP_PASSWD:
-        do_passwd(token, msg_len, caller);
+        DoPasswd(token, msg_len, caller);
         break;
     case USER_OP_USERADD:
-        do_useradd(token, msg_len, caller);
+        DoUseradd(token, msg_len, caller);
         break;
     case USER_OP_USERDEL:
-        do_userdel(token, msg_len, caller);
+        DoUserdel(token, msg_len, caller);
         break;
     case USER_OP_USERS:
-        do_users(token, msg_len, caller);
+        DoUsers(token, msg_len, caller);
         break;
     case USER_OP_WHOAMI:
-        do_whoami(token, msg_len, caller);
+        DoWhoami(token, msg_len, caller);
         break;
     case USER_OP_VERIFY:
-        do_verify(token, msg_len);
+        DoVerify(token, msg_len);
         break;
     case USER_OP_STOP:
-        do_stop(token, msg_len, caller);
+        DoStop(token, msg_len, caller);
         break;
     case USER_OP_LOCK:
-        do_lock(token, msg_len, caller, 1);
+        DoLock(token, msg_len, caller, 1);
         break;
     case USER_OP_UNLOCK:
-        do_lock(token, msg_len, caller, 0);
+        DoLock(token, msg_len, caller, 0);
         break;
     case USER_OP_POLICY_SET:
-        do_policy_set(token, msg_len, caller);
+        DoPolicySet(token, msg_len, caller);
         break;
     case USER_OP_POLICY_DUMP:
-        do_policy_dump(token, msg_len, caller);
+        DoPolicyDump(token, msg_len, caller);
         break;
     case USER_OP_KILL:
-        do_kill(token, msg_len, caller);
+        DoKill(token, msg_len, caller);
         break;
     case USER_OP_DISK_MOUNT:
     case USER_OP_DISK_UNMOUNT:
     case USER_OP_DISK_FORMAT:
     case USER_OP_DISK_FILL:
-        do_disk(token, msg_len, caller);
+        DoDisk(token, msg_len, caller);
         break;
     default: {
         i32 *resp = (i32 *)s_resp;
         *resp     = ERR_INVAL;
-        (void)ipc_reply(token, resp, (int)sizeof(i32));
+        (void)IpcReply(token, resp, (int)sizeof(i32));
         break;
     }
     }
@@ -924,26 +957,26 @@ int main(void) {
         s_binds[i].acct = -1;
 
     /* Bootstrap: seed a default admin account on first boot. */
-    if (acct_count() == 0) {
+    if (AcctCount() == 0) {
         user_acct_t *a   = &s_accts[0];
         a->in_use        = 1;
         strncpy(a->name, "admin", sizeof(a->name) - 1);
         a->name[sizeof(a->name) - 1] = '\0';
-        a->salt          = salt_gen();
-        a->pw_hash       = pw_hash("admin", a->salt);
+        a->salt          = SaltGen();
+        a->pw_hash       = PwHash("admin", a->salt);
         a->role          = PERM_ROLE_OWNER;
         printf("user: DEFAULT admin/admin created - CHANGE THE PASSWORD (passwd)\n");
     }
 
-    int port = ipc_port_create();
+    int port = IpcPortCreate();
     if (port < 0) {
         printf("user: ipc_port_create failed (%d)\n", port);
-        thread_exit(1);
+        ThreadExit(1);
     }
-    int ret = port_register(USER_PORT_NAME, port);
+    int ret = PortRegister(USER_PORT_NAME, port);
     if (ret < 0) {
-        printf("user: port_register('%s') failed (%d)\n", USER_PORT_NAME, ret);
-        thread_exit(1);
+        printf("user: PortRegister('%s') failed (%d)\n", USER_PORT_NAME, ret);
+        ThreadExit(1);
     }
     printf("user: port %d registered as '%s'\n", port, USER_PORT_NAME);
 
@@ -951,18 +984,18 @@ int main(void) {
         int  msg_len        = (int)sizeof(s_req);
         int  token          = 0;
         u64  caller_subject = 0;
-        ret = ipc_recv_from(port, s_req, &msg_len, &token, &caller_subject);
+        ret = IpcRecvFrom(port, s_req, &msg_len, &token, &caller_subject);
         if (ret < 0) {
             printf("user: ipc_recv failed (%d)\n", ret);
-            thread_exit(1);
+            ThreadExit(1);
         }
         if (msg_len < (int)sizeof(u32)) {
             i32 *resp = (i32 *)s_resp;
             *resp     = ERR_INVAL;
-            (void)ipc_reply(token, resp, (int)sizeof(i32));
+            (void)IpcReply(token, resp, (int)sizeof(i32));
             continue;
         }
         u32 op = *(u32 *)s_req;
-        user_handle(token, op, msg_len, caller_subject);
+        UserHandle(token, op, msg_len, caller_subject);
     }
 }

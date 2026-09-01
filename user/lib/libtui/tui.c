@@ -1,8 +1,40 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * tui.c - TUI (Text User Interface) client library implementation
  * Copyright (c) 2026 OpSys Project
  *
  * IPC wrappers for terminal service operations.
+ *
+ * ------------------------------------------------------------------
+ * Structure (IPC client, rendering, snapshots, dialogs):
+ *   TuiWrite/RenderBox/RenderLineAt/... -> TuiCall(op, payload) -> term service
+ *   TuiRegionSave -> cells[w*h] snapshot ; TuiRegionRestore -> write back
+ *   TuiInputLine/TuiConfirm/TuiMenu -> TuiKbdReadKey + render + restore
+ * How it works:
+ *   The service port is resolved once and cached; every operation packs
+ *   a request into s_req and ships it through TuiCall, reading the reply
+ *   into s_resp.  Region snapshots copy a rectangle of cells into a
+ *   caller buffer so popups can restore what they covered.
+ * Purpose:
+ *   Client-side TUI for the terminal service: output, boxes, menus,
+ *   prompts, and snapshot/restore of screen regions.
+ * Caveats:
+ *   Static request/response buffers (4 KiB) and a single cached port
+ *   make the library non-reentrant; oversized payloads do not fit.
+ *   Snapshot cell format (uint16_t per cell) must match the service.
+ * ------------------------------------------------------------------
  */
 
 #include "tui.h"
@@ -28,16 +60,16 @@ static int s_resp_len; /* actual reply bytes from the last tui_call */
  * Internal: port resolution and IPC call
  * ==================================================================== */
 
-int tui_port_get(void) {
+int TuiPortGet(void) {
     if (s_tui_port >= -1)
         return s_tui_port;
 
-    s_tui_port = port_get(TUI_PORT_NAME);
+    s_tui_port = PortGet(TUI_PORT_NAME);
     return s_tui_port;
 }
 
-static int tui_call(u32 op, const void *payload, u32 payload_len) {
-    int port = tui_port_get();
+static int TuiCall(u32 op, const void *payload, u32 payload_len) {
+    int port = TuiPortGet();
     if (port < 0)
         return port;
 
@@ -50,7 +82,7 @@ static int tui_call(u32 op, const void *payload, u32 payload_len) {
 
     /* Call and get response */
     int resp_len = (int)sizeof(s_resp);
-    int ret      = ipc_call(port, s_req, 8 + payload_len, s_resp, &resp_len);
+    int ret      = IpcCall(port, s_req, 8 + payload_len, s_resp, &resp_len);
     if (ret < 0)
         return ret;
     s_resp_len = resp_len;
@@ -67,33 +99,33 @@ static int tui_call(u32 op, const void *payload, u32 payload_len) {
  * Basic output
  * ==================================================================== */
 
-int tui_write(const char *text, uint32_t len) {
+int TuiWrite(const char *text, uint32_t len) {
     if (!text || len == 0)
         return 0;
     if (len > TUI_MAX_TEXT)
         len = TUI_MAX_TEXT;
 
-    return tui_call(TUI_OP_WRITE, text, len);
+    return TuiCall(TUI_OP_WRITE, text, len);
 }
 
-int tui_write_str(const char *str) {
+int TuiWriteStr(const char *str) {
     if (!str)
         return 0;
     uint32_t len = 0;
     while (str[len] && len < TUI_MAX_TEXT)
         len++;
-    return tui_write(str, len);
+    return TuiWrite(str, len);
 }
 
 /* ====================================================================
  * Screen control
  * ==================================================================== */
 
-int tui_clear(void) {
-    return tui_call(TUI_OP_CLEAR, NULL, 0);
+int TuiClear(void) {
+    return TuiCall(TUI_OP_CLEAR, NULL, 0);
 }
 
-int tui_render_status(const char *prefix, const char *msg) {
+int TuiRenderStatus(const char *prefix, const char *msg) {
     if (!prefix)
         prefix = "";
     if (!msg)
@@ -113,14 +145,14 @@ int tui_render_status(const char *prefix, const char *msg) {
     memcpy(payload + 8, prefix, plen);
     memcpy(payload + 8 + plen, msg, mlen);
 
-    return tui_call(TUI_OP_STATUS, payload, 8 + plen + mlen);
+    return TuiCall(TUI_OP_STATUS, payload, 8 + plen + mlen);
 }
 
 /* ====================================================================
  * Box/border drawing
  * ==================================================================== */
 
-int tui_render_box(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const char *title) {
+int TuiRenderBox(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const char *title) {
     if (!title)
         title = "";
 
@@ -139,14 +171,14 @@ int tui_render_box(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const char *t
     if (tlen > 0)
         memcpy(payload + 20, title, tlen);
 
-    return tui_call(TUI_OP_BOX, payload, 20 + tlen);
+    return TuiCall(TUI_OP_BOX, payload, 20 + tlen);
 }
 
 /* ====================================================================
  * Text rendering without cursor change
  * ==================================================================== */
 
-int tui_render_line_at(uint32_t x, uint32_t y, const char *text, uint32_t len) {
+int TuiRenderLineAt(uint32_t x, uint32_t y, const char *text, uint32_t len) {
     if (!text || len == 0)
         return 0;
     if (len > TUI_MAX_TEXT)
@@ -159,20 +191,20 @@ int tui_render_line_at(uint32_t x, uint32_t y, const char *text, uint32_t len) {
     coords[1]   = y;
     memcpy(payload + 8, text, len);
 
-    return tui_call(TUI_OP_RENDER_LINE, payload, 8 + len);
+    return TuiCall(TUI_OP_RENDER_LINE, payload, 8 + len);
 }
 
 /* ====================================================================
  * Cursor control
  * ==================================================================== */
 
-int tui_set_cursor(uint32_t x, uint32_t y) {
+int TuiSetCursor(uint32_t x, uint32_t y) {
     u32 coords[2] = {x, y};
-    return tui_call(TUI_OP_SET_CURSOR, coords, 8);
+    return TuiCall(TUI_OP_SET_CURSOR, coords, 8);
 }
 
-int tui_get_cursor(uint32_t *x, uint32_t *y) {
-    int ret = tui_call(TUI_OP_GET_CURSOR, NULL, 0);
+int TuiGetCursor(uint32_t *x, uint32_t *y) {
+    int ret = TuiCall(TUI_OP_GET_CURSOR, NULL, 0);
     if (ret < 0)
         return ret;
     /* Response: ret + x + y (12 bytes).  Guard against a truncated
@@ -187,8 +219,8 @@ int tui_get_cursor(uint32_t *x, uint32_t *y) {
     return 0;
 }
 
-int tui_get_size(uint32_t *cols, uint32_t *rows) {
-    int ret = tui_call(TUI_OP_GET_SIZE, NULL, 0);
+int TuiGetSize(uint32_t *cols, uint32_t *rows) {
+    int ret = TuiCall(TUI_OP_GET_SIZE, NULL, 0);
     if (ret < 0)
         return ret;
     if (s_resp_len < 12)
@@ -204,7 +236,7 @@ int tui_get_size(uint32_t *cols, uint32_t *rows) {
  * Utility: formatted output
  * ==================================================================== */
 
-int tui_printf(const char *fmt, ...) {
+int TuiPrintf(const char *fmt, ...) {
     if (!fmt)
         return 0;
 
@@ -283,18 +315,18 @@ int tui_printf(const char *fmt, ...) {
     va_end(ap);
 
     buf[len] = '\0';
-    return tui_write(buf, (u32)len);
+    return TuiWrite(buf, (u32)len);
 }
 
 /* ====================================================================
  * Region snapshot/restore (v1.2)
  * ==================================================================== */
 
-int tui_region_save(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint16_t *cells) {
+int TuiRegionSave(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint16_t *cells) {
     if (!cells || w == 0 || h == 0 || (uint64_t)w * h > TUI_MAX_REGION_CELLS)
         return -2; /* ERR_INVAL */
 
-    int port = tui_port_get();
+    int port = TuiPortGet();
     if (port < 0)
         return port;
 
@@ -307,7 +339,7 @@ int tui_region_save(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint16_t *ce
     req[5]   = h;
 
     int resp_len = (int)sizeof(s_resp);
-    int ret      = ipc_call(port, s_req, 8 + 16, s_resp, &resp_len);
+    int ret      = IpcCall(port, s_req, 8 + 16, s_resp, &resp_len);
     if (ret < 0)
         return ret;
     if (resp_len < 4)
@@ -319,11 +351,11 @@ int tui_region_save(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint16_t *ce
     return 0;
 }
 
-int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint16_t *cells) {
+int TuiRegionRestore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint16_t *cells) {
     if (!cells || w == 0 || h == 0 || (uint64_t)w * h > TUI_MAX_REGION_CELLS)
         return -2; /* ERR_INVAL */
 
-    int port = tui_port_get();
+    int port = TuiPortGet();
     if (port < 0)
         return port;
 
@@ -337,7 +369,7 @@ int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uin
     memcpy(s_req + 8 + 16, cells, (size_t)(w * h) * 2);
 
     int resp_len = (int)sizeof(s_resp);
-    int ret      = ipc_call(port, s_req, 8 + 16 + (int)(w * h) * 2, s_resp, &resp_len);
+    int ret      = IpcCall(port, s_req, 8 + 16 + (int)(w * h) * 2, s_resp, &resp_len);
     if (ret < 0)
         return ret;
     if (resp_len < 4)
@@ -351,30 +383,30 @@ int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uin
 
 static int s_tui_kbd_port = -2; /* -2 unresolved, -1 failed, >=0 port */
 
-static int tui_kbd_get(void) {
+static int TuiKbdGet(void) {
     if (s_tui_kbd_port >= -1)
         return s_tui_kbd_port;
-    s_tui_kbd_port = port_get("keyboard");
+    s_tui_kbd_port = PortGet("keyboard");
     return s_tui_kbd_port;
 }
 
 /* Read one key (READ_BLOCK, ASCII char in data[0]). */
-static int tui_kbd_read_key(u8 *key) {
-    int port = tui_kbd_get();
+static int TuiKbdReadKey(u8 *key) {
+    int port = TuiKbdGet();
     if (port < 0)
         return -1;
     u32 *req = (u32 *)s_req;
     req[0]   = 2; /* KBD_OP_READ_BLOCK */
     req[1]   = 1; /* max data bytes */
     int  resp_len = (int)sizeof(s_resp);
-    if (ipc_call(port, s_req, 8, s_resp, &resp_len) < 0 || resp_len < 4)
+    if (IpcCall(port, s_req, 8, s_resp, &resp_len) < 0 || resp_len < 4)
         return -1;
     if (key)
         *key = s_resp[4];
     return *(i32 *)s_resp;
 }
 
-int tui_input_line(int x, int y, const char *prompt, char *buf, int maxlen, int mask) {
+int TuiInputLine(int x, int y, const char *prompt, char *buf, int maxlen, int mask) {
     if (!buf || maxlen <= 1)
         return -1;
 
@@ -386,9 +418,9 @@ int tui_input_line(int x, int y, const char *prompt, char *buf, int maxlen, int 
     int  has_saved = 0;
     u32  cx = 0, cy = 0;
     int  have_cursor = 0;
-    if (rw <= TUI_MAX_REGION_CELLS && tui_region_save((u32)x, (u32)y, rw, 1, saved) == 0) {
+    if (rw <= TUI_MAX_REGION_CELLS && TuiRegionSave((u32)x, (u32)y, rw, 1, saved) == 0) {
         has_saved = 1;
-        if (tui_get_cursor(&cx, &cy) == 0)
+        if (TuiGetCursor(&cx, &cy) == 0)
             have_cursor = 1;
     }
 
@@ -412,15 +444,15 @@ int tui_input_line(int x, int y, const char *prompt, char *buf, int maxlen, int 
         while (d < (int)rw && d < (int)sizeof(disp) - 1)
             disp[d++] = ' ';
         disp[d]   = '\0';
-        tui_render_line_at(x, y, disp, (u32)d);
-        tui_set_cursor((u32)(x + d), (u32)y);
+        TuiRenderLineAt(x, y, disp, (u32)d);
+        TuiSetCursor((u32)(x + d), (u32)y);
 
         u8 key = 0;
-        if (tui_kbd_read_key(&key) < 0) {
+        if (TuiKbdReadKey(&key) < 0) {
             if (has_saved) {
-                (void)tui_region_restore((u32)x, (u32)y, rw, 1, saved);
+                (void)TuiRegionRestore((u32)x, (u32)y, rw, 1, saved);
                 if (have_cursor)
-                    (void)tui_set_cursor(cx, cy);
+                    (void)TuiSetCursor(cx, cy);
             }
             return -1;
         }
@@ -439,14 +471,14 @@ int tui_input_line(int x, int y, const char *prompt, char *buf, int maxlen, int 
 
     /* Restore the covered region and the previous cursor position. */
     if (has_saved) {
-        (void)tui_region_restore((u32)x, (u32)y, rw, 1, saved);
+        (void)TuiRegionRestore((u32)x, (u32)y, rw, 1, saved);
         if (have_cursor)
-            (void)tui_set_cursor(cx, cy);
+            (void)TuiSetCursor(cx, cy);
     }
     return pos;
 }
 
-int tui_confirm(int x, int y, int w, const char *title, const char *msg, const char *hint) {
+int TuiConfirm(int x, int y, int w, const char *title, const char *msg, const char *hint) {
     if (w < 16)
         w = 16;
     if (w > 100)
@@ -458,22 +490,22 @@ int tui_confirm(int x, int y, int w, const char *title, const char *msg, const c
     u32 cx = 0, cy = 0;
     int have_cursor = 0;
     if ((u64)w * 5 <= TUI_MAX_REGION_CELLS &&
-        tui_region_save((u32)x, (u32)y, (u32)w, 5, saved) == 0) {
+        TuiRegionSave((u32)x, (u32)y, (u32)w, 5, saved) == 0) {
         has_saved = 1;
-        if (tui_get_cursor(&cx, &cy) == 0)
+        if (TuiGetCursor(&cx, &cy) == 0)
             have_cursor = 1;
     }
 
-    tui_render_box(x, y, (u32)w, 5, title);
+    TuiRenderBox(x, y, (u32)w, 5, title);
     if (msg)
-        tui_render_line_at(x + 2, (u32)(y + 2), msg, (u32)strlen(msg));
+        TuiRenderLineAt(x + 2, (u32)(y + 2), msg, (u32)strlen(msg));
     if (hint)
-        tui_render_line_at(x + 2, (u32)(y + 3), hint, (u32)strlen(hint));
+        TuiRenderLineAt(x + 2, (u32)(y + 3), hint, (u32)strlen(hint));
 
     int result = -1;
     for (;;) {
         u8 key = 0;
-        if (tui_kbd_read_key(&key) < 0) {
+        if (TuiKbdReadKey(&key) < 0) {
             result = -1;
             break;
         }
@@ -489,9 +521,9 @@ int tui_confirm(int x, int y, int w, const char *title, const char *msg, const c
 
     /* Restore the covered region and the previous cursor position. */
     if (has_saved) {
-        (void)tui_region_restore((u32)x, (u32)y, (u32)w, 5, saved);
+        (void)TuiRegionRestore((u32)x, (u32)y, (u32)w, 5, saved);
         if (have_cursor)
-            (void)tui_set_cursor(cx, cy);
+            (void)TuiSetCursor(cx, cy);
     }
     return result;
 }
@@ -507,7 +539,7 @@ int tui_confirm(int x, int y, int w, const char *title, const char *msg, const c
  * Returns the selected index (0-based) on Enter, -1 on cancel/error.
  * ==================================================================== */
 
-int tui_menu(int x, int y, int w, int h, const char *title,
+int TuiMenu(int x, int y, int w, int h, const char *title,
              const char *const *items, int count, int *scroll_out) {
     if (!items || count <= 0 || h < 3)
         return -1;
@@ -522,9 +554,9 @@ int tui_menu(int x, int y, int w, int h, const char *title,
     u32 cx = 0, cy = 0;
     int have_cursor = 0;
     if ((uint64_t)w * h <= TUI_MAX_REGION_CELLS &&
-        tui_region_save((u32)x, (u32)y, (u32)w, (u32)h, saved) == 0) {
+        TuiRegionSave((u32)x, (u32)y, (u32)w, (u32)h, saved) == 0) {
         has_saved = 1;
-        if (tui_get_cursor(&cx, &cy) == 0)
+        if (TuiGetCursor(&cx, &cy) == 0)
             have_cursor = 1;
     }
 
@@ -535,7 +567,7 @@ int tui_menu(int x, int y, int w, int h, const char *title,
     int result = -1;
     for (;;) {
         /* Redraw the menu each key. */
-        tui_render_box(x, y, (u32)w, (u32)h, title);
+        TuiRenderBox(x, y, (u32)w, (u32)h, title);
         int visible = (count - scroll < rows) ? count - scroll : rows;
         for (int r = 0; r < visible; r++) {
             int idx = scroll + r;
@@ -559,11 +591,11 @@ int tui_menu(int x, int y, int w, int h, const char *title,
             else if (r == visible - 1 && scroll + visible < count)
                 line[ln++] = 'v';
             line[ln] = '\0';
-            tui_render_line_at((u32)(x + 1), (u32)(y + 1 + r), line, (u32)ln);
+            TuiRenderLineAt((u32)(x + 1), (u32)(y + 1 + r), line, (u32)ln);
         }
 
         u8 key = 0;
-        if (tui_kbd_read_key(&key) < 0) {
+        if (TuiKbdReadKey(&key) < 0) {
             result = -1;
             break;
         }
@@ -600,9 +632,9 @@ int tui_menu(int x, int y, int w, int h, const char *title,
 
     /* Restore the covered region and the previous cursor position. */
     if (has_saved) {
-        (void)tui_region_restore((u32)x, (u32)y, (u32)w, (u32)h, saved);
+        (void)TuiRegionRestore((u32)x, (u32)y, (u32)w, (u32)h, saved);
         if (have_cursor)
-            (void)tui_set_cursor(cx, cy);
+            (void)TuiSetCursor(cx, cy);
     }
     if (scroll_out)
         *scroll_out = scroll;

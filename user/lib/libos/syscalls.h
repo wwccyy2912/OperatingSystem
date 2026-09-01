@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * syscalls.h - User-space system call wrappers
  * Copyright (c) 2026 OpSys Project
  *
@@ -74,7 +87,7 @@ static inline long sys_call(long num, long a1, long a2, long a3, long a4, long a
     /* The kernel's syscall ABI reads args 1-3 from RDI/RSI/RDX and
      * args 4-5 from R10/R8 (kernel/arch/x86_64/syscall_entry.S:16-17).
      * Plain "r" constraints let GCC pick any register for a4/a5, so
-     * 5-arg syscalls like ipc_call() could deliver garbage in arg4/arg5.
+     * 5-arg syscalls like IpcCall() could deliver garbage in arg4/arg5.
      * Pin the tail args to the exact ABI registers.  The SYSCALL
      * instruction (v0.7 fast path) clobbers RCX (user RIP) and R11
      * (user RFLAGS) — the same registers INT 0x80 trashed, so the
@@ -89,21 +102,21 @@ static inline long sys_call(long num, long a1, long a2, long a3, long a4, long a
 }
 
 /* --- Debug / Serial I/O --- */
-int debug_log(const char *str);
-int debug_getchar(void);
+int DebugLog(const char *str);
+int DebugGetchar(void);
 
 /* --- Capability management --- */
-int cap_create(int type, int rights);
-int cap_create_obj(int type, int rights, unsigned long obj_id);
-int cap_grant(int handle, int target_pid, int rights);
-int cap_revoke(int handle);
+int CapCreate(int type, int rights);
+int CapCreateObj(int type, int rights, unsigned long obj_id);
+int CapGrant(int handle, int target_pid, int rights);
+int CapRevoke(int handle);
 
 /* --- IPC --- */
-int ipc_send(int port, const void *msg, int len);
-int ipc_recv(int port, void *buf, int *len, int *tok);
-int ipc_call(int port, const void *req, int req_len, void *resp, int *resp_len);
-int ipc_port_create(void);
-int ipc_reply(int token, const void *resp, int resp_len);
+int IpcSend(int port, const void *msg, int len);
+int IpcRecv(int port, void *buf, int *len, int *tok);
+int IpcCall(int port, const void *req, int req_len, void *resp, int *resp_len);
+int IpcPortCreate(void);
+int IpcReply(int token, const void *resp, int resp_len);
 
 /* --- Memory ---
  * offset/size are uint64_t (not int): the kernel's SYS_MAP_MEMORY takes
@@ -111,18 +124,18 @@ int ipc_reply(int token, const void *resp, int resp_len);
  * region) can exceed INT_MAX — an int offset would truncate and make the
  * map fail or wrap into kernel half. */
 void *map_memory(int cap, uint64_t offset, uint64_t size, int prot);
-int   unmap_memory(void *addr, uint64_t size);
+int   UnmapMemory(void *addr, uint64_t size);
 
 /* --- Thread management --- */
-int  thread_create(void (*entry)(void *), void *arg, int priority);
-void thread_exit(int code);
-void thread_yield(void);
-int  thread_set_affinity(int tid, int cpu);
-int  thread_join(int tid, int *exit_code);
+int  ThreadCreate(void (*entry)(void *), void *arg, int priority);
+void ThreadExit(int code);
+void ThreadYield(void);
+int  ThreadSetAffinity(int tid, int cpu);
+int  ThreadJoin(int tid, int *exit_code);
 
 /* --- Time --- */
-int get_time(void);
-int sleep(int ticks);
+int GetTime(void);
+int Sleep(int ticks);
 
 /* Wall-clock time (layout must match kernel/include/kernel/rtc.h) */
 typedef struct {
@@ -135,32 +148,32 @@ typedef struct {
 } rtc_time_t;
 
 /* --- RTC wall clock --- */
-int os_get_rtc_time(rtc_time_t *out);
+int OsGetRtcTime(rtc_time_t *out);
 
 /* P2 地基: set the wall clock (SYS_SET_TIME), gated by ATOM_SYS_SET_TIME
  * — an unauthorized caller gets ERR_NOCAP with zero IPC (pure kernel
  * cap-table lookup, docs/permission_model.md §四).  Returns 0 on
  * success, ERR_NOCAP unauthorized, ERR_INVAL bad time range, or
  * ERR_FAULT on a bad pointer. */
-int os_set_time(const rtc_time_t *t);
+int OsSetTime(const rtc_time_t *t);
 
 /* --- Port registry --- */
-int port_register(const char *name, int port);
-int port_get(const char *name);
+int PortRegister(const char *name, int port);
+int PortGet(const char *name);
 
 /* --- Async notification --- */
-int notify(int target_tid, unsigned int mask);
-int wait_notification(unsigned int mask);
+int Notify(int target_tid, unsigned int mask);
+int WaitNotification(unsigned int mask);
 
 /* --- IRQ binding --- */
-int bind_irq(int cap, int irq, unsigned int mask);
-int unbind_irq(int cap, int irq);
+int BindIrq(int cap, int irq, unsigned int mask);
+int UnbindIrq(int cap, int irq);
 
 /* --- I/O port access --- */
-int io_read8(unsigned short port);
-int io_write8(unsigned short port, unsigned char val);
-int io_read16(unsigned short port);
-int io_write16(unsigned short port, unsigned short val);
+int IoRead8(unsigned short port);
+int IoWrite8(unsigned short port, unsigned char val);
+int IoRead16(unsigned short port);
+int IoWrite16(unsigned short port, unsigned short val);
 
 /* --- System power --- */
 int sys_reboot(void);
@@ -168,18 +181,18 @@ int sys_shutdown(void);
 int sys_panic(void); /* TEMP test hook: trigger a kernel panic */
 
 /* --- Init protocol --- */
-int get_free_pages(void);
-int get_pid(void);
+int GetFreePages(void);
+int GetPid(void);
 
 /* --- ASLR: per-process randomized heap base (design item ⑭) ---
  * Returns the current process's heap base (0x70000000-based, 64 KB
  * aligned).  malloc.c fetches it lazily on first heap grow so the
  * user heap matches the kernel's randomized layout. */
-uint64_t get_heap_base(void);
+uint64_t GetHeapBase(void);
 
 /* --- Process management --- */
-int process_create(const char *name, const void *elf, unsigned long size);
-int process_wait(int pid, int *exit_code);
+int ProcessCreate(const char *name, const void *elf, unsigned long size);
+int ProcessWait(int pid, int *exit_code);
 
 /*
  * Process list entry — layout MUST match kernel proc_info_t
@@ -197,7 +210,7 @@ typedef struct {
 /* Fill buf with up to max_entries proc_info_t entries.  Returns
  * the number written (0..max_entries), or a negative error
  * (ERR_FAULT bad buffer). */
-int process_list(proc_info_t *buf, int max_entries);
+int ProcessList(proc_info_t *buf, int max_entries);
 
 /*
  * Process identity record (Unit 1: kernel-issued app UUID) —
@@ -218,28 +231,28 @@ typedef struct {
  * (docs/permission_model.md §三).  Returns 0 and fills out on success;
  * ERR_NOENT for subject 0 (kernel), an unknown subject, or a dead
  * process; ERR_FAULT on a bad output pointer. */
-int proc_info_by_subject(uint64_t subject, proc_ident_t *out);
+int ProcInfoBySubject(uint64_t subject, proc_ident_t *out);
 
 /* --- Embedded blob access --- */
-int blob_get(const char *name, void *buf, int buf_size);
+int BlobGet(const char *name, void *buf, int buf_size);
 
 /* --- Mutex --- */
-int mutex_create(void);
-int mutex_lock(int handle);
-int mutex_unlock(int handle);
-int mutex_destroy(int handle);
+int MutexCreate(void);
+int MutexLock(int handle);
+int MutexUnlock(int handle);
+int MutexDestroy(int handle);
 
 /* --- Signals ---
  * Constants mirror kernel/include/kernel/signal.h (POSIX subset).
  * Signal SEMANTICS live in Ring 3 (kernel_roadmap.md D4/P2):
- * signal() swaps a slot in the runtime's user-memory handler table
+ * Signal() swaps a slot in the runtime's user-memory handler table
  * (user/runtime/signal_user.c) -- no syscall involved.  Delivery
  * enters the runtime's __sig_dispatcher, which decides ignore/
  * default/handler and restores the interrupted context via the
  * kernel's SYS_SIGRETURN (never call it directly).
  *
  * SIG_DFL/SIG_IGN are encoded as the integer values 0/1 but typed as
- * sighandler_t so they can be passed to/returned from signal(). */
+ * sighandler_t so they can be passed to/returned from Signal(). */
 typedef void (*sighandler_t)(int signum);
 
 #define SIGKILL 9 /* uncatchable, unignorable terminate */
@@ -252,16 +265,16 @@ typedef void (*sighandler_t)(int signum);
 #define SIGSTOP 19                /* reserved: cannot be caught/ignored */
 #define SIG_DFL ((sighandler_t)0) /* default action (terminate or ignore) */
 #define SIG_IGN ((sighandler_t)1) /* ignore */
-#define SIG_ERR ((sighandler_t)-1) /* error return from signal() */
+#define SIG_ERR ((sighandler_t)-1) /* error return from Signal() */
 #define NSIG    64
 
 /* Register a handler for signum.  Returns the previous handler
  * (SIG_DFL if never set), or SIG_ERR on failure. */
-sighandler_t signal(int signum, sighandler_t handler);
+sighandler_t Signal(int signum, sighandler_t handler);
 
 /* Send a signal to a process.  Returns 0 on success, or a negative
  * error code (ERR_INVAL bad args, ERR_NOENT unknown process). */
-int kill(int pid, int signum);
+int Kill(int pid, int signum);
 
 /*
  * --- VSpace (roadmap P1) ---
@@ -273,31 +286,31 @@ void *vspace_alloc(unsigned long size, unsigned long flags);
 
 /*
  * --- Thread context (roadmap P2) ---
- * thread_set_ctx(tid, ctx, ctx_size): overwrite a thread's saved
+ * ThreadSetCtx(tid, ctx, ctx_size): overwrite a thread's saved
  * register context.  Used by user-space signal trampolines to resume
  * with modified state.  Returns 0 or a negative error. */
-int thread_set_ctx(int tid, const void *ctx, unsigned long ctx_size);
+int ThreadSetCtx(int tid, const void *ctx, unsigned long ctx_size);
 
 /*
  * --- PCI enumeration ---
- * pci_get_count(): number of PCI devices found at boot.
- * pci_get_device(index, out): fill pci_device_info_t for device `index`.
- * pci_cfg_read32(index, offset) / pci_cfg_write32(index, offset, val):
+ * PciGetCount(): number of PCI devices found at boot.
+ * PciGetDevice(index, out): fill pci_device_info_t for device `index`.
+ * PciCfgRead32(index, offset) / PciCfgWrite32(index, offset, val):
  *   raw 32-bit config-space access (device drivers use this to enable
  *   PCI bus mastering via the command register at 0x04, among others).
  *   Gated on CAP_TYPE_PCI_DEV (RIGHT_READ|RIGHT_WRITE) for `index`.
  * All return non-negative values or negative errors. */
-int pci_get_count(void);
-int pci_get_device(int index, pci_device_info_t *out);
-int pci_cfg_read32(int index, unsigned offset);
-int pci_cfg_write32(int index, unsigned offset, unsigned val);
+int PciGetCount(void);
+int PciGetDevice(int index, pci_device_info_t *out);
+int PciCfgRead32(int index, unsigned offset);
+int PciCfgWrite32(int index, unsigned offset, unsigned val);
 
 /*
  * --- Block device (Phase 1: legacy virtio-blk) ---
  * disk = PCI table index of the virtio-blk adapter, obtained from
- * pci_get_device() (vendor 0x1AF4, device 0x1001).  The calling
+ * PciGetDevice() (vendor 0x1AF4, device 0x1001).  The calling
  * process must hold a CAP_TYPE_PCI_DEV cap for that index with
- * RIGHT_READ|RIGHT_WRITE (cap_create_obj(CAP_TYPE_PCI_DEV, ...)).
+ * RIGHT_READ|RIGHT_WRITE (CapCreateObj(CAP_TYPE_PCI_DEV, ...)).
  *
  * Return values follow the repo convention: 0 on success, negative
  * error code on failure (ERR_NOCAP unauthorized, ERR_INVAL bad
@@ -334,7 +347,7 @@ typedef struct {
 /* Fetch the user-facing framebuffer descriptor.  Returns 0 on success,
  * or a negative error (ERR_NOENT if no framebuffer, ERR_FAULT on a bad
  * output pointer). */
-int fb_get_info(fb_user_info_t *out);
+int FbGetInfo(fb_user_info_t *out);
 
 /* Map the framebuffer at a user-chosen page-aligned virtual address.
  * Returns the mapped virtual address on success, or a negative error. */
@@ -350,27 +363,27 @@ void *fb_map(void *virt, unsigned long size);
 /* Return the caller's kernel-issued subject ID (SYS_GET_SUBJECT).
  * Unforgeable: it comes from the PCB, never from a user-supplied value.
  * subject 0 = System (kernel); every user process gets a unique ID. */
-uint64_t get_subject(void);
+uint64_t GetSubject(void);
 
 /* Create an atom capability with the permission-model lifecycle fields
  * (SYS_CAP_CREATE_ATOM): atom, rights, expiry (absolute tick deadline,
  * 0 = permanent), quota (remaining uses, 0 = unlimited), scope_hash
  * (0 = unrestricted).  The holding subject is the caller.  Returns a
  * handle > 0, or a negative error (ERR_NOMEM table full). */
-int cap_create_atom(
+int CapCreateAtom(
     atom_id_t atom, int rights, uint64_t expiry_ticks, uint32_t quota, uint64_t scope_hash);
 
 /* Consume one quota unit of a caller-owned capability (SYS_CAP_CONSUME).
  * Includes lazy expiry: an expired entry is revoked in place and
  * reported as ERR_NOENT.  Returns 0, or ERR_NOENT (missing/stale/
  * expired) / ERR_INVAL (bad handle). */
-int cap_consume(int handle);
+int CapConsume(int handle);
 
 /* Revoke every capability held by `subject` matching `atom`, optionally
  * restricted to a scope_hash (0 = any scope), across ALL kernel cap
  * tables (SYS_CAP_REVOKE_BY_ATOM).  Returns the number of entries
  * revoked (>= 0), or ERR_INVAL for a bad atom. */
-int cap_revoke_by_atom(uint64_t subject, atom_id_t atom, uint64_t scope_hash);
+int CapRevokeByAtom(uint64_t subject, atom_id_t atom, uint64_t scope_hash);
 
 /* P1 地基: issue an atom capability to the process holding `subject`
  * (SYS_CAP_GRANT_TO_SUBJECT).  The perm-engine's decision-encoding
@@ -378,7 +391,7 @@ int cap_revoke_by_atom(uint64_t subject, atom_id_t atom, uint64_t scope_hash);
  * cap in ITS table (entry.subject = target).  Returns a handle > 0,
  * ERR_NOENT (no live process holds the subject), ERR_INVAL (bad
  * atom/rights), or ERR_NOMEM (target table full). */
-int cap_grant_to_subject(
+int CapGrantToSubject(
     uint64_t subject, atom_id_t atom, int rights, uint64_t expiry_ticks, uint32_t quota);
 
 /* P1 地基: read-only atom-holding query (SYS_CAP_HAS_ATOM).  Returns 1
@@ -388,12 +401,12 @@ int cap_grant_to_subject(
  * another subject's atom holdings.  ERR_NOENT (no live process holds
  * the subject), ERR_INVAL (bad atom), ERR_NOCAP (caller not
  * management-plane). */
-int cap_has_atom(uint64_t subject, atom_id_t atom);
+int CapHasAtom(uint64_t subject, atom_id_t atom);
 
 /* Receive with sender identity (SYS_IPC_RECV_FROM): identical to
- * ipc_recv() plus, when sender_subject is non-NULL, the kernel-filled
+ * IpcRecv() plus, when sender_subject is non-NULL, the kernel-filled
  * unforgeable sender subject is written to it. */
-int ipc_recv_from(int port, void *buf, int *len, int *tok, uint64_t *sender_subject);
+int IpcRecvFrom(int port, void *buf, int *len, int *tok, uint64_t *sender_subject);
 
 #endif /* LIBOS_SYSCALLS_H */
 
@@ -402,11 +415,11 @@ int ipc_recv_from(int port, void *buf, int *len, int *tok, uint64_t *sender_subj
 /* SYS_SHM_CREATE — allocate a contiguous physical-page pool mapped at
  * `virt` in the caller (management-plane gated).  Returns the pool's
  * physical base (handle for shm_map), or a negative error. */
-uint64_t shm_create(uint64_t count, void *virt);
+uint64_t ShmCreate(uint64_t count, void *virt);
 
 /* SYS_SHM_MAP — map `count` pool pages at `phys_base` READ-ONLY into
  * the process holding `subject` at `virt` (vspace_alloc'ed by the
  * client).  Returns 0, or a negative error. */
-int shm_map(uint64_t phys_base, uint64_t count, uint64_t subject, void *virt);
+int ShmMap(uint64_t phys_base, uint64_t count, uint64_t subject, void *virt);
 
 

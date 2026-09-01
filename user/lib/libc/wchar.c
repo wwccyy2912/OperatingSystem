@@ -5,6 +5,21 @@
  * Implements the wide string/memory operations and the wide numeric
  * conversions.  The numeric routines delegate to the narrow strtol
  * family after copying the wide input into a narrow buffer.
+ 
+ *
+ * ------------------------------------------------------------------
+ * Structure (wchar):
+ *   wcs strings (32-bit wchar_t) + mbrtowc/wcrtomb/mbsrtowcs/... +
+ *   wcwidth — UTF-8 on the byte side (no locale switching).
+ * How it works:
+ *   mbrtowc assembles UTF-8 sequences incrementally via mbstate_t;
+ *   wcrtomb emits UTF-8; char16_t conversions handle surrogate
+ *   pairs through the state field.
+ * Purpose:
+ *   Wide/multibyte interop for a UTF-8 system.
+ * Caveats:
+ *   wchar_t is 32-bit; overlong/surrogate encodings are rejected.
+ * ------------------------------------------------------------------
  */
 
 #include "wchar.h"
@@ -345,7 +360,7 @@ int mbsinit(const mbstate_t *ps) {
  * from a pending-byte count, which is always <= 4). */
 #define MBSTATE_SURROGATE ((size_t)0xFFFFFFFFu)
 
-static void mbstate_put_surrogate(mbstate_t *ps, unsigned v) {
+static void MbstatePutSurrogate(mbstate_t *ps, unsigned v) {
     ps->__buf[0] = (char)(v & 0xFF);
     ps->__buf[1] = (char)((v >> 8) & 0xFF);
     ps->__buf[2] = (char)((v >> 16) & 0xFF);
@@ -354,7 +369,7 @@ static void mbstate_put_surrogate(mbstate_t *ps, unsigned v) {
 }
 
 /* Returns the pending surrogate, or -1 when none; clears the state. */
-static int mbstate_get_surrogate(mbstate_t *ps) {
+static int MbstateGetSurrogate(mbstate_t *ps) {
     if (ps->__len != MBSTATE_SURROGATE)
         return -1;
     unsigned v = (unsigned)(unsigned char)ps->__buf[0] |
@@ -551,7 +566,7 @@ int wcwidth(wchar_t wc) {
     uint32_t cp = (uint32_t)wc;
     if (cp < 0x20 || (cp >= 0x7F && cp < 0xA0))
         return -1;
-    return utf8_char_width(cp);
+    return Utf8CharWidth(cp);
 }
 
 /* ====================================================================
@@ -580,7 +595,7 @@ size_t mbrtoc16(char16_t *pc16, const char *s, size_t n, mbstate_t *ps) {
         return 0;
     }
     /* A pending low surrogate from a previous astral character. */
-    int low = mbstate_get_surrogate(ps);
+    int low = MbstateGetSurrogate(ps);
     if (low >= 0) {
         if (pc16)
             *pc16 = (char16_t)low;
@@ -594,7 +609,7 @@ size_t mbrtoc16(char16_t *pc16, const char *s, size_t n, mbstate_t *ps) {
         uint32_t cp = (uint32_t)wc - 0x10000;
         if (pc16)
             *pc16 = (char16_t)(0xD800 + (cp >> 10));
-        mbstate_put_surrogate(ps, 0xDC00 + (cp & 0x3FF));
+        MbstatePutSurrogate(ps, 0xDC00 + (cp & 0x3FF));
     } else if (pc16) {
         *pc16 = (char16_t)wc;
     }
@@ -611,10 +626,10 @@ size_t c16rtomb(char *s, char16_t c16, mbstate_t *ps) {
     }
     unsigned c = (unsigned)c16;
     if (c >= 0xD800 && c <= 0xDBFF) { /* high surrogate: wait for the low */
-        mbstate_put_surrogate(ps, c);
+        MbstatePutSurrogate(ps, c);
         return 0;
     }
-    int hi = mbstate_get_surrogate(ps);
+    int hi = MbstateGetSurrogate(ps);
     if (hi >= 0) {
         if (!(c >= 0xDC00 && c <= 0xDFFF)) { /* malformed pair */
             ps->__len = 0;

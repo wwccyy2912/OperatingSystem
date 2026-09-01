@@ -1,9 +1,22 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * threads.h - C11 threads (§7.26)
  * Copyright (c) 2026 OpSys Project
  *
  * User-space C11 <threads.h> backed by the kernel thread syscalls
- * (thread_create / thread_yield / thread_exit) and get_time() for
+ * (thread_create / thread_yield / thread_exit) and GetTime() for
  * timed waits.  Mutexes, condition variables and once-flags are built
  * on lock-free atomics; TSS is process-wide until per-thread TLS lands
  * (v1.0+).

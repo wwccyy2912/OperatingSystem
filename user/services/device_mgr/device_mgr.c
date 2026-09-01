@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * device_mgr.c - PCI device manager service (ring-3, independent process)
  * Copyright (c) 2026 OpSys Project
  *
@@ -13,7 +26,7 @@
  * Architecture (mirrors serial.c / perm-manager.c):
  *
  *   manager process
- *     └─ process_create("device_mgr")      this process
+ *     └─ ProcessCreate("device_mgr")      this process
  *          └─ main() = register "device_mgr" port, then serve
  *               └─ loop: ipc_recv -> op dispatch -> ipc_reply
  *
@@ -30,6 +43,24 @@
  * pci_device_info_t is the kernel/user shared ABI struct
  * (kernel/include/kernel/pci.h): bus/dev/func, vendor_id, device_id,
  * class_code, prog_if, revision_id, bar[6], irq_line.
+ *
+ * ------------------------------------------------------------------
+ * Structure (main):
+ *   main() -> register "device_mgr" port, then serve loop
+ *     ipc_recv -> op dispatch (GET_COUNT / GET_DEVICE) -> ipc_reply
+ *   data source: kernel PCI snapshot via pci_get_count/get_device
+ *   pci_device_info_t: bus/dev/func, ids, class, bars, irq_line
+ * How it works:
+ *   The kernel scans PCI config space (0xCF8/0xCFC) once at boot; this
+ *   service queries the snapshot through libos wrappers and serves it
+ *   over IPC, so clients need no I/O-port or PCI capability.
+ * Purpose:
+ *   User-space PCI device manager: exposes the kernel's PCI enumeration
+ *   to unprivileged clients through a registered IPC port.
+ * Caveats:
+ *   Serves a boot-time snapshot — no live bus rescan.  Bad indices or
+ *   bad client pointers return negative errors (ERR_INVAL/ERR_FAULT).
+ * ------------------------------------------------------------------
  */
 
 #include "../lib/libc/stdio.h"
@@ -80,7 +111,7 @@ static u8 s_resp[sizeof(dmgr_resp_t)];
  * a negative error code; on error dev is zeroed so a confused client
  * never reads stale device bytes.
  */
-static void dmgr_reply(int token, i32 ret, const pci_device_info_t *dev) {
+static void DmgrReply(int token, i32 ret, const pci_device_info_t *dev) {
     dmgr_resp_t *resp = (dmgr_resp_t *)s_resp;
     resp->ret         = ret;
     if (dev) {
@@ -88,7 +119,7 @@ static void dmgr_reply(int token, i32 ret, const pci_device_info_t *dev) {
     } else {
         memset(&resp->dev, 0, sizeof(resp->dev));
     }
-    int r = ipc_reply(token, s_resp, (int)sizeof(*resp));
+    int r = IpcReply(token, s_resp, (int)sizeof(*resp));
     if (r < 0)
         printf("device_mgr: ipc_reply failed (%d)\n", r);
 }
@@ -98,30 +129,30 @@ static void dmgr_reply(int token, i32 ret, const pci_device_info_t *dev) {
  * input: the opcode is validated and every buffer access is bounded
  * by the length ipc_recv actually reported.
  */
-static void dmgr_handle_request(int token, u32 op, int msg_len) {
+static void DmgrHandleRequest(int token, u32 op, int msg_len) {
     switch (op) {
     case DMGR_OP_GET_COUNT: {
-        int n = pci_get_count();
-        dmgr_reply(token, (i32)n, NULL);
+        int n = PciGetCount();
+        DmgrReply(token, (i32)n, NULL);
         break;
     }
     case DMGR_OP_GET_DEVICE: {
         if (msg_len < (int)sizeof(dmgr_req_t)) {
-            dmgr_reply(token, ERR_INVAL, NULL);
+            DmgrReply(token, ERR_INVAL, NULL);
             break;
         }
         dmgr_req_t       *req = (dmgr_req_t *)s_req;
         pci_device_info_t dev;
-        int               r = pci_get_device(req->index, &dev);
+        int               r = PciGetDevice(req->index, &dev);
         if (r < 0) {
-            dmgr_reply(token, (i32)r, NULL);
+            DmgrReply(token, (i32)r, NULL);
             break;
         }
-        dmgr_reply(token, 0, &dev);
+        DmgrReply(token, 0, &dev);
         break;
     }
     default:
-        dmgr_reply(token, ERR_INVAL, NULL);
+        DmgrReply(token, ERR_INVAL, NULL);
         break;
     }
 }
@@ -134,21 +165,21 @@ static void dmgr_handle_request(int token, u32 op, int msg_len) {
  * Main service loop: receive a request, serve it, reply, repeat.
  * Runs on the single service thread (the port owner).
  */
-static void dmgr_server_loop(int port) {
+static void DmgrServerLoop(int port) {
     for (;;) {
         int msg_len = (int)sizeof(s_req);
         int token   = 0;
-        int ret     = ipc_recv(port, s_req, &msg_len, &token);
+        int ret     = IpcRecv(port, s_req, &msg_len, &token);
         if (ret < 0) {
             printf("device_mgr: ipc_recv failed (%d)\n", ret);
-            thread_exit(1);
+            ThreadExit(1);
         }
         if (msg_len < (int)sizeof(u32)) { /* no op code */
-            dmgr_reply(token, ERR_INVAL, NULL);
+            DmgrReply(token, ERR_INVAL, NULL);
             continue;
         }
         u32 op = *(u32 *)s_req;
-        dmgr_handle_request(token, op, msg_len);
+        DmgrHandleRequest(token, op, msg_len);
     }
 }
 
@@ -162,19 +193,19 @@ static void dmgr_server_loop(int port) {
  * a clean 0 is still valid (no devices) and the service serves the
  * empty table fine.
  */
-static void dmgr_self_check(void) {
-    int count = pci_get_count();
+static void DmgrSelfCheck(void) {
+    int count = PciGetCount();
     if (count < 0) {
         printf("device_mgr: pci_get_count failed (%d)\n", count);
-        thread_exit(1);
+        ThreadExit(1);
     }
     printf("device_mgr: %d PCI devices\n", count);
 
     if (count > 0) {
         pci_device_info_t dev;
-        int               r = pci_get_device(0, &dev);
+        int               r = PciGetDevice(0, &dev);
         if (r < 0) {
-            printf("device_mgr: pci_get_device(0) failed (%d)\n", r);
+            printf("device_mgr: PciGetDevice(0) failed (%d)\n", r);
         } else {
             printf("device_mgr: device 0 bus=%u dev=%u func=%u "
                    "vendor=0x%x device=0x%x class=0x%x irq=%u\n",
@@ -192,23 +223,23 @@ static void dmgr_self_check(void) {
 int main(void) {
     printf("device_mgr: starting PCI device manager\n");
 
-    dmgr_self_check();
+    DmgrSelfCheck();
 
     /* IPC port, registered under the well-known name "device_mgr". */
-    int port = ipc_port_create();
+    int port = IpcPortCreate();
     if (port < 0) {
         printf("device_mgr: ipc_port_create failed (%d)\n", port);
-        thread_exit(1);
+        ThreadExit(1);
     }
-    int ret = port_register(DMGR_PORT_NAME, port);
+    int ret = PortRegister(DMGR_PORT_NAME, port);
     if (ret < 0) {
-        printf("device_mgr: port_register('%s') failed (%d)\n", DMGR_PORT_NAME, ret);
-        thread_exit(1);
+        printf("device_mgr: PortRegister('%s') failed (%d)\n", DMGR_PORT_NAME, ret);
+        ThreadExit(1);
     }
     printf("device_mgr: port %d registered as '%s'\n", port, DMGR_PORT_NAME);
 
     /* Serve clients. */
     printf("device_mgr: serving on port %d\n", port);
-    dmgr_server_loop(port);
+    DmgrServerLoop(port);
     return 0; /* unreachable */
 }

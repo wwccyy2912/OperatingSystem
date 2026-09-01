@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * main.c - GUI demo application (v0.7.1, GUI round)
  * Copyright (c) 2026 OpSys Project
  *
@@ -19,7 +32,7 @@
 
 static int s_port = -1;
 
-static int gui_call(u32 op, const void *payload, u32 payload_len, void *resp, u32 resp_cap) {
+static int GuiCall(u32 op, const void *payload, u32 payload_len, void *resp, u32 resp_cap) {
     static gui_req_t req;
     memset(&req, 0, sizeof(req));
     req.op  = op;
@@ -27,22 +40,22 @@ static int gui_call(u32 op, const void *payload, u32 payload_len, void *resp, u3
     if (payload_len > 0 && payload)
         memcpy(req.data, payload, payload_len);
     int rlen = (int)resp_cap;
-    return ipc_call(s_port, &req, (int)(8 + payload_len), resp, &rlen);
+    return IpcCall(s_port, &req, (int)(8 + payload_len), resp, &rlen);
 }
 
-static int gui_activate(void) {
+static int GuiActivate(void) {
     gui_resp_t r;
     memset(&r, 0, sizeof(r));
-    return gui_call(GUI_OP_ACTIVATE, NULL, 0, &r, sizeof(r));
+    return GuiCall(GUI_OP_ACTIVATE, NULL, 0, &r, sizeof(r));
 }
 
-static int gui_deactivate(void) {
+static int GuiDeactivate(void) {
     gui_resp_t r;
     memset(&r, 0, sizeof(r));
-    return gui_call(GUI_OP_DEACTIVATE, NULL, 0, &r, sizeof(r));
+    return GuiCall(GUI_OP_DEACTIVATE, NULL, 0, &r, sizeof(r));
 }
 
-static int gui_create(const char *title, int w, int h) {
+static int GuiCreate(const char *title, int w, int h) {
     gui_req_create_t c;
     memset(&c, 0, sizeof(c));
     strncpy(c.title, title, sizeof(c.title) - 1);
@@ -50,25 +63,25 @@ static int gui_create(const char *title, int w, int h) {
     c.h = h;
     gui_resp_t r;
     memset(&r, 0, sizeof(r));
-    if (gui_call(GUI_OP_CREATE, &c, sizeof(c), &r, sizeof(r)) < 0 || r.ret < 0)
+    if (GuiCall(GUI_OP_CREATE, &c, sizeof(c), &r, sizeof(r)) < 0 || r.ret < 0)
         return -1;
     return r.ret;
 }
 
-static int gui_destroy(int id) {
+static int GuiDestroy(int id) {
     gui_resp_t r;
     memset(&r, 0, sizeof(r));
-    return gui_call(GUI_OP_DESTROY, &id, 4, &r, sizeof(r));
+    return GuiCall(GUI_OP_DESTROY, &id, 4, &r, sizeof(r));
 }
 
-static int gui_move(int id, int x, int y) {
+static int GuiMove(int id, int x, int y) {
     i32        a[3] = {id, x, y};
     gui_resp_t r;
     memset(&r, 0, sizeof(r));
-    return gui_call(GUI_OP_MOVE, a, sizeof(a), &r, sizeof(r));
+    return GuiCall(GUI_OP_MOVE, a, sizeof(a), &r, sizeof(r));
 }
 
-static int gui_fill(int id, int x, int y, int w, int h, u32 color) {
+static int GuiFill(int id, int x, int y, int w, int h, u32 color) {
     gui_req_fill_t f;
     memset(&f, 0, sizeof(f));
     f.id = id;
@@ -79,10 +92,10 @@ static int gui_fill(int id, int x, int y, int w, int h, u32 color) {
     f.color = color;
     gui_resp_t r;
     memset(&r, 0, sizeof(r));
-    return gui_call(GUI_OP_FILL, &f, sizeof(f), &r, sizeof(r));
+    return GuiCall(GUI_OP_FILL, &f, sizeof(f), &r, sizeof(r));
 }
 
-static int gui_text(int id, int x, int y, const char *s, u32 fg, u32 bg) {
+static int GuiText(int id, int x, int y, const char *s, u32 fg, u32 bg) {
     gui_req_text_t t;
     memset(&t, 0, sizeof(t));
     t.id = id;
@@ -93,12 +106,12 @@ static int gui_text(int id, int x, int y, const char *s, u32 fg, u32 bg) {
     strncpy(t.text, s, sizeof(t.text) - 1);
     gui_resp_t r;
     memset(&r, 0, sizeof(r));
-    return gui_call(GUI_OP_TEXT, &t, (u32)(20 + strlen(t.text) + 1), &r, sizeof(r));
+    return GuiCall(GUI_OP_TEXT, &t, (u32)(20 + strlen(t.text) + 1), &r, sizeof(r));
 }
 
-static int gui_poll(gui_resp_poll_t *ev, int *count) {
+static int GuiPoll(gui_resp_poll_t *ev, int *count) {
     memset(ev, 0, sizeof(*ev));
-    if (gui_call(GUI_OP_POLL, NULL, 0, ev, sizeof(*ev)) < 0)
+    if (GuiCall(GUI_OP_POLL, NULL, 0, ev, sizeof(*ev)) < 0)
         return -1;
     *count = (int)ev->count;
     return 0;
@@ -118,44 +131,44 @@ int main(void) {
     printf("gui_demo: starting\n");
 
     printf("gui_demo: resolving gui port\n");
-    s_port = port_get(GUI_PORT_NAME);
+    s_port = PortGet(GUI_PORT_NAME);
     if (s_port < 0) {
         printf("gui_demo: 'gui' port unavailable (%d)\n", s_port);
         return 1;
     }
 
     printf("gui_demo: activating\n");
-    if (gui_activate() < 0) {
+    if (GuiActivate() < 0) {
         printf("gui_demo: ACTIVATE failed\n");
         return 1;
     }
 
     printf("gui_demo: creating windows\n");
-    int w1 = gui_create("Keys (type; q quits)", WIN_W, WIN_H);
-    int w2 = gui_create("Canvas (click to paint)", WIN_W, WIN_H);
-    int w3 = gui_create("Info", 240, 96);
+    int w1 = GuiCreate("Keys (type; q quits)", WIN_W, WIN_H);
+    int w2 = GuiCreate("Canvas (click to paint)", WIN_W, WIN_H);
+    int w3 = GuiCreate("Info", 240, 96);
     printf("gui_demo: windows %d %d %d\n", w1, w2, w3);
     if (w1 < 0 || w2 < 0 || w3 < 0) {
         printf("gui_demo: window create failed (%d %d %d)\n", w1, w2, w3);
-        gui_deactivate();
+        GuiDeactivate();
         return 1;
     }
     /* Place the three windows side by side (non-overlapping): the
      * compositor's auto-placement already avoids stacking, and these
      * explicit positions keep the demo windows apart so no border ever
      * overlaps another. */
-    gui_move(w1, 20, 20);
-    gui_move(w2, 350, 40);
-    gui_move(w3, 680, 320);
+    GuiMove(w1, 20, 20);
+    GuiMove(w2, 350, 40);
+    GuiMove(w3, 680, 320);
 
     /* Window-local coordinates for click hit-conversion. */
     int wx2 = 350, wy2 = 40;
 
     /* Initial content. */
-    gui_fill(w2, 0, 0, WIN_W, WIN_H, 0x00101010);
-    gui_text(w1, 4, 4, "OpSys GUI demo", 0x00FFFF80, 0);
-    gui_text(w1, 4, 24, "Type keys below - they echo here.", 0x00C0C0C0, 0);
-    gui_text(w2, 8, 8, "Click anywhere to paint.", 0x00C0C0C0, 0);
+    GuiFill(w2, 0, 0, WIN_W, WIN_H, 0x00101010);
+    GuiText(w1, 4, 4, "OpSys GUI demo", 0x00FFFF80, 0);
+    GuiText(w1, 4, 24, "Type keys below - they echo here.", 0x00C0C0C0, 0);
+    GuiText(w2, 8, 8, "Click anywhere to paint.", 0x00C0C0C0, 0);
 
     char    line[64];
     int     lpos = 0;
@@ -165,7 +178,7 @@ int main(void) {
     for (;;) {
         gui_resp_poll_t ev;
         int             n = 0;
-        if (gui_poll(&ev, &n) < 0)
+        if (GuiPoll(&ev, &n) < 0)
             break;
         for (int i = 0; i < n; i++) {
             gui_event_t *e = &ev.events[i];
@@ -185,14 +198,14 @@ int main(void) {
                     lrow += 20;
                     lpos = 0;
                     if (lrow > WIN_H - 20) {
-                        gui_fill(w1, 0, 0, WIN_W, WIN_H, 0x00101018);
+                        GuiFill(w1, 0, 0, WIN_W, WIN_H, 0x00101018);
                         lrow = 44;
                     }
                 } else if (ch >= ' ' && ch < 0x7F) {
                     if (lpos < (int)sizeof(line) - 2) {
                         line[lpos++] = (char)ch;
                         line[lpos]   = '\0';
-                        gui_text(w1, 4, lrow, line, 0x00FFFFFF, 0x00101018);
+                        GuiText(w1, 4, lrow, line, 0x00FFFFFF, 0x00101018);
                     }
                 }
             } else if (e->type == GUI_EV_BUTTON && e->code == 1) {
@@ -200,25 +213,25 @@ int main(void) {
                 int cx = e->x - wx2 - 1;
                 int cy = e->y - wy2 - GUI_TITLE_H - 1;
                 if (cx >= 0 && cy >= 0 && cx + 12 <= WIN_W && cy + 12 <= WIN_H) {
-                    gui_fill(w2, cx, cy, 12, 12, s_colors[color_idx % 7]);
+                    GuiFill(w2, cx, cy, 12, 12, s_colors[color_idx % 7]);
                     color_idx++;
                 }
             } else if (e->type == GUI_EV_MOUSEMOVE) {
                 /* Info window: pointer position. */
                 char info[64];
                 snprintf(info, sizeof(info), "ptr %d,%d", e->x, e->y);
-                gui_fill(w3, 4, 4, 200, 20, 0x00101010);
-                gui_text(w3, 4, 4, info, 0x00FFFFFF, 0);
+                GuiFill(w3, 4, 4, 200, 20, 0x00101010);
+                GuiText(w3, 4, 4, info, 0x00FFFFFF, 0);
             }
         }
-        (void)sleep(1);
+        (void)Sleep(1);
     }
 
 done:
-    gui_destroy(w1);
-    gui_destroy(w2);
-    gui_destroy(w3);
-    gui_deactivate();
+    GuiDestroy(w1);
+    GuiDestroy(w2);
+    GuiDestroy(w3);
+    GuiDeactivate();
     printf("gui_demo: exited cleanly\n");
     return 0;
 }

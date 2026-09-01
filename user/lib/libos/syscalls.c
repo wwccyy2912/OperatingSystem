@@ -1,9 +1,46 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * syscalls.c - User-space system call wrappers
  * Copyright (c) 2026 OpSys Project
  *
  * Each function is a thin wrapper that passes arguments
  * to the raw sys_call() inline assembly via INT 0x80.
+ *
+ * ------------------------------------------------------------------
+ * Structure (flat wrapper set, grouped by subsystem):
+ *   user app / lib (shell, libfs, libipc, libpkg ...)
+ *        |
+ *   syscalls.c: one thin wrapper per SYS_* operation
+ *        |  pack args -> sys_call(SYS_X, a1..a5)
+ *        v
+ *   INT 0x80 -> kernel syscall handler
+ *
+ * How it works:
+ *   Each wrapper maps its C arguments onto the fixed six-slot
+ *   sys_call(number, a1..a5) inline asm; the kernel dispatches on the
+ *   SYS_* number and returns a raw errno-style int.
+ *
+ * Purpose:
+ *   The single user-space ABI surface for talking to the kernel;
+ *   everything else (IPC, VFS, pkg, process, caps) builds on it.
+ *
+ * Caveats:
+ *   Wrappers do no validation, buffering or locking; callers must pass
+ *   sane pointers and check the raw error return.  A few calls never
+ *   return on success (ThreadExit, sys_reboot/shutdown/panic).
+ * ------------------------------------------------------------------
  */
 
 #include "syscalls.h"
@@ -11,17 +48,17 @@
 
 /* ---- Debug / Serial I/O ---- */
 
-int debug_log(const char *str) {
+int DebugLog(const char *str) {
     return (int)sys_call(SYS_DEBUG_LOG, (long)str, 0, 0, 0, 0);
 }
 
-int debug_getchar(void) {
+int DebugGetchar(void) {
     return (int)sys_call(SYS_DEBUG_GETCHAR, 0, 0, 0, 0, 0);
 }
 
 /* ---- Capability management ---- */
 
-int cap_create(int type, int rights) {
+int CapCreate(int type, int rights) {
     return (int)sys_call(SYS_CAP_CREATE, type, rights, 0, 0, 0);
 }
 
@@ -32,37 +69,37 @@ int cap_create(int type, int rights) {
  *   CAP_TYPE_IO_PORT → port range (count << 16) | base_port
  *   other types      → unused (0)
  */
-int cap_create_obj(int type, int rights, unsigned long obj_id) {
+int CapCreateObj(int type, int rights, unsigned long obj_id) {
     return (int)sys_call(SYS_CAP_CREATE, type, rights, (long)obj_id, 0, 0);
 }
 
-int cap_grant(int handle, int target_pid, int rights) {
+int CapGrant(int handle, int target_pid, int rights) {
     return (int)sys_call(SYS_CAP_GRANT, handle, target_pid, rights, 0, 0);
 }
 
-int cap_revoke(int handle) {
+int CapRevoke(int handle) {
     return (int)sys_call(SYS_CAP_REVOKE, handle, 0, 0, 0, 0);
 }
 
 /* ---- IPC ---- */
 
-int ipc_send(int port, const void *msg, int len) {
+int IpcSend(int port, const void *msg, int len) {
     return (int)sys_call(SYS_IPC_SEND, port, (long)msg, len, 0, 0);
 }
 
-int ipc_recv(int port, void *buf, int *len, int *tok) {
+int IpcRecv(int port, void *buf, int *len, int *tok) {
     return (int)sys_call(SYS_IPC_RECV, port, (long)buf, (long)len, (long)tok, 0);
 }
 
-int ipc_call(int port, const void *req, int req_len, void *resp, int *resp_len) {
+int IpcCall(int port, const void *req, int req_len, void *resp, int *resp_len) {
     return (int)sys_call(SYS_IPC_CALL, port, (long)req, req_len, (long)resp, (long)resp_len);
 }
 
-int ipc_port_create(void) {
+int IpcPortCreate(void) {
     return (int)sys_call(SYS_IPC_PORT_CREATE, 0, 0, 0, 0, 0);
 }
 
-int ipc_reply(int token, const void *resp, int resp_len) {
+int IpcReply(int token, const void *resp, int resp_len) {
     return (int)sys_call(SYS_IPC_REPLY, token, (long)resp, resp_len, 0, 0);
 }
 
@@ -72,17 +109,17 @@ void *map_memory(int cap, uint64_t offset, uint64_t size, int prot) {
     return (void *)sys_call(SYS_MAP_MEMORY, cap, (long)offset, (long)size, prot, 0);
 }
 
-int unmap_memory(void *addr, uint64_t size) {
+int UnmapMemory(void *addr, uint64_t size) {
     return (int)sys_call(SYS_UNMAP_MEMORY, (long)addr, (long)size, 0, 0, 0);
 }
 
 /* ---- Thread management ---- */
 
-int thread_create(void (*entry)(void *), void *arg, int priority) {
+int ThreadCreate(void (*entry)(void *), void *arg, int priority) {
     return (int)sys_call(SYS_THREAD_CREATE, (long)entry, (long)arg, priority, 0, 0);
 }
 
-void thread_exit(int code) {
+void ThreadExit(int code) {
     sys_call(SYS_THREAD_EXIT, code, 0, 0, 0, 0);
     /* Should never return */
     __builtin_unreachable();
@@ -94,24 +131,24 @@ void *vspace_alloc(unsigned long size, unsigned long flags) {
 }
 
 /* --- Thread context (roadmap P2): overwrite a thread's saved state --- */
-int thread_set_ctx(int tid, const void *ctx, unsigned long ctx_size) {
+int ThreadSetCtx(int tid, const void *ctx, unsigned long ctx_size) {
     return (int)sys_call(SYS_THREAD_SET_CTX, tid, (long)ctx, ctx_size, 0, 0);
 }
 
 /* --- PCI enumeration --- */
-int pci_get_count(void) {
+int PciGetCount(void) {
     return (int)sys_call(SYS_PCI_GET_COUNT, 0, 0, 0, 0, 0);
 }
 
-int pci_get_device(int index, pci_device_info_t *out) {
+int PciGetDevice(int index, pci_device_info_t *out) {
     return (int)sys_call(SYS_PCI_GET_DEVICE, index, (long)out, 0, 0, 0);
 }
 
-int pci_cfg_read32(int index, unsigned offset) {
+int PciCfgRead32(int index, unsigned offset) {
     return (int)sys_call(SYS_PCI_CFG_READ, index, (long)offset, 0, 0, 0);
 }
 
-int pci_cfg_write32(int index, unsigned offset, unsigned val) {
+int PciCfgWrite32(int index, unsigned offset, unsigned val) {
     return (int)sys_call(SYS_PCI_CFG_WRITE, index, (long)offset, (long)val, 0, 0);
 }
 
@@ -129,81 +166,81 @@ int64_t sys_blk_info(uint64_t disk, blk_info_t *out) {
     return (int64_t)sys_call(SYS_BLK_INFO, (long)disk, (long)out, 0, 0, 0);
 }
 
-void thread_yield(void) {
+void ThreadYield(void) {
     sys_call(SYS_THREAD_YIELD, 0, 0, 0, 0, 0);
 }
 
-int thread_set_affinity(int tid, int cpu) {
+int ThreadSetAffinity(int tid, int cpu) {
     return (int)sys_call(SYS_THREAD_SET_AFFINITY, tid, cpu, 0, 0, 0);
 }
 
-int thread_join(int tid, int *exit_code) {
+int ThreadJoin(int tid, int *exit_code) {
     return (int)sys_call(SYS_THREAD_JOIN, tid, (long)exit_code, 0, 0, 0);
 }
 
 /* ---- Time ---- */
 
-int get_time(void) {
+int GetTime(void) {
     return (int)sys_call(SYS_GET_TIME, 0, 0, 0, 0, 0);
 }
 
-int sleep(int ticks) {
+int Sleep(int ticks) {
     return (int)sys_call(SYS_SLEEP, ticks, 0, 0, 0, 0);
 }
 
-int os_get_rtc_time(rtc_time_t *out) {
+int OsGetRtcTime(rtc_time_t *out) {
     return (int)sys_call(SYS_GET_RTC_TIME, (long)out, 0, 0, 0, 0);
 }
 
-int os_set_time(const rtc_time_t *t) {
+int OsSetTime(const rtc_time_t *t) {
     return (int)sys_call(SYS_SET_TIME, (long)t, 0, 0, 0, 0);
 }
 
 /* ---- Port registry ---- */
 
-int port_register(const char *name, int port) {
+int PortRegister(const char *name, int port) {
     return (int)sys_call(SYS_PORT_REGISTER, (long)name, port, 0, 0, 0);
 }
 
-int port_get(const char *name) {
+int PortGet(const char *name) {
     return (int)sys_call(SYS_PORT_GET, (long)name, 0, 0, 0, 0);
 }
 
 /* ---- Async notification ---- */
 
-int notify(int target_tid, unsigned int mask) {
+int Notify(int target_tid, unsigned int mask) {
     return (int)sys_call(SYS_NOTIFY, target_tid, (long)mask, 0, 0, 0);
 }
 
-int wait_notification(unsigned int mask) {
+int WaitNotification(unsigned int mask) {
     return (int)sys_call(SYS_WAIT_NOTIFICATION, (long)mask, 0, 0, 0, 0);
 }
 
 /* ---- IRQ binding ---- */
 
-int bind_irq(int cap, int irq, unsigned int mask) {
+int BindIrq(int cap, int irq, unsigned int mask) {
     return (int)sys_call(SYS_BIND_IRQ, cap, irq, (long)mask, 0, 0);
 }
 
-int unbind_irq(int cap, int irq) {
+int UnbindIrq(int cap, int irq) {
     return (int)sys_call(SYS_UNBIND_IRQ, cap, irq, 0, 0, 0);
 }
 
 /* ---- I/O port access ---- */
 
-int io_read8(unsigned short port) {
+int IoRead8(unsigned short port) {
     return (int)sys_call(SYS_IO_READ8, (long)port, 0, 0, 0, 0);
 }
 
-int io_write8(unsigned short port, unsigned char val) {
+int IoWrite8(unsigned short port, unsigned char val) {
     return (int)sys_call(SYS_IO_WRITE8, (long)port, (long)val, 0, 0, 0);
 }
 
-int io_read16(unsigned short port) {
+int IoRead16(unsigned short port) {
     return (int)sys_call(SYS_IO_READ16, (long)port, 0, 0, 0, 0);
 }
 
-int io_write16(unsigned short port, unsigned short val) {
+int IoWrite16(unsigned short port, unsigned short val) {
     return (int)sys_call(SYS_IO_WRITE16, (long)port, (long)val, 0, 0, 0);
 }
 
@@ -224,23 +261,23 @@ int sys_panic(void) {
 
 /* ---- Init protocol ---- */
 
-int get_free_pages(void) {
+int GetFreePages(void) {
     return (int)sys_call(SYS_GET_FREE_PAGES, 0, 0, 0, 0, 0);
 }
 
-int get_pid(void) {
+int GetPid(void) {
     return (int)sys_call(SYS_GET_PID, 0, 0, 0, 0, 0);
 }
 
-uint64_t get_heap_base(void) {
+uint64_t GetHeapBase(void) {
     return (uint64_t)sys_call(SYS_GET_HEAP_BASE, 0, 0, 0, 0, 0);
 }
 
 /* ---- Process management ---- */
 
 /*
- * Roadmap P1: ELF parsing now happens HERE in user space.  process_create()
- * parses the ELF blob with elf_parse() into a proc_image_desc_t + segment
+ * Roadmap P1: ELF parsing now happens HERE in user space.  ProcessCreate()
+ * parses the ELF blob with ElfParse() into a proc_image_desc_t + segment
  * table, then asks the kernel to build the address space, copy the opaque
  * segment bytes from the blob, zero BSS and start the process.  The kernel
  * never parses the blob's file format (see kernel/syscall/process_desc.c).
@@ -248,71 +285,71 @@ uint64_t get_heap_base(void) {
  * The descriptor and its segment table must be CONTIGUOUS: the kernel ABI
  * reads the proc_seg_desc_t array right after the proc_image_desc_t.
  */
-int process_create(const char *name, const void *elf, unsigned long size) {
+int ProcessCreate(const char *name, const void *elf, unsigned long size) {
     struct {
         proc_image_desc_t desc;
         proc_seg_desc_t   segs[ELF_MAX_LOAD_SEGS];
     } img;
 
-    int err = elf_parse(elf, size, &img.desc, img.segs, ELF_MAX_LOAD_SEGS);
+    int err = ElfParse(elf, size, &img.desc, img.segs, ELF_MAX_LOAD_SEGS);
     if (err < 0)
         return err;
 
     return (int)sys_call(SYS_PROCESS_CREATE, (long)name, (long)&img.desc, (long)elf, (long)size, 0);
 }
 
-int process_wait(int pid, int *exit_code) {
+int ProcessWait(int pid, int *exit_code) {
     return (int)sys_call(SYS_PROCESS_WAIT, (long)pid, (long)exit_code, 0, 0, 0);
 }
 
-int process_list(proc_info_t *buf, int max_entries) {
+int ProcessList(proc_info_t *buf, int max_entries) {
     return (int)sys_call(SYS_PROCESS_LIST, (long)buf, max_entries, 0, 0, 0);
 }
 
-int proc_info_by_subject(uint64_t subject, proc_ident_t *out) {
+int ProcInfoBySubject(uint64_t subject, proc_ident_t *out) {
     return (int)sys_call(SYS_PROC_INFO_BY_SUBJECT, (long)subject, (long)out, 0, 0, 0);
 }
 
 /* ---- Embedded blob access ---- */
 
-int blob_get(const char *name, void *buf, int buf_size) {
+int BlobGet(const char *name, void *buf, int buf_size) {
     return (int)sys_call(SYS_BLOB_GET, (long)name, (long)buf, buf_size, 0, 0);
 }
 
 /* ---- Mutex ---- */
 
-int mutex_create(void) {
+int MutexCreate(void) {
     return (int)sys_call(SYS_MUTEX_CREATE, 0, 0, 0, 0, 0);
 }
 
-int mutex_lock(int handle) {
+int MutexLock(int handle) {
     return (int)sys_call(SYS_MUTEX_LOCK, handle, 0, 0, 0, 0);
 }
 
-int mutex_unlock(int handle) {
+int MutexUnlock(int handle) {
     return (int)sys_call(SYS_MUTEX_UNLOCK, handle, 0, 0, 0, 0);
 }
 
-int mutex_destroy(int handle) {
+int MutexDestroy(int handle) {
     return (int)sys_call(SYS_MUTEX_DESTROY, handle, 0, 0, 0, 0);
 }
 
 /* ---- Signals ---- */
 
 /*
- * signal() lives in the C runtime (user/runtime/signal_user.c): with
+ * Signal() lives in the C runtime (user/runtime/signal_user.c): with
  * semantics moved to Ring 3 (kernel_roadmap.md D4/P2), registering a
  * handler is a plain user-memory table swap -- no syscall involved.
- * kill() remains a syscall: the kernel latches the pending bit and
+ * Kill() remains a syscall: the kernel latches the pending bit and
  * the Ring 3 dispatcher decides ignore/default/handler at delivery.
  */
-int kill(int pid, int signum) {
+int Kill(int pid, int signum) {
     return (int)sys_call(SYS_KILL, pid, signum, 0, 0, 0);
 }
 
 /* ---- Framebuffer ---- */
 
-int fb_get_info(fb_user_info_t *out) {
+int FbGetInfo(fb_user_info_t *out) {
     return (int)sys_call(SYS_FB_GET_INFO, (long)out, 0, 0, 0, 0);
 }
 
@@ -322,11 +359,11 @@ void *fb_map(void *virt, unsigned long size) {
 
 /* ---- P0 地基: permission model (docs/permission_model.md) ---- */
 
-uint64_t get_subject(void) {
+uint64_t GetSubject(void) {
     return (uint64_t)sys_call(SYS_GET_SUBJECT, 0, 0, 0, 0, 0);
 }
 
-int cap_create_atom(
+int CapCreateAtom(
     atom_id_t atom, int rights, uint64_t expiry_ticks, uint32_t quota, uint64_t scope_hash) {
     return (int)sys_call(SYS_CAP_CREATE_ATOM,
                          (long)atom,
@@ -336,15 +373,15 @@ int cap_create_atom(
                          (long)scope_hash);
 }
 
-int cap_consume(int handle) {
+int CapConsume(int handle) {
     return (int)sys_call(SYS_CAP_CONSUME, (long)handle, 0, 0, 0, 0);
 }
 
-int cap_revoke_by_atom(uint64_t subject, atom_id_t atom, uint64_t scope_hash) {
+int CapRevokeByAtom(uint64_t subject, atom_id_t atom, uint64_t scope_hash) {
     return (int)sys_call(SYS_CAP_REVOKE_BY_ATOM, (long)subject, (long)atom, (long)scope_hash, 0, 0);
 }
 
-int cap_grant_to_subject(
+int CapGrantToSubject(
     uint64_t subject, atom_id_t atom, int rights, uint64_t expiry_ticks, uint32_t quota) {
     return (int)sys_call(SYS_CAP_GRANT_TO_SUBJECT,
                          (long)subject,
@@ -354,11 +391,11 @@ int cap_grant_to_subject(
                          (long)quota);
 }
 
-int cap_has_atom(uint64_t subject, atom_id_t atom) {
+int CapHasAtom(uint64_t subject, atom_id_t atom) {
     return (int)sys_call(SYS_CAP_HAS_ATOM, (long)subject, (long)atom, 0, 0, 0);
 }
 
-int ipc_recv_from(int port, void *buf, int *len, int *tok, uint64_t *sender_subject) {
+int IpcRecvFrom(int port, void *buf, int *len, int *tok, uint64_t *sender_subject) {
     return (int)sys_call(
         SYS_IPC_RECV_FROM, port, (long)buf, (long)len, (long)tok, (long)sender_subject);
 }
@@ -369,7 +406,7 @@ int ipc_recv_from(int port, void *buf, int *len, int *tok, uint64_t *sender_subj
  * them at `virt` (a vspace_alloc()'d range) in the caller's address
  * space.  Gated on ATOM_SERVICE_MANAGE.  Returns the pool's physical
  * base (the handle for shm_map), or a negative error. */
-uint64_t shm_create(uint64_t count, void *virt) {
+uint64_t ShmCreate(uint64_t count, void *virt) {
     return (uint64_t)sys_call(SYS_SHM_CREATE, (long)count, (long)virt, 0, 0, 0);
 }
 
@@ -377,7 +414,7 @@ uint64_t shm_create(uint64_t count, void *virt) {
  * into the process holding `subject` at `virt` (vspace_alloc'ed by the
  * client).  Gated on ATOM_SERVICE_MANAGE + pool-table verification.
  * Returns 0, or a negative error. */
-int shm_map(uint64_t phys_base, uint64_t count, uint64_t subject, void *virt) {
+int ShmMap(uint64_t phys_base, uint64_t count, uint64_t subject, void *virt) {
     return (int)sys_call(
         SYS_SHM_MAP, (long)phys_base, (long)count, (long)subject, (long)virt, 0);
 }

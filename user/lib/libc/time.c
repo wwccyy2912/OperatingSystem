@@ -2,8 +2,22 @@
  * time.c - Date and time functions (C11 §7.27)
  * Copyright (c) 2026 OpSys Project
  *
- * Backed by kernel get_time() (tick count) and os_get_rtc_time()
+ * Backed by kernel GetTime() (tick count) and OsGetRtcTime()
  * (wall clock).  No timezone support — localtime == gmtime.
+ 
+ *
+ * ------------------------------------------------------------------
+ * Structure (time):
+ *   time()/clock()/GetTime() -> kernel tick/RTC syscalls;
+ *   localtime/gmtime/strftime -> civil-time conversion.
+ * How it works:
+ *   Reads the kernel tick counter or RTC; date math is standard
+ *   days-from-epoch conversion.
+ * Purpose:
+ *   Timestamps and calendar formatting for services and the shell.
+ * Caveats:
+ *   No timezone database; localtime is fixed to the RTC timezone.
+ * ------------------------------------------------------------------
  */
 
 #include "time.h"
@@ -22,15 +36,15 @@ static char      s_time_str[32];
  * ==================================================================== */
 
 clock_t clock(void) {
-    /* Kernel get_time() returns a tick counter at 1 kHz. */
-    return (clock_t)get_time();
+    /* Kernel GetTime() returns a tick counter at 1 kHz. */
+    return (clock_t)GetTime();
 }
 
 time_t time(time_t *timer) {
     rtc_time_t rtc;
-    if (os_get_rtc_time(&rtc) != 0) {
+    if (OsGetRtcTime(&rtc) != 0) {
         /* RTC unavailable — fall back to tick count */
-        time_t t = (time_t)get_time() / (time_t)CLOCKS_PER_SEC;
+        time_t t = (time_t)GetTime() / (time_t)CLOCKS_PER_SEC;
         if (timer)
             *timer = t;
         return t;
@@ -71,11 +85,11 @@ double difftime(time_t t1, time_t t0) {
 
 static const int s_mon_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 
-static int is_leap(int year) {
+static int IsLeap(int year) {
     return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
 }
 
-static int day_of_week(int y, int m, int d) {
+static int DayOfWeek(int y, int m, int d) {
     /* Zeller's congruence (0 = Sunday). */
     if (m < 3) {
         m += 12;
@@ -106,7 +120,7 @@ struct tm *gmtime(const time_t *timer) {
     /* Compute year. */
     int year = 1970;
     while (1) {
-        int yd = is_leap(year) ? 366 : 365;
+        int yd = IsLeap(year) ? 366 : 365;
         if (days < yd)
             break;
         days -= yd;
@@ -118,7 +132,7 @@ struct tm *gmtime(const time_t *timer) {
     int mon = 0;
     while (mon < 11) {
         int md = s_mon_days[mon];
-        if (mon == 1 && is_leap(year))
+        if (mon == 1 && IsLeap(year))
             md++;
         if (days < md)
             break;
@@ -128,13 +142,13 @@ struct tm *gmtime(const time_t *timer) {
     s_tm_buf.tm_mon  = mon;
     s_tm_buf.tm_mday = days + 1;
 
-    s_tm_buf.tm_wday = day_of_week(year, mon + 1, s_tm_buf.tm_mday);
+    s_tm_buf.tm_wday = DayOfWeek(year, mon + 1, s_tm_buf.tm_mday);
 
     /* Day of year. */
     int yday = s_tm_buf.tm_mday - 1;
     for (int i = 0; i < mon; i++) {
         yday += s_mon_days[i];
-        if (i == 1 && is_leap(year))
+        if (i == 1 && IsLeap(year))
             yday++;
     }
     s_tm_buf.tm_yday  = yday;
@@ -168,10 +182,10 @@ time_t mktime(struct tm *t) {
     /* Days from epoch. */
     int days = 0;
     for (int y = 1970; y < year; y++)
-        days += is_leap(y) ? 366 : 365;
+        days += IsLeap(y) ? 366 : 365;
     for (int m = 0; m < mon; m++) {
         int md = s_mon_days[m];
-        if (m == 1 && is_leap(year))
+        if (m == 1 && IsLeap(year))
             md++;
         days += md;
     }
@@ -181,14 +195,14 @@ time_t mktime(struct tm *t) {
                     (time_t)t->tm_sec;
 
     /* Update fields. */
-    t->tm_wday = day_of_week(year, mon + 1, t->tm_mday);
+    t->tm_wday = DayOfWeek(year, mon + 1, t->tm_mday);
     t->tm_year = year - 1900;
     t->tm_mon  = mon;
 
     int yday = t->tm_mday - 1;
     for (int m = 0; m < mon; m++) {
         int md = s_mon_days[m];
-        if (m == 1 && is_leap(year))
+        if (m == 1 && IsLeap(year))
             md++;
         yday += md;
     }

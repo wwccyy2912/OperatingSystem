@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * fs_mem_driver.c - In-memory filesystem driver (ring-3, independent process)
  * Copyright (c) 2026 OpSys Project
  *
@@ -24,6 +37,26 @@
  * Driver port: "vfs.fs.mem"   (driver_name "mem")
  * Protocol:    drv_req_t/drv_resp_t (vfs.h) — compact unions, every
  *              exchange < 4096 bytes.
+ *
+ * ------------------------------------------------------------------
+ * Structure (volumes): two heap-backed volumes with per-volume dense
+ *   item tables — System (RO, kernel blobs exposed as /Kernel/*.elf
+ *   via s_sys_blobs) and Users (32 MiB RW scratch); driver port
+ *   "vfs.fs.mem", protocol drv_req_t/drv_resp_t.
+ * How it works:
+ *   The manager-spawned process waits for the "vfs" port, builds the
+ *   System volume from blob.c entries, then MemMount()s System and
+ *   Users (VFS_OP_MOUNT handshake); DRV_OP_* requests from the
+ *   vfs_server dispatch to helpers such as MemCreate; itemID is the
+ *   1-based table index, never reused after delete.
+ * Purpose:
+ *   In-RAM storage driver — the boot filesystem (kernel ELF blobs)
+ *   plus a 32 MiB RW scratch volume for the running system.
+ * Caveats:
+ *   No persistence: a reboot loses Users data.  Item space is capped
+ *   (MEM_MAX_ITEMS) and deleted items never recycle their ID; storage
+ *   is malloc'd pages, so writes consume real RAM.
+ * ------------------------------------------------------------------
  */
 
 #include <stdint.h>
@@ -96,11 +129,11 @@ static int  s_pool_ready;
 /* Create the pool: vspace_alloc a range, then SYS_SHM_CREATE maps the
  * physical pages into it.  Returns 0, or -1 (pool stays disabled and
  * all files use heap storage — safe fallback). */
-static int pool_init(void) {
+static int PoolInit(void) {
     void *virt = vspace_alloc(SHM_POOL_PAGES * PAGE_SIZE, 0);
     if (!virt)
         return -1;
-    u64 phys = shm_create(SHM_POOL_PAGES, virt);
+    u64 phys = ShmCreate(SHM_POOL_PAGES, virt);
     if ((long long)phys <= 0)
         return -1;
     s_pool_virt  = (u8 *)virt;
@@ -125,14 +158,14 @@ static u8 *pool_alloc(u32 size) {
     return p;
 }
 
-static int pool_contains(const u8 *p) {
+static int PoolContains(const u8 *p) {
     return s_pool_ready && p >= s_pool_virt &&
            p < s_pool_virt + SHM_POOL_PAGES * PAGE_SIZE;
 }
 
 /* Backing physical range of a pool-resident buffer. */
-static int pool_phys_range(const u8 *p, u64 *phys_out) {
-    if (!pool_contains(p))
+static int PoolPhysRange(const u8 *p, u64 *phys_out) {
+    if (!PoolContains(p))
         return 0;
     *phys_out = s_pool_phys + (u64)(p - s_pool_virt);
     return 1;
@@ -141,8 +174,8 @@ static int pool_phys_range(const u8 *p, u64 *phys_out) {
 /* Free a data buffer: heap buffers are free()d, pool buffers are NOT
  * (the bump allocator never returns blocks; the 1 MiB pool is a
  * bounded, driver-lifetime cache). */
-static void item_free_data(u8 *p) {
-    if (p && !pool_contains(p))
+static void ItemFreeData(u8 *p) {
+    if (p && !PoolContains(p))
         free(p);
 }
 
@@ -162,7 +195,7 @@ static mem_item_t *mem_find(mem_vol_t *vol, vfs_item_id_t id)
         return it->in_use ? it : NULL;
 }
 
-static i32 mem_lookup(mem_vol_t *vol, vfs_item_id_t parent,
+static i32 MemLookup(mem_vol_t *vol, vfs_item_id_t parent,
                                             const char *name, vfs_item_id_t *out)
 {
         if (!name)
@@ -183,7 +216,7 @@ static i32 mem_lookup(mem_vol_t *vol, vfs_item_id_t parent,
 /* Internal create primitive — no read-only check.  Used by the
  * RO-guarded protocol path (mem_create) and by System-volume setup,
  * which must build /Kernel on a volume that is RO to everyone else. */
-static i32 mem_create_item(mem_vol_t *vol, vfs_item_id_t parent,
+static i32 MemCreateItem(mem_vol_t *vol, vfs_item_id_t parent,
                            const char *name, u32 type, vfs_item_id_t *out_id)
 {
         if (!name || !name[0])
@@ -196,7 +229,7 @@ static i32 mem_create_item(mem_vol_t *vol, vfs_item_id_t parent,
                 return ERR_NOENT;
 
         vfs_item_id_t dup = 0;
-        if (mem_lookup(vol, parent, name, &dup) == 0)
+        if (MemLookup(vol, parent, name, &dup) == 0)
                 return VFS_ERR_EXISTS;
 
         if (vol->item_count >= MEM_MAX_ITEMS)
@@ -210,7 +243,7 @@ static i32 mem_create_item(mem_vol_t *vol, vfs_item_id_t parent,
         it->parent = parent;
         strncpy(it->name, name, sizeof(it->name) - 1);
         it->name[sizeof(it->name) - 1] = '\0';
-        it->created = (u64)get_time();
+        it->created = (u64)GetTime();
         it->modified = it->created;
         *out_id = (vfs_item_id_t)(idx + 1);
         return 0;
@@ -218,16 +251,16 @@ static i32 mem_create_item(mem_vol_t *vol, vfs_item_id_t parent,
 
 /* Create a file or dir item under parent.  Returns 0 and sets *out_id,
  * or a negative error (VFS_ERR_READONLY / VFS_ERR_EXISTS / ERR_NOMEM). */
-static i32 mem_create(mem_vol_t *vol, vfs_item_id_t parent,
+static i32 MemCreate(mem_vol_t *vol, vfs_item_id_t parent,
                                             const char *name, u32 type, vfs_item_id_t *out_id)
 {
         if (vol->read_only)
                 return VFS_ERR_READONLY;
-        return mem_create_item(vol, parent, name, type, out_id);
+        return MemCreateItem(vol, parent, name, type, out_id);
 }
 
 /* Recursive delete of item id (dir children first).  Frees file data. */
-static i32 mem_delete(mem_vol_t *vol, vfs_item_id_t id, u32 recursive)
+static i32 MemDelete(mem_vol_t *vol, vfs_item_id_t id, u32 recursive)
 {
         if (vol->read_only)
                 return VFS_ERR_READONLY;
@@ -241,7 +274,7 @@ static i32 mem_delete(mem_vol_t *vol, vfs_item_id_t id, u32 recursive)
                                 continue;
                         if (!recursive)
                                 return ERR_BUSY;            /* dir not empty */
-                        i32 r = mem_delete(vol, (vfs_item_id_t)(i + 1), 1);
+                        i32 r = MemDelete(vol, (vfs_item_id_t)(i + 1), 1);
                         if (r < 0)
                                 return r;
                         i = 0;                          /* table shrinks; rescan */
@@ -249,7 +282,7 @@ static i32 mem_delete(mem_vol_t *vol, vfs_item_id_t id, u32 recursive)
         }
 
         if (it->data) {
-                item_free_data(it->data);
+                ItemFreeData(it->data);
                 vol->used -= it->size;
         }
         memset(it, 0, sizeof(*it));             /* in_use = 0, id never reused */
@@ -264,7 +297,7 @@ static i32 mem_delete(mem_vol_t *vol, vfs_item_id_t id, u32 recursive)
  * 后书签仍有效」的地基).  A non-empty payload.name renames the item;
  * an empty name keeps it.  Rejects moving a dir into its own subtree.
  */
-static i32 mem_move(mem_vol_t *vol, vfs_item_id_t id,
+static i32 MemMove(mem_vol_t *vol, vfs_item_id_t id,
                                         vfs_item_id_t new_parent, const char *name)
 {
         if (vol->read_only)
@@ -283,7 +316,7 @@ static i32 mem_move(mem_vol_t *vol, vfs_item_id_t id,
         if (it->parent != new_parent ||
                 (name && name[0] && strcmp(name, it->name) != 0)) {
                 vfs_item_id_t dup = 0;
-                if (mem_lookup(vol, new_parent, final_name, &dup) == 0)
+                if (MemLookup(vol, new_parent, final_name, &dup) == 0)
                         return VFS_ERR_EXISTS;
         }
 
@@ -305,7 +338,7 @@ static i32 mem_move(mem_vol_t *vol, vfs_item_id_t id,
                 strncpy(it->name, name, sizeof(it->name) - 1);
                 it->name[sizeof(it->name) - 1] = '\0';
         }
-        it->modified = (u64)get_time();
+        it->modified = (u64)GetTime();
         return 0;                               /* itemID stays stable */
 }
 
@@ -314,7 +347,7 @@ static i32 mem_move(mem_vol_t *vol, vfs_item_id_t id,
  * ==================================================================== */
 
 /* Fresh volume with a root dir. */
-static void mem_vol_init(mem_vol_t *vol, const char *mount_name,
+static void MemVolInit(mem_vol_t *vol, const char *mount_name,
                          u32 read_only, u64 capacity)
 {
         memset(vol, 0, sizeof(*vol));
@@ -326,7 +359,7 @@ static void mem_vol_init(mem_vol_t *vol, const char *mount_name,
         root->in_use = 1;
         root->type = VFS_ITEM_DIR;
         root->parent = 0;
-        root->created = (u64)get_time();
+        root->created = (u64)GetTime();
         root->modified = root->created;
         vol->item_count = 1;
         vol->root = 1;
@@ -340,16 +373,16 @@ static void mem_vol_init(mem_vol_t *vol, const char *mount_name,
  * item.  buf_size > BLOB_MAX_SIZE in the kernel is fine: the kernel
  * only refuses when the blob does not fit the caller's buffer.
  */
-static int mem_sys_load(void)
+static int MemSysLoad(void)
 {
         static char blob_buf[262144];
 
-        mem_vol_init(&s_sys, "System", 1, 0);
+        MemVolInit(&s_sys, "System", 1, 0);
 
         /* Kernel directory under the root (System is RO to everyone else,
      * so setup uses the internal create primitive) */
         vfs_item_id_t kernel_id = 0;
-        int r = mem_create_item(&s_sys, s_sys.root, "Kernel", VFS_ITEM_DIR,
+        int r = MemCreateItem(&s_sys, s_sys.root, "Kernel", VFS_ITEM_DIR,
                                                         &kernel_id);
         if (r < 0) {
                 printf("fs_mem_driver: System /Kernel create failed (%d)\n", r);
@@ -359,7 +392,7 @@ static int mem_sys_load(void)
         int loaded = 0;
         for (int i = 0; i < SYS_BLOB_COUNT; i++) {
                 const char *bname = s_sys_blobs[i];
-                int n = blob_get(bname, blob_buf, (int)sizeof(blob_buf));
+                int n = BlobGet(bname, blob_buf, (int)sizeof(blob_buf));
                 if (n < 0) {
                         printf("fs_mem_driver: blob '%s' fetch failed (%d)\n", bname, n);
                         continue;
@@ -380,7 +413,7 @@ static int mem_sys_load(void)
                 fname[l + 4] = '\0';
 
                 vfs_item_id_t fid = 0;
-                r = mem_create_item(&s_sys, kernel_id, fname, VFS_ITEM_FILE, &fid);
+                r = MemCreateItem(&s_sys, kernel_id, fname, VFS_ITEM_FILE, &fid);
                 if (r < 0) {
                         printf("fs_mem_driver: file '%s' create failed (%d)\n", fname, r);
                         continue;
@@ -413,7 +446,7 @@ static int mem_sys_load(void)
  * MOUNT handshake (A1: driver-initiated, design §7.2)
  * ==================================================================== */
 
-static int mem_mount(int vfs_port, mem_vol_t *vol, u64 uuid_lo)
+static int MemMount(int vfs_port, mem_vol_t *vol, u64 uuid_lo)
 {
         vfs_req_mount_t req;
         vfs_resp_mount_t resp;
@@ -422,12 +455,12 @@ static int mem_mount(int vfs_port, mem_vol_t *vol, u64 uuid_lo)
         strncpy(req.driver_name, "mem", sizeof(req.driver_name) - 1);
         strncpy(req.mount_name, vol->mount_name, sizeof(req.mount_name) - 1);
         req.uuid.hi = 0x6f707379732d7666ULL;        /* "opsys-vf" magic */
-        req.uuid.lo = ((u64)(u32)get_time() << 32) | uuid_lo;
+        req.uuid.lo = ((u64)(u32)GetTime() << 32) | uuid_lo;
         req.root_item_id = vol->root;
         req.read_only = vol->read_only;
 
         int resp_len = (int)sizeof(resp);
-        int ret = ipc_call(vfs_port, &req, (int)sizeof(req), &resp, &resp_len);
+        int ret = IpcCall(vfs_port, &req, (int)sizeof(req), &resp, &resp_len);
         if (ret < 0)
                 return ret;
         return resp.ret;
@@ -446,7 +479,7 @@ static mem_vol_t *mem_vol_of(u32 v)
         return NULL;
 }
 
-static i32 mem_getattr(mem_vol_t *vol, vfs_item_id_t id, vfs_item_info_t *out)
+static i32 MemGetattr(mem_vol_t *vol, vfs_item_id_t id, vfs_item_info_t *out)
 {
         mem_item_t *it = mem_find(vol, id);
         if (!it)
@@ -467,7 +500,7 @@ static i32 mem_getattr(mem_vol_t *vol, vfs_item_id_t id, vfs_item_info_t *out)
         return 0;
 }
 
-static i32 mem_read(mem_vol_t *vol, vfs_item_id_t id, u64 offset,
+static i32 MemRead(mem_vol_t *vol, vfs_item_id_t id, u64 offset,
                                         u32 len, u8 *out)
 {
         mem_item_t *it = mem_find(vol, id);
@@ -486,7 +519,7 @@ static i32 mem_read(mem_vol_t *vol, vfs_item_id_t id, u64 offset,
         return (i32)len;
 }
 
-static i32 mem_write(mem_vol_t *vol, vfs_item_id_t id, u64 offset,
+static i32 MemWrite(mem_vol_t *vol, vfs_item_id_t id, u64 offset,
                      u32 len, const u8 *in)
 {
         if (vol->read_only)
@@ -500,11 +533,11 @@ static i32 mem_write(mem_vol_t *vol, vfs_item_id_t id, u64 offset,
         /* Truncate (OPEN+TRUNCATE): len==0 && offset==0 clears the file. */
         if (len == 0) {
                 if (offset == 0 && it->size > 0) {
-                        item_free_data(it->data);
+                        ItemFreeData(it->data);
                         it->data = NULL;
                         vol->used -= it->size;
                         it->size = 0;
-                        it->modified = (u64)get_time();
+                        it->modified = (u64)GetTime();
                 }
                 return 0;
         }
@@ -522,7 +555,7 @@ static i32 mem_write(mem_vol_t *vol, vfs_item_id_t id, u64 offset,
                         nd = pool_alloc((u32)need);
                         if (nd && offset > 0)   /* hole: zero-fill 0..offset */
                                 memset(nd, 0, (size_t)offset);
-                } else if (pool_contains(it->data)) {
+                } else if (PoolContains(it->data)) {
                         /* Pool-backed file growing: migrate to the heap.
                          * (The pool bump allocator cannot grow blocks in
                          * place; after migration the file is served by
@@ -547,12 +580,12 @@ static i32 mem_write(mem_vol_t *vol, vfs_item_id_t id, u64 offset,
                 it->size = need;
         }
         memcpy(it->data + offset, in, len);
-        it->modified = (u64)get_time();
+        it->modified = (u64)GetTime();
         return (i32)len;
 }
 
 /* Collect up to VFS_ENUM_BATCH child names starting at index `from`. */
-static i32 mem_enum(mem_vol_t *vol, vfs_item_id_t parent, u32 from,
+static i32 MemEnum(mem_vol_t *vol, vfs_item_id_t parent, u32 from,
                                         drv_resp_t *resp)
 {
         u32 n = 0;
@@ -575,7 +608,7 @@ static i32 mem_enum(mem_vol_t *vol, vfs_item_id_t parent, u32 from,
         return (i32)n;
 }
 
-static void drv_handle(int token, drv_req_t *req)
+static void DrvHandle(int token, drv_req_t *req)
 {
         drv_resp_t *resp = (drv_resp_t *)s_resp;
         memset(resp, 0, sizeof(*resp));
@@ -588,36 +621,36 @@ static void drv_handle(int token, drv_req_t *req)
 
         switch (req->op) {
         case DRV_OP_GETATTR:
-                resp->ret = mem_getattr(vol, req->item_id, &resp->u.item);
+                resp->ret = MemGetattr(vol, req->item_id, &resp->u.item);
                 break;
         case DRV_OP_LOOKUP:
-                resp->ret = mem_lookup(vol, req->parent_id, req->payload.name,
+                resp->ret = MemLookup(vol, req->parent_id, req->payload.name,
                                &resp->u.item_id);
                 break;
         case DRV_OP_READ:
-                resp->ret = mem_read(vol, req->item_id, req->offset, req->len,
+                resp->ret = MemRead(vol, req->item_id, req->offset, req->len,
                              resp->u.data);
                 break;
         case DRV_OP_WRITE:
-                resp->ret = mem_write(vol, req->item_id, req->offset, req->len,
+                resp->ret = MemWrite(vol, req->item_id, req->offset, req->len,
                                                             req->payload.data);
                 break;
         case DRV_OP_CREATE_DIR:
-                resp->ret = mem_create(vol, req->parent_id, req->payload.name,
+                resp->ret = MemCreate(vol, req->parent_id, req->payload.name,
                                VFS_ITEM_DIR, &resp->u.item_id);
                 break;
         case DRV_OP_MKFILE:
-                resp->ret = mem_create(vol, req->parent_id, req->payload.name,
+                resp->ret = MemCreate(vol, req->parent_id, req->payload.name,
                                VFS_ITEM_FILE, &resp->u.item_id);
                 break;
         case DRV_OP_DELETE:
-                resp->ret = mem_delete(vol, req->item_id, req->recursive);
+                resp->ret = MemDelete(vol, req->item_id, req->recursive);
                 break;
         case DRV_OP_ENUM:
-                resp->ret = mem_enum(vol, req->parent_id, req->from, resp);
+                resp->ret = MemEnum(vol, req->parent_id, req->from, resp);
                 break;
         case DRV_OP_MOVE:
-                resp->ret = mem_move(vol, req->item_id, req->parent_id,
+                resp->ret = MemMove(vol, req->item_id, req->parent_id,
                              req->payload.name);
                 break;
         case DRV_OP_STAT:
@@ -634,7 +667,7 @@ static void drv_handle(int token, drv_req_t *req)
                         break;
                 }
                 u64 phys = 0;
-                if (!pool_phys_range(it->data, &phys)) {
+                if (!PoolPhysRange(it->data, &phys)) {
                         resp->ret = ERR_NOENT; /* heap-backed: fall back */
                         break;
                 }
@@ -649,7 +682,7 @@ static void drv_handle(int token, drv_req_t *req)
         }
 
 out:
-        int r = ipc_reply(token, resp, (int)sizeof(*resp));
+        int r = IpcReply(token, resp, (int)sizeof(*resp));
         if (r < 0)
                 printf("fs_mem_driver: ipc_reply failed (%d)\n", r);
 }
@@ -666,27 +699,27 @@ int main(void)
          * only disables the fast path; every file falls back to heap).
          * Created before the System volume loads so its blobs land in
          * the pool. ---- */
-        (void)pool_init();
+        (void)PoolInit();
 
         /* ---- 1. Volumes ---- */
-        if (mem_sys_load() < 0) {
+        if (MemSysLoad() < 0) {
                 printf("fs_mem_driver: System volume load FAILED\n");
-                thread_exit(1);
+                ThreadExit(1);
         }
-        mem_vol_init(&s_usr, "Users", 0, MEM_USERS_CAP);
+        MemVolInit(&s_usr, "Users", 0, MEM_USERS_CAP);
         printf("fs_mem_driver: Users volume ready - %d MiB read-write\n",
            (int)(MEM_USERS_CAP / (1024u * 1024u)));
 
         /* ---- 2. Driver port ---- */
-        int port = ipc_port_create();
+        int port = IpcPortCreate();
         if (port < 0) {
                 printf("fs_mem_driver: ipc_port_create failed (%d)\n", port);
-                thread_exit(1);
+                ThreadExit(1);
         }
-        int ret = port_register("vfs.fs.mem", port);
+        int ret = PortRegister("vfs.fs.mem", port);
         if (ret < 0) {
-                printf("fs_mem_driver: port_register('vfs.fs.mem') failed (%d)\n", ret);
-                thread_exit(1);
+                printf("fs_mem_driver: PortRegister('vfs.fs.mem') failed (%d)\n", ret);
+                ThreadExit(1);
         }
         printf("fs_mem_driver: port %d registered as 'vfs.fs.mem'\n", port);
 
@@ -696,20 +729,20 @@ int main(void)
      * this process keeps the driver-initiated MOUNT path. */
         int vfs_port = -1;
         for (int i = 0; i < MEM_MOUNT_WAIT && vfs_port < 0; i++) {
-                vfs_port = port_get("vfs");
+                vfs_port = PortGet("vfs");
                 if (vfs_port < 0)
-                        sleep(1);
+                        Sleep(1);
         }
         if (vfs_port < 0) {
                 printf("fs_mem_driver: 'vfs' port never resolved\n");
-                thread_exit(1);
+                ThreadExit(1);
         }
         printf("fs_mem_driver: vfs_server port %d resolved\n", vfs_port);
 
-        ret = mem_mount(vfs_port, &s_sys, 0x53595354u);      /* "SYST" */
+        ret = MemMount(vfs_port, &s_sys, 0x53595354u);      /* "SYST" */
         if (ret < 0)
                 printf("fs_mem_driver: MOUNT System failed (%d)\n", ret);
-        ret = mem_mount(vfs_port, &s_usr, 0x55534552u);      /* "USER" */
+        ret = MemMount(vfs_port, &s_usr, 0x55534552u);      /* "USER" */
         if (ret < 0)
                 printf("fs_mem_driver: MOUNT Users failed (%d)\n", ret);
         printf("fs_mem_driver: volumes mounted (System RO, Users RW)\n");
@@ -718,17 +751,17 @@ int main(void)
         for (;;) {
                 int msg_len = (int)sizeof(s_req);
                 int token = 0;
-                ret = ipc_recv(port, s_req, &msg_len, &token);
+                ret = IpcRecv(port, s_req, &msg_len, &token);
                 if (ret < 0) {
                         printf("fs_mem_driver: ipc_recv failed (%d)\n", ret);
-                        thread_exit(1);
+                        ThreadExit(1);
                 }
                 if (msg_len < (int)sizeof(u32)) {       /* no op code: reject */
                         drv_resp_t *resp = (drv_resp_t *)s_resp;
                         resp->ret = ERR_INVAL;
-                        (void)ipc_reply(token, resp, (int)sizeof(*resp));
+                        (void)IpcReply(token, resp, (int)sizeof(*resp));
                         continue;
                 }
-                drv_handle(token, (drv_req_t *)s_req);
+                DrvHandle(token, (drv_req_t *)s_req);
         }
 }

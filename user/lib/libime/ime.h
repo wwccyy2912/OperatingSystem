@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * ime.h - Minimal pinyin input-method engine (library form)
  * Copyright (c) 2026 OpSys Project
  *
@@ -31,14 +44,14 @@ extern "C" {
  * table; each points at one UTF-8 hanzi (3 bytes + NUL).  Returns the
  * number of candidates (0 when the pinyin has no match).
  */
-int ime_lookup(const char *pinyin, const char **chars_out /* IME_MAX_CAND */);
+int ImeLookup(const char *pinyin, const char **chars_out /* IME_MAX_CAND */);
 
 /*
  * True when `pinyin` is a PREFIX of at least one table entry (i.e. it
  * could still grow into a valid syllable).  The line editor uses this
  * to decide whether to keep accumulating letters into the composition.
  */
-int ime_prefix(const char *pinyin);
+int ImePrefix(const char *pinyin);
 
 #ifdef __cplusplus
 }

@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * perm.h - Powerbox permission-manager protocol (docs/vfs_design.md §8 决策 2)
  * Copyright (c) 2026 OpSys Project
  *
@@ -27,7 +40,7 @@
  *                                          Powerbox — test/management).
  *   UI_SHOW  6   perm-manager → term("perm.ui")   push prompt text.
  *
- * Transport: flat structs over ipc_call()/ipc_recv()+ipc_reply() like
+ * Transport: flat structs over IpcCall()/IpcRecv()+IpcReply() like
  * the VFS protocol (vfs.h), req[0] = op code, all messages < 4096.
  */
 

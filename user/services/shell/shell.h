@@ -1,11 +1,24 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * shell.h - Shell command registration API
  * Copyright (c) 2026 OpSys Project
  *
  * The shell's command set is a runtime-registered singly-linked list,
- * not a compile-time table.  shell_main() registers its 12 built-ins
+ * not a compile-time table.  ShellMain() registers its 12 built-ins
  * itself; any other service (e.g. the manager) may add its own commands
- * via shell_register_command() BEFORE the shell starts reading input.
+ * via ShellRegisterCommand() BEFORE the shell starts reading input.
  *
  * Registration only succeeds while the shell is not yet running its
  * loop (single-writer rule, see shell.c): call this from the shell's
@@ -29,6 +42,6 @@ typedef int (*cmd_func_t)(int argc, char *argv[]);
  * ERR_INVAL if name/help/func is NULL or the name is already
  * registered.
  */
-int shell_register_command(const char *name, const char *help, cmd_func_t func);
+int ShellRegisterCommand(const char *name, const char *help, cmd_func_t func);
 
 #endif /* SHELL_H */

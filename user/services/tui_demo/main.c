@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * tui_demo.c - TUI demonstration application
  * Copyright (c) 2026 OpSys Project
  *
@@ -17,11 +30,11 @@
 #include "../lib/libtui/tui.h"
 #include <stdint.h>
 
-static void demo_main(void) {
+static void DemoMain(void) {
     printf("[tui-demo] Starting TUI demonstration\n");
 
     /* Verify terminal is available */
-    int port = tui_port_get();
+    int port = TuiPortGet();
     if (port < 0) {
         printf("[tui-demo] Terminal service unavailable (%d)\n", port);
         return;
@@ -29,47 +42,47 @@ static void demo_main(void) {
     printf("[tui-demo] Terminal port: %d\n", port);
 
     /* Clear the screen */
-    int ret = tui_clear();
+    int ret = TuiClear();
     if (ret < 0) {
         printf("[tui-demo] tui_clear failed (%d)\n", ret);
         return;
     }
 
     /* Draw a title box at the top */
-    tui_render_box(2, 1, 70, 5, "OpSys TUI Demo v1.0");
+    TuiRenderBox(2, 1, 70, 5, "OpSys TUI Demo v1.0");
 
     /* Render welcome message inside the box */
-    tui_render_line_at(4, 3, "Welcome to the TUI demonstration!", 34);
-    tui_render_line_at(4, 4, "Using the new framebuffer terminal service", 43);
+    TuiRenderLineAt(4, 3, "Welcome to the TUI demonstration!", 34);
+    TuiRenderLineAt(4, 4, "Using the new framebuffer terminal service", 43);
 
     /* Move cursor and write some text */
-    tui_set_cursor(2, 7);
-    tui_write_str("Status: ");
-    tui_write_str("[OK]\n");
+    TuiSetCursor(2, 7);
+    TuiWriteStr("Status: ");
+    TuiWriteStr("[OK]\n");
 
-    tui_write_str("Features demonstrated:\n");
-    tui_write_str("  - Status bar rendering\n");
-    tui_write_str("  - Box drawing with titles\n");
-    tui_write_str("  - Cursor control\n");
-    tui_write_str("  - Formatted output\n");
+    TuiWriteStr("Features demonstrated:\n");
+    TuiWriteStr("  - Status bar rendering\n");
+    TuiWriteStr("  - Box drawing with titles\n");
+    TuiWriteStr("  - Cursor control\n");
+    TuiWriteStr("  - Formatted output\n");
 
     /* Render another box: input area */
-    tui_render_box(2, 13, 70, 5, "Input Area");
-    tui_render_line_at(4, 14, "You can now interact with the system.", 37);
-    tui_render_line_at(4, 15, "Type commands in the shell to control the TUI.", 47);
+    TuiRenderBox(2, 13, 70, 5, "Input Area");
+    TuiRenderLineAt(4, 14, "You can now interact with the system.", 37);
+    TuiRenderLineAt(4, 15, "Type commands in the shell to control the TUI.", 47);
 
     /* Render status bar at the bottom */
-    tui_render_status("System", "TUI Demo Ready - Use shell commands");
+    TuiRenderStatus("System", "TUI Demo Ready - Use shell commands");
 
     printf("[tui-demo] Demo rendering complete\n");
 
     /* Keep running for a bit so the display persists */
-    sleep(50);
+    Sleep(50);
 
     printf("[tui-demo] Demo finished\n");
 }
 
 int main(void) {
-    demo_main();
+    DemoMain();
     return 0;
 }

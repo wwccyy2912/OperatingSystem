@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * runtime_demo.c - OpSys Runtime Demonstration
  * Copyright (c) 2026 OpSys Project
  *
@@ -50,15 +63,15 @@ __attribute__((destructor)) static void resource_destroy(void) {
 
 static int atexit_counter = 0;
 
-static void cleanup_handler_1(void) {
+static void CleanupHandler1(void) {
     printf("[runtime_demo] atexit handler 1 (counter=%d)\n", ++atexit_counter);
 }
 
-static void cleanup_handler_2(void) {
+static void CleanupHandler2(void) {
     printf("[runtime_demo] atexit handler 2 (counter=%d)\n", ++atexit_counter);
 }
 
-static void cleanup_handler_3(void) {
+static void CleanupHandler3(void) {
     printf("[runtime_demo] atexit handler 3 (counter=%d)\n", ++atexit_counter);
 }
 
@@ -68,12 +81,12 @@ static void cleanup_handler_3(void) {
 
 static volatile int signal_count = 0;
 
-static void handle_sigusr1(int sig) {
+static void HandleSigusr1(int sig) {
     printf("[runtime_demo] Caught signal %d (SIGUSR1)\n", sig);
     signal_count++;
 }
 
-static void handle_sigterm(int sig) {
+static void HandleSigterm(int sig) {
     printf("[runtime_demo] Caught signal %d (SIGTERM), exiting gracefully\n", sig);
     exit(0);
 }
@@ -94,16 +107,16 @@ int main(void) {
     printf("\n=== Section 2: atexit Handlers ===\n");
     printf("Registering atexit handlers in order 1, 2, 3...\n");
 
-    if (atexit(cleanup_handler_1) != 0) {
-        printf("atexit(cleanup_handler_1) failed\n");
+    if (Atexit(CleanupHandler1) != 0) {
+        printf("Atexit(CleanupHandler1) failed\n");
         return 1;
     }
-    if (atexit(cleanup_handler_2) != 0) {
-        printf("atexit(cleanup_handler_2) failed\n");
+    if (Atexit(CleanupHandler2) != 0) {
+        printf("Atexit(CleanupHandler2) failed\n");
         return 1;
     }
-    if (atexit(cleanup_handler_3) != 0) {
-        printf("atexit(cleanup_handler_3) failed\n");
+    if (Atexit(CleanupHandler3) != 0) {
+        printf("Atexit(CleanupHandler3) failed\n");
         return 1;
     }
 
@@ -165,25 +178,25 @@ int main(void) {
     printf("\n=== Section 5: Signal Registration ===\n");
 
     printf("Registering SIGUSR1 handler...\n");
-    sighandler_t old_handler = signal(SIGUSR1, handle_sigusr1);
+    sighandler_t old_handler = Signal(SIGUSR1, HandleSigusr1);
     if (old_handler == SIG_ERR) {
-        printf("signal(SIGUSR1) failed\n");
+        printf("Signal(SIGUSR1) failed\n");
         return 1;
     }
     printf("Previous SIGUSR1 handler: %p\n", (void *)old_handler);
 
     printf("Registering SIGTERM handler for graceful exit...\n");
-    old_handler = signal(SIGTERM, handle_sigterm);
+    old_handler = Signal(SIGTERM, HandleSigterm);
     if (old_handler == SIG_ERR) {
-        printf("signal(SIGTERM) failed\n");
+        printf("Signal(SIGTERM) failed\n");
         return 1;
     }
     printf("Previous SIGTERM handler: %p\n", (void *)old_handler);
 
     printf("Ignoring SIGPIPE...\n");
-    old_handler = signal(SIGPIPE, SIG_IGN);
+    old_handler = Signal(SIGPIPE, SIG_IGN);
     if (old_handler == SIG_ERR) {
-        printf("signal(SIGPIPE) failed\n");
+        printf("Signal(SIGPIPE) failed\n");
         return 1;
     }
     printf("Previous SIGPIPE handler: %p\n", (void *)old_handler);
@@ -191,9 +204,9 @@ int main(void) {
     /* ---- Section 6: Process information ---- */
     printf("\n=== Section 6: Process Information ===\n");
 
-    int      pid       = get_pid();
-    int      pages     = get_free_pages();
-    uint64_t heap_base = get_heap_base();
+    int      pid       = GetPid();
+    int      pages     = GetFreePages();
+    uint64_t heap_base = GetHeapBase();
 
     printf("Current process:\n");
     printf("  PID: %d\n", pid);

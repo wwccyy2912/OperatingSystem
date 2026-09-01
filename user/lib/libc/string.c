@@ -3,6 +3,19 @@
  * Copyright (c) 2026 OpSys Project
  *
  * Pure utility functions — no syscalls, no allocation (except strdup).
+ 
+ *
+ * ------------------------------------------------------------------
+ * Structure (string):
+ *   mem and str families (length, copy, compare, search, tokenize).
+ * How it works:
+ *   Byte-wise loops (word-at-a-time only where alignment is proven);
+ *   all functions are NUL-termination aware per C semantics.
+ * Purpose:
+ *   Core string/memory primitives shared by every service.
+ * Caveats:
+ *   Bounds are the caller's responsibility (no _s variants wired in).
+ * ------------------------------------------------------------------
  */
 
 #include "string.h"

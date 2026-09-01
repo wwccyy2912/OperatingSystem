@@ -1,12 +1,25 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * proto.c - Minimal L3/L4 protocol stack (ARP + IPv4 + ICMP + UDP)
  * Copyright (c) 2026 OpSys Project
  *
  * The net service owns the NIC, so the whole stack lives here and runs
- * on the service thread: proto_rx() is fed from the driver's frame
- * queue; proto_ip_send() resolves the next hop via the ARP cache and
+ * on the service thread: ProtoRx() is fed from the driver's frame
+ * queue; ProtoIpSend() resolves the next hop via the ARP cache and
  * hands the finished frame to the driver.  UDP datagrams destined for
- * a bound local port are queued and drained with proto_udp_recv().
+ * a bound local port are queued and drained with ProtoUdpRecv().
  */
 
 #include "proto.h"
@@ -17,11 +30,11 @@
 
 /* The driver side (implemented in main.c): send a raw Ethernet frame
  * and the NIC MAC. */
-extern int  net_send_raw(const u8 *frame, u32 len);
-extern void net_get_mac(u8 mac[6]);
-extern void net_rx_pump_now(void);        /* NIC ring -> driver queue */
-extern int  net_rx_pump(u8 *out, u32 *out_len); /* pop a queued frame */
-extern void net_yield(void);              /* sleep one 10 ms tick */
+extern int  NetSendRaw(const u8 *frame, u32 len);
+extern void NetGetMac(u8 mac[6]);
+extern void NetRxPumpNow(void);        /* NIC ring -> driver queue */
+extern int  NetRxPump(u8 *out, u32 *out_len); /* pop a queued frame */
+extern void NetYield(void);              /* sleep one 10 ms tick */
 
 /* ---- address state ---- */
 static u8 s_ip[4];  /* local IPv4 */
@@ -40,7 +53,7 @@ typedef struct {
 static arp_entry_t s_arp[ARP_CACHE_MAX];
 
 /* fwd: TCP segment handler (defined below) */
-static void proto_tcp_rx_tcp(const u8 *f, u32 fl);
+static void ProtoTcpRxTcp(const u8 *f, u32 fl);
 
 /* ---- UDP ---- */
 #define UDP_SOCK_MAX  16
@@ -64,7 +77,7 @@ static u32       s_udp_rx_count;
 
 /* ---- helpers ---- */
 
-static u16 ip_checksum(const u8 *buf, u32 len) {
+static u16 IpChecksum(const u8 *buf, u32 len) {
     u32 sum = 0;
     u32 i   = 0;
     while (i + 1 < len) {
@@ -78,7 +91,7 @@ static u16 ip_checksum(const u8 *buf, u32 len) {
     return (u16)~sum;
 }
 
-static int ip_equal(const u8 a[4], const u8 b[4]) {
+static int IpEqual(const u8 a[4], const u8 b[4]) {
     return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
 }
 
@@ -86,12 +99,12 @@ static int ip_equal(const u8 a[4], const u8 b[4]) {
 
 static arp_entry_t *arp_lookup(const u8 ip[4]) {
     for (int i = 0; i < ARP_CACHE_MAX; i++)
-        if (s_arp[i].valid && s_arp[i].ttl > 0 && ip_equal(s_arp[i].ip, ip))
+        if (s_arp[i].valid && s_arp[i].ttl > 0 && IpEqual(s_arp[i].ip, ip))
             return &s_arp[i];
     return NULL;
 }
 
-static void arp_learn(const u8 ip[4], const u8 mac[6]) {
+static void ArpLearn(const u8 ip[4], const u8 mac[6]) {
     arp_entry_t *e = arp_lookup(ip);
     if (!e) {
         for (int i = 0; i < ARP_CACHE_MAX; i++) {
@@ -110,7 +123,7 @@ static void arp_learn(const u8 ip[4], const u8 mac[6]) {
 }
 
 /* Build + send an ARP request for target_ip. */
-static void arp_request(const u8 target_ip[4]) {
+static void ArpRequest(const u8 target_ip[4]) {
     u8 f[60];
     memset(f, 0xFF, 6);           /* dst broadcast */
     memcpy(f + 6, s_mac, 6);      /* src = us */
@@ -124,19 +137,19 @@ static void arp_request(const u8 target_ip[4]) {
     memcpy(f + 28, s_ip, 4);      /* sender IP */
     memset(f + 32, 0, 6);         /* target MAC 0 */
     memcpy(f + 38, target_ip, 4); /* target IP */
-    (void)net_send_raw(f, 60);
+    (void)NetSendRaw(f, 60);
 }
 
 /* Handle an ARP frame: learn the sender, reply to requests for us. */
-static void arp_handle(const u8 *f) {
+static void ArpHandle(const u8 *f) {
     /* f = start of the Ethernet payload (already past the 14B header). */
     u8 sender_ip[4], target_ip[4];
     memcpy(sender_ip, f + 14, 4);
     memcpy(target_ip, f + 24, 4);
-    arp_learn(sender_ip, f + 8);
+    ArpLearn(sender_ip, f + 8);
 
     u16 op = (u16)((f[6] << 8) | f[7]);
-    if (op == 1 && ip_equal(target_ip, s_ip)) {
+    if (op == 1 && IpEqual(target_ip, s_ip)) {
         /* ARP reply: tell the requester our MAC. */
         u8 r[60];
         memset(r, 0xFF, 6);
@@ -153,48 +166,48 @@ static void arp_handle(const u8 *f) {
         memcpy(r + 28, s_ip, 4);
         memcpy(r + 32, f + 8, 6); /* target MAC = requester */
         memcpy(r + 38, sender_ip, 4);
-        (void)net_send_raw(r, 60);
+        (void)NetSendRaw(r, 60);
     }
 }
 
 /* Resolve dst_ip to a MAC: cache hit, or send an ARP request and wait
  * for the reply (pumping the NIC + driver queue so the reply arrives
  * without client-side polling).  Returns 0 on success, -7 on timeout. */
-static int arp_resolve(const u8 dst_ip[4], u8 mac[6]) {
+static int ArpResolve(const u8 dst_ip[4], u8 mac[6]) {
 
     arp_entry_t *e = arp_lookup(dst_ip);
     if (e) {
         memcpy(mac, e->mac, 6);
         return 0;
     }
-    arp_request(dst_ip);
+    ArpRequest(dst_ip);
     for (int i = 0; i < 600; i++) { /* ~6 s */
-        net_rx_pump_now();
+        NetRxPumpNow();
         u8 f[1600];
         u32 fl;
-        while (net_rx_pump(f, &fl)) {
+        while (NetRxPump(f, &fl)) {
             if (fl >= 42 && f[12] == 0x08 && f[13] == 0x06) {
                 const u8 *a = f + 14;
                 u16 op = (u16)((a[6] << 8) | a[7]);
                 if (op == 2 && a[14] == dst_ip[0] && a[15] == dst_ip[1] &&
                     a[16] == dst_ip[2] && a[17] == dst_ip[3]) {
                     memcpy(mac, a + 8, 6);
-                    arp_learn(dst_ip, mac);
+                    ArpLearn(dst_ip, mac);
                     return 0;
                 }
             }
-            proto_rx(f, fl); /* everything else into the stack */
+            ProtoRx(f, fl); /* everything else into the stack */
         }
-        net_yield();
+        NetYield();
     }
     return -7; /* ERR_FAULT: no ARP reply */
 }
 
 /* ---- IP ---- */
 
-static int ip_send_raw(const u8 dst_ip[4], u8 proto, const u8 *payload, u32 len) {
+static int IpSendRaw(const u8 dst_ip[4], u8 proto, const u8 *payload, u32 len) {
     u8 mac[6];
-    int r = arp_resolve(dst_ip, mac);
+    int r = ArpResolve(dst_ip, mac);
     if (r != 0)
         return r;
 
@@ -222,17 +235,17 @@ static int ip_send_raw(const u8 dst_ip[4], u8 proto, const u8 *payload, u32 len)
     memcpy(ip + 16, dst_ip, 4);
     ip[10] = 0;
     ip[11] = 0;
-    u16 cs = ip_checksum(ip, IP_HDR_LEN);
+    u16 cs = IpChecksum(ip, IP_HDR_LEN);
     ip[10] = (u8)(cs >> 8);
     ip[11] = (u8)(cs & 0xFF);
     memcpy(ip + IP_HDR_LEN, payload, len);
-    return net_send_raw(f, 14 + total);
+    return NetSendRaw(f, 14 + total);
 }
 
 /* ---- ICMP ---- */
 
 /* Reply to an ICMP echo request (ping).  f = IP payload (ICMP header). */
-static void icmp_echo_reply(const u8 *src_ip, const u8 *icmp, u32 icmp_len) {
+static void IcmpEchoReply(const u8 *src_ip, const u8 *icmp, u32 icmp_len) {
     /* icmp[0]=type(8 req) icmp[1]=code icmp[2..3]=checksum
      * icmp[4..5]=id icmp[6..7]=seq + data */
     u8 payload[1500];
@@ -242,14 +255,14 @@ static void icmp_echo_reply(const u8 *src_ip, const u8 *icmp, u32 icmp_len) {
     payload[1] = 0;
     payload[2] = 0;
     payload[3] = 0;
-    u16 cs = ip_checksum(payload, plen);
+    u16 cs = IpChecksum(payload, plen);
     payload[2] = (u8)(cs >> 8);
     payload[3] = (u8)(cs & 0xFF);
-    (void)ip_send_raw(src_ip, IP_PROTO_ICMP, payload, plen);
+    (void)IpSendRaw(src_ip, IP_PROTO_ICMP, payload, plen);
 }
 
 /* fwd: TCP segment handler (defined below) */
-static void proto_tcp_rx_tcp(const u8 *f, u32 fl);
+static void ProtoTcpRxTcp(const u8 *f, u32 fl);
 
 /* ---- UDP ---- */
 
@@ -260,11 +273,11 @@ static udp_sock_t *udp_find(u16 port) {
     return NULL;
 }
 
-static int udp_port_bound(u16 port) {
+static int UdpPortBound(u16 port) {
     return udp_find(port) != NULL;
 }
 
-static void udp_queue(const u8 src[4], u16 sport, u16 dport, const u8 *data, u32 len) {
+static void UdpQueue(const u8 src[4], u16 sport, u16 dport, const u8 *data, u32 len) {
     if (s_udp_rx_count >= UDP_RXQ_MAX)
         return; /* drop on overflow */
     u32 slot = (s_udp_rx_head + s_udp_rx_count) % UDP_RXQ_MAX;
@@ -279,17 +292,17 @@ static void udp_queue(const u8 src[4], u16 sport, u16 dport, const u8 *data, u32
 
 /* ---- public API ---- */
 
-void proto_init(const u8 ip[4], const u8 gw[4]) {
+void ProtoInit(const u8 ip[4], const u8 gw[4]) {
     memcpy(s_ip, ip, 4);
     memcpy(s_gw, gw, 4);
-    net_get_mac(s_mac);
+    NetGetMac(s_mac);
     memset(s_arp, 0, sizeof(s_arp));
     memset(s_udp, 0, sizeof(s_udp));
     s_udp_rx_head = 0;
     s_udp_rx_count = 0;
 }
 
-void proto_rx(const u8 *frame, u32 len) {
+void ProtoRx(const u8 *frame, u32 len) {
     if (!frame || len < 14)
         return;
     u16 etype = (u16)((frame[12] << 8) | frame[13]);
@@ -307,7 +320,7 @@ void proto_rx(const u8 *frame, u32 len) {
 
     if (etype == ETH_TYPE_ARP) {
         if (plen >= 28)
-            arp_handle(p);
+            ArpHandle(p);
         return;
     }
     if (etype != ETH_TYPE_IPV4 || plen < IP_HDR_LEN)
@@ -320,7 +333,7 @@ void proto_rx(const u8 *frame, u32 len) {
     if (iplen > plen)
         return;
     /* verify the header checksum */
-    if (ip_checksum(ip, IP_HDR_LEN) != 0)
+    if (IpChecksum(ip, IP_HDR_LEN) != 0)
         return;
     u8 src[4];
     memcpy(src, ip + 12, 4);
@@ -330,27 +343,27 @@ void proto_rx(const u8 *frame, u32 len) {
 
     if (proto == IP_PROTO_ICMP && lplen >= 8) {
         if (pl[0] == 8) /* echo request */
-            icmp_echo_reply(src, pl, lplen);
+            IcmpEchoReply(src, pl, lplen);
         return;
     }
     if (proto == IP_PROTO_UDP && lplen >= UDP_HDR_LEN) {
         u16 sport = (u16)((pl[0] << 8) | pl[1]);
         u16 dport = (u16)((pl[2] << 8) | pl[3]);
-        if (udp_port_bound(dport))
-            udp_queue(src, sport, dport, pl + UDP_HDR_LEN, lplen - UDP_HDR_LEN);
+        if (UdpPortBound(dport))
+            UdpQueue(src, sport, dport, pl + UDP_HDR_LEN, lplen - UDP_HDR_LEN);
         return;
     }
     if (proto == IP_PROTO_TCP && lplen >= TCP_HDR_LEN)
-        proto_tcp_rx_tcp(frame, len);
+        ProtoTcpRxTcp(frame, len);
 }
 
-int proto_ip_send(const u8 dst_ip[4], u8 proto, const u8 *payload, u32 len) {
-    return ip_send_raw(dst_ip, proto, payload, len);
+int ProtoIpSend(const u8 dst_ip[4], u8 proto, const u8 *payload, u32 len) {
+    return IpSendRaw(dst_ip, proto, payload, len);
 }
 
 /* ICMP echo request + wait for the reply.  The driver queue is pumped
  * inside the wait loop so the reply arrives without client polling. */
-int proto_ping(const u8 dst_ip[4]) {
+int ProtoPing(const u8 dst_ip[4]) {
     /* Build the echo request. */
     static u16 s_ping_id = 0x1234;
     u8 icmp[8 + 32];
@@ -360,15 +373,15 @@ int proto_ping(const u8 dst_ip[4]) {
     icmp[6] = 0; icmp[7] = 1; /* seq */
     for (int i = 0; i < 32; i++)
         icmp[8 + i] = (u8)i;
-    u16 cs = ip_checksum(icmp, sizeof(icmp));
+    u16 cs = IpChecksum(icmp, sizeof(icmp));
     icmp[2] = (u8)(cs >> 8);
     icmp[3] = (u8)(cs & 0xFF);
-    int r = ip_send_raw(dst_ip, IP_PROTO_ICMP, icmp, sizeof(icmp));
+    int r = IpSendRaw(dst_ip, IP_PROTO_ICMP, icmp, sizeof(icmp));
     if (r != 0) {
         return r;
     }
     s_ping_id++;
-    /* Wait for the echo reply: pump the driver queue via net_rx_pump().
+    /* Wait for the echo reply: pump the driver queue via NetRxPump().
      * The reply path (icmp_echo_reply in the peer) arrives as an ICMP
      * type-0 packet — proto_rx drops it silently (no local echo match
      * tracking needed: reaching the peer proves reachability via the
@@ -377,9 +390,9 @@ int proto_ping(const u8 dst_ip[4]) {
     for (int i = 0; i < 600; i++) { /* ~6 s */
         u8 frame[1600];
         u32 flen;
-        net_rx_pump_now(); /* NIC ring -> driver queue (missed: the
+        NetRxPumpNow(); /* NIC ring -> driver queue (missed: the
                             * reply sits in the RMD ring otherwise) */
-        if (net_rx_pump(frame, &flen)) {
+        if (NetRxPump(frame, &flen)) {
             if (flen >= 14 + IP_HDR_LEN + 8) {
                 const u8 *ip = frame + 14;
                 if ((ip[0] >> 4) == 4 && ip[9] == IP_PROTO_ICMP) {
@@ -388,15 +401,15 @@ int proto_ping(const u8 dst_ip[4]) {
                         return 0;
                 }
             }
-            proto_rx(frame, flen);
+            ProtoRx(frame, flen);
         }
-        net_yield();
+        NetYield();
     }
     return -7; /* ERR_FAULT: timeout */
 }
 
-int proto_udp_bind(u16 port) {
-    if (port < 16 || udp_port_bound(port))
+int ProtoUdpBind(u16 port) {
+    if (port < 16 || UdpPortBound(port))
         return -2; /* ERR_INVAL / already bound */
     for (int i = 0; i < UDP_SOCK_MAX; i++) {
         if (!s_udp[i].in_use) {
@@ -408,7 +421,7 @@ int proto_udp_bind(u16 port) {
     return -1; /* ERR_NOMEM */
 }
 
-int proto_udp_unbind(u16 port) {
+int ProtoUdpUnbind(u16 port) {
     udp_sock_t *s = udp_find(port);
     if (!s)
         return -4; /* ERR_NOENT */
@@ -416,7 +429,7 @@ int proto_udp_unbind(u16 port) {
     return 0;
 }
 
-int proto_udp_sendto(const u8 dst_ip[4], u16 sport, u16 dport,
+int ProtoUdpSendto(const u8 dst_ip[4], u16 sport, u16 dport,
                      const u8 *data, u32 len) {
     u8 udp[UDP_HDR_LEN + 1500];
     u32 total = UDP_HDR_LEN + len;
@@ -430,10 +443,10 @@ int proto_udp_sendto(const u8 dst_ip[4], u16 sport, u16 dport,
     udp[5] = (u8)(total & 0xFF);
     udp[6] = 0; udp[7] = 0; /* checksum 0 (RFC 768: allowed) */
     memcpy(udp + UDP_HDR_LEN, data, len);
-    return ip_send_raw(dst_ip, IP_PROTO_UDP, udp, total);
+    return IpSendRaw(dst_ip, IP_PROTO_UDP, udp, total);
 }
 
-int proto_udp_recv(u8 src[4], u16 *sport, u16 *dport, u8 *data, u32 max) {
+int ProtoUdpRecv(u8 src[4], u16 *sport, u16 *dport, u8 *data, u32 max) {
     if (s_udp_rx_count == 0)
         return -6; /* ERR_AGAIN */
     udp_pkt_t *p = &s_udp_rxq[s_udp_rx_head];
@@ -486,7 +499,7 @@ static u32     s_tcp_rx_head;
 static u32     s_tcp_rx_count;
 
 /* TCP pseudo-header checksum (RFC 793). */
-static u16 tcp_checksum(const u8 *src_ip, const u8 *dst_ip,
+static u16 TcpChecksum(const u8 *src_ip, const u8 *dst_ip,
                         const u8 *seg, u32 seg_len) {
     u8 pseudo[12];
     memcpy(pseudo, src_ip, 4);
@@ -510,7 +523,7 @@ static u16 tcp_checksum(const u8 *src_ip, const u8 *dst_ip,
 }
 
 /* Build + send a raw TCP segment. */
-static int tcp_send_seg(u8 flags, u32 seq, u32 ack, const u8 *data, u32 len) {
+static int TcpSendSeg(u8 flags, u32 seq, u32 ack, const u8 *data, u32 len) {
     u8 seg[TCP_HDR_LEN + 1500];
     memset(seg, 0, TCP_HDR_LEN);
     seg[0] = (u8)(s_tcp_lport >> 8);
@@ -536,13 +549,13 @@ static int tcp_send_seg(u8 flags, u32 seq, u32 ack, const u8 *data, u32 len) {
     if (data && len)
         memcpy(seg + TCP_HDR_LEN, data, len);
     u32 total = TCP_HDR_LEN + len;
-    u16 cs = tcp_checksum(s_ip, s_tcp_peer, seg, total);
+    u16 cs = TcpChecksum(s_ip, s_tcp_peer, seg, total);
     seg[16] = (u8)(cs >> 8);
     seg[17] = (u8)(cs & 0xFF);
-    return ip_send_raw(s_tcp_peer, IP_PROTO_TCP, seg, total);
+    return IpSendRaw(s_tcp_peer, IP_PROTO_TCP, seg, total);
 }
 
-int proto_tcp_listen(u16 port) {
+int ProtoTcpListen(u16 port) {
     if (port < 16)
         return -2;
     s_tcp_state = TCP_STATE_LISTEN;
@@ -552,7 +565,7 @@ int proto_tcp_listen(u16 port) {
     return 0;
 }
 
-int proto_tcp_close(void) {
+int ProtoTcpClose(void) {
     s_tcp_state = TCP_STATE_CLOSED;
     s_tcp_rx_head = 0;
     s_tcp_rx_count = 0;
@@ -560,15 +573,15 @@ int proto_tcp_close(void) {
 }
 
 /* Block until a connection is established (or ~6 s timeout). */
-int proto_tcp_accept(u8 peer[4], u16 *peer_port) {
+int ProtoTcpAccept(u8 peer[4], u16 *peer_port) {
     if (s_tcp_state != TCP_STATE_LISTEN)
         return -2;
-    extern void net_yield(void);
+    extern void NetYield(void);
     for (int i = 0; i < 6000; i++) { /* ~60 s accept window */
-        net_rx_pump_now();
+        NetRxPumpNow();
         u8 f[1600];
         u32 fl;
-        while (net_rx_pump(f, &fl)) {
+        while (NetRxPump(f, &fl)) {
             if (fl >= 14 + IP_HDR_LEN + TCP_HDR_LEN && f[12] == 0x08 && f[13] == 0x00) {
                 const u8 *ip = f + 14;
                 if (ip[9] == IP_PROTO_TCP) {
@@ -582,34 +595,34 @@ int proto_tcp_accept(u8 peer[4], u16 *peer_port) {
                         memcpy(s_tcp_peer, ip + 12, 4);
                         s_tcp_peer_port = (u16)((t[0] << 8) | t[1]);
                         s_tcp_rcv_nxt = seq + 1;
-                        s_tcp_iss = (u32)get_time();
+                        s_tcp_iss = (u32)GetTime();
                         if (s_tcp_iss == 0)
                             s_tcp_iss = 0x1234;
                         s_tcp_snd_nxt = s_tcp_iss + 1;
                         s_tcp_state = TCP_STATE_SYN_SENT; /* awaiting ACK */
-                        (void)tcp_send_seg(TCP_SYN | TCP_ACK, s_tcp_iss,
+                        (void)TcpSendSeg(TCP_SYN | TCP_ACK, s_tcp_iss,
                                            s_tcp_rcv_nxt, NULL, 0);
                         /* fall through: the ACK arrives next pump */
-                        proto_tcp_rx_tcp(f, fl);
+                        ProtoTcpRxTcp(f, fl);
                     }
                 }
             }
-            proto_rx(f, fl);
+            ProtoRx(f, fl);
         }
         if (s_tcp_state == TCP_STATE_ESTAB || s_tcp_state == TCP_STATE_CLOSE_WAIT) {
             memcpy(peer, s_tcp_peer, 4);
             *peer_port = s_tcp_peer_port;
             return 0;
         }
-        net_yield();
+        NetYield();
     }
     s_tcp_state = TCP_STATE_LISTEN;
     return -7; /* timeout */
 }
 /* Handle an incoming TCP segment (called from proto_rx). */
-static void proto_tcp_rx_tcp(const u8 *f, u32 fl); /* fwd */
+static void ProtoTcpRxTcp(const u8 *f, u32 fl); /* fwd */
 
-static void proto_tcp_rx_tcp(const u8 *f, u32 fl) {
+static void ProtoTcpRxTcp(const u8 *f, u32 fl) {
     const u8 *ip = f + 14;
     const u8 *t  = ip + IP_HDR_LEN;
     u16 sport = (u16)((t[0] << 8) | t[1]);
@@ -634,7 +647,7 @@ static void proto_tcp_rx_tcp(const u8 *f, u32 fl) {
             s_tcp_rcv_nxt = seq + 1;
             s_tcp_snd_nxt = ack;
             s_tcp_state = TCP_STATE_ESTAB;
-            (void)tcp_send_seg(TCP_ACK, s_tcp_snd_nxt, s_tcp_rcv_nxt, NULL, 0);
+            (void)TcpSendSeg(TCP_ACK, s_tcp_snd_nxt, s_tcp_rcv_nxt, NULL, 0);
         }
         return;
     }
@@ -651,24 +664,24 @@ static void proto_tcp_rx_tcp(const u8 *f, u32 fl) {
                 memcpy(s_tcp_rxq[slot].data, t + hlen, s_tcp_rxq[slot].len);
                 s_tcp_rx_count++;
                 s_tcp_rcv_nxt = seq + dlen;
-                (void)tcp_send_seg(TCP_ACK, s_tcp_snd_nxt, s_tcp_rcv_nxt, NULL, 0);
+                (void)TcpSendSeg(TCP_ACK, s_tcp_snd_nxt, s_tcp_rcv_nxt, NULL, 0);
             }
         }
         if (flags & TCP_FIN) {
             s_tcp_rcv_nxt = seq + 1;
             s_tcp_state = TCP_STATE_CLOSE_WAIT;
-            (void)tcp_send_seg(TCP_ACK, s_tcp_snd_nxt, s_tcp_rcv_nxt, NULL, 0);
+            (void)TcpSendSeg(TCP_ACK, s_tcp_snd_nxt, s_tcp_rcv_nxt, NULL, 0);
         }
         return;
     }
 }
 
-int proto_tcp_send(const u8 *data, u32 len) {
+int ProtoTcpSend(const u8 *data, u32 len) {
     if (s_tcp_state != TCP_STATE_ESTAB && s_tcp_state != TCP_STATE_CLOSE_WAIT)
         return -2;
     if (len > 1400)
         len = 1400;
-    int r = tcp_send_seg(TCP_ACK | TCP_PSH, s_tcp_snd_nxt, s_tcp_rcv_nxt,
+    int r = TcpSendSeg(TCP_ACK | TCP_PSH, s_tcp_snd_nxt, s_tcp_rcv_nxt,
                          data, len);
     if (r == 0)
         s_tcp_snd_nxt += len;
@@ -676,23 +689,23 @@ int proto_tcp_send(const u8 *data, u32 len) {
 }
 
 /* Block for one received segment (~6 s). */
-int proto_tcp_recv(u8 *data, u32 max, u16 *peer_port) {
-    extern void net_yield(void);
+int ProtoTcpRecv(u8 *data, u32 max, u16 *peer_port) {
+    extern void NetYield(void);
     for (int i = 0; i < 600; i++) {
-        net_rx_pump_now();
+        NetRxPumpNow();
         u8 f[1600];
         u32 fl;
-        while (net_rx_pump(f, &fl)) {
+        while (NetRxPump(f, &fl)) {
             if (fl >= 14 + IP_HDR_LEN + TCP_HDR_LEN && f[12] == 0x08 && f[13] == 0x00) {
                 const u8 *ip = f + 14;
                 if (ip[9] == IP_PROTO_TCP) {
                     const u8 *t = ip + IP_HDR_LEN;
                     u16 dport = (u16)((t[2] << 8) | t[3]);
                     if (dport == s_tcp_lport)
-                        proto_tcp_rx_tcp(f, fl);
+                        ProtoTcpRxTcp(f, fl);
                 }
             }
-            proto_rx(f, fl);
+            ProtoRx(f, fl);
         }
         if (s_tcp_rx_count > 0) {
             tcp_pkt_t *p = &s_tcp_rxq[s_tcp_rx_head];
@@ -710,7 +723,7 @@ int proto_tcp_recv(u8 *data, u32 max, u16 *peer_port) {
             /* Peer closed and drained: report EOF. */
             return 0;
         }
-        net_yield();
+        NetYield();
     }
     return -7;
 }

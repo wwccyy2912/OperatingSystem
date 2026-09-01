@@ -1,10 +1,23 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * crashpeer.c - IPC peer-death test service (independent process)
  * Copyright (c) 2026 OpSys Project
  *
  * Exists ONLY to prove kernel crash recovery: it owns a port, receives
  * ONE synchronous call, then exits WITHOUT replying — a simulated
- * crash mid-call.  The init regression suite blocks in ipc_call() on
+ * crash mid-call.  The init regression suite blocks in IpcCall() on
  * this port and asserts it wakes with ERR_NOENT (process_reap →
  * ipc_cleanup_process destroys the port, waking the caller) instead of
  * hanging forever.
@@ -17,11 +30,11 @@
 #define CRASHPEER_PORT_NAME "crashpeer"
 
 int main(void) {
-    int port = ipc_port_create();
+    int port = IpcPortCreate();
     if (port < 0)
         return 1;
 
-    int ret = port_register(CRASHPEER_PORT_NAME, port);
+    int ret = PortRegister(CRASHPEER_PORT_NAME, port);
     if (ret < 0)
         return 1;
 
@@ -30,7 +43,7 @@ int main(void) {
     char buf[64];
     int  len = (int)sizeof(buf);
     int  tok = 0;
-    ret      = ipc_recv(port, buf, &len, &tok);
+    ret      = IpcRecv(port, buf, &len, &tok);
     if (ret < 0)
         return 1;
 

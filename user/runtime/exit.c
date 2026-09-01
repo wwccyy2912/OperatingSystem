@@ -1,5 +1,18 @@
 /*
- * exit.c - Process termination, atexit, and global destructors
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
+ * exit.c - Process termination, Atexit, and global destructors
  * Copyright (c) 2026 OpSys Project
  *
  * exit() calls atexit handlers in reverse order, then runs global
@@ -22,7 +35,7 @@
 static atexit_func_t s_atexit[ATEXIT_MAX];
 static int           s_atexit_count = 0;
 
-int atexit(atexit_func_t func) {
+int Atexit(atexit_func_t func) {
     if (s_atexit_count >= ATEXIT_MAX)
         return -1;
     s_atexit[s_atexit_count++] = func;
@@ -44,6 +57,6 @@ void exit(int code) {
 
 void _exit(int code) {
     (void)code;
-    thread_exit(code);
+    ThreadExit(code);
     __builtin_unreachable();
 }

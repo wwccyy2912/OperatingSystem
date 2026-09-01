@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * libtui.h - TUI (Text User Interface) client library
  * Copyright (c) 2026 OpSys Project
  *
@@ -20,7 +33,7 @@
 
 #include <stdint.h>
 
-/* Terminal service port name (registered by term.c at startup) */
+/* Terminal service port name(registered by term.c at startup) */
 #define TUI_PORT_NAME "term"
 
 /* TUI operation codes (must match term.c TERM_OP_*) */
@@ -51,12 +64,12 @@
  * Supports \n (newline), \r (carriage return), \b (backspace), \t (tab).
  * Returns bytes written on success, or negative error.
  */
-int tui_write(const char *text, uint32_t len);
+int TuiWrite(const char *text, uint32_t len);
 
 /**
  * Write a NUL-terminated string.
  */
-int tui_write_str(const char *str);
+int TuiWriteStr(const char *str);
 
 /* ====================================================================
  * Screen control
@@ -66,14 +79,14 @@ int tui_write_str(const char *str);
  * Clear the entire screen and reset cursor to (0, 0).
  * Returns 0 on success, negative error on failure.
  */
-int tui_clear(void);
+int TuiClear(void);
 
 /**
  * Render a status bar at the bottom of the screen.
  * Format: "prefix: msg"
  * Returns 0 on success, negative error on failure.
  */
-int tui_render_status(const char *prefix, const char *msg);
+int TuiRenderStatus(const char *prefix, const char *msg);
 
 /* ====================================================================
  * Box/border drawing
@@ -85,7 +98,7 @@ int tui_render_status(const char *prefix, const char *msg);
  * title may be NULL for no title bar.
  * Returns 0 on success, negative error on failure.
  */
-int tui_render_box(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const char *title);
+int TuiRenderBox(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const char *title);
 
 /* ====================================================================
  * Text rendering without cursor change
@@ -96,7 +109,7 @@ int tui_render_box(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const char *t
  * Useful for status lines, dialog boxes, overlays.
  * Returns 0 on success, negative error on failure.
  */
-int tui_render_line_at(uint32_t x, uint32_t y, const char *text, uint32_t len);
+int TuiRenderLineAt(uint32_t x, uint32_t y, const char *text, uint32_t len);
 
 /* ====================================================================
  * Cursor control
@@ -104,22 +117,22 @@ int tui_render_line_at(uint32_t x, uint32_t y, const char *text, uint32_t len);
 
 /**
  * Set the cursor position to (x, y) in cell coordinates.
- * Next tui_write() will render at this position.
+ * Next TuiWrite() will render at this position.
  * Returns 0 on success, negative error on failure.
  */
-int tui_set_cursor(uint32_t x, uint32_t y);
+int TuiSetCursor(uint32_t x, uint32_t y);
 
 /**
  * Query the current cursor position.
  * Returns 0 on success and fills x/y, or negative error.
  */
-int tui_get_cursor(uint32_t *x, uint32_t *y);
+int TuiGetCursor(uint32_t *x, uint32_t *y);
 
 /**
  * Query the terminal size in cells.  Returns 0 on success and fills
  * cols/rows (either may be NULL), or a negative error.
  */
-int tui_get_size(uint32_t *cols, uint32_t *rows);
+int TuiGetSize(uint32_t *cols, uint32_t *rows);
 
 /* ====================================================================
  * Utility functions
@@ -131,14 +144,14 @@ int tui_get_size(uint32_t *cols, uint32_t *rows);
  * to verify the terminal is available before rendering.
  * Returns the port number on success, negative error if unavailable.
  */
-int tui_port_get(void);
+int TuiPortGet(void);
 
 /**
  * Print formatted string to the terminal (like printf, but to term).
  * Supports %d, %x, %s, %c, %% — enough for most TUI use cases.
  * Returns 0 on success, negative error on failure.
  */
-int tui_printf(const char *fmt, ...);
+int TuiPrintf(const char *fmt, ...);
 
 /* ====================================================================
  * Region snapshot/restore (v1.2): save a rectangular block of screen
@@ -154,13 +167,13 @@ int tui_printf(const char *fmt, ...);
  * hold at least w*h uint16_t values; w*h must not exceed
  * TUI_MAX_REGION_CELLS).  Returns 0 on success, negative error.
  */
-int tui_region_save(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint16_t *cells);
+int TuiRegionSave(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint16_t *cells);
 
 /**
  * Redraw the w*h cells previously saved by tui_region_save at (x,y).
  * Returns 0 on success, negative error on failure.
  */
-int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint16_t *cells);
+int TuiRegionRestore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint16_t *cells);
 
 /* ====================================================================
  * Interactive components (v1.1): input line, password line, confirm box.
@@ -173,19 +186,19 @@ int tui_region_restore(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uin
  * keyboard.  When mask != 0 every typed character is echoed as '*'
  * (password entry).  Returns the number of characters read (>=0), or
  * a negative error.  buf receives the NUL-terminated line. */
-int tui_input_line(int x, int y, const char *prompt, char *buf, int maxlen, int mask);
+int TuiInputLine(int x, int y, const char *prompt, char *buf, int maxlen, int mask);
 
 /* Render a titled confirmation dialog centered around (x,y) with a
  * message and a hint line, then read y/n.  Returns 1 (yes), 0 (no),
  * or a negative error. */
-int tui_confirm(int x, int y, int w, const char *title, const char *msg,
+int TuiConfirm(int x, int y, int w, const char *title, const char *msg,
                 const char *hint);
 
 /* Render a titled, boxed, scrollable item list with keyboard selection
  * (j/k/s/w move, Enter select, q cancel).  Non-destructive overlay.
  * Returns the selected 0-based index on Enter, -1 on cancel/error.
  * items[] must stay valid for the call; count > 0. */
-int tui_menu(int x, int y, int w, int h, const char *title,
+int TuiMenu(int x, int y, int w, int h, const char *title,
              const char *const *items, int count, int *scroll_out);
 
 #endif /* LIBTUI_TUI_H */

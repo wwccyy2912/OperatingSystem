@@ -17,6 +17,21 @@
  *   - mtx_timedlock/cnd_timedwait interpret `ts` as a RELATIVE
  *     duration; C11 specifies an absolute TIME_UTC point, but the
  *     kernel exposes no epoch mapping yet.
+ 
+ *
+ * ------------------------------------------------------------------
+ * Structure (threads):
+ *   thrd_create/join/exit + mtx/cnd/tss/once -> kernel syscall
+ *   wrappers (ThreadCreate/ThreadExit/MutexLock/...) — thin C11 shims.
+ * How it works:
+ *   Each C11 call packs arguments and issues the matching syscall;
+ *   mutexes/conditions map onto the kernel's blocking primitives.
+ * Purpose:
+ *   C11 threads.h concurrency API on top of the microkernel.
+ * Caveats:
+ *   thrd_sleep uses the kernel tick clock; cnd_timedwait needs a
+ *   deadline in ticks.
+ * ------------------------------------------------------------------
  */
 
 #include "threads.h"
@@ -46,17 +61,17 @@ struct thrd_state {
  * this trampoline bridges the signature mismatch and records the
  * result before the thread exits.
  */
-static void thrd_entry_wrapper(void *p) {
+static void ThrdEntryWrapper(void *p) {
     struct thrd_state *st  = (struct thrd_state *)p;
     int                res = st->func(st->arg);
     st->result             = res;
     atomic_store(&st->done, 1);
-    thread_exit(res);
+    ThreadExit(res);
 }
 
 /* Convert a (relative) timespec to kernel ticks.  The tick rate is
  * 1 kHz (CLOCKS_PER_SEC == 1000), so 1 tick == 1 ms. */
-static int timespec_to_ticks(const struct timespec *ts) {
+static int TimespecToTicks(const struct timespec *ts) {
     return (int)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
 }
 
@@ -73,7 +88,7 @@ int thrd_create(thrd_t *thr, thrd_start_t func, void *arg) {
     st->func   = func;
     st->arg    = arg;
 
-    int tid = thread_create(thrd_entry_wrapper, st, 0);
+    int tid = ThreadCreate(ThrdEntryWrapper, st, 0);
     if (tid < 0) {
         free(st);
         return (tid == ERR_NOMEM) ? thrd_nomem : thrd_error;
@@ -98,10 +113,10 @@ int thrd_sleep(const struct timespec *duration, struct timespec *remaining) {
     if (!duration)
         return -2;
 
-    int ticks = timespec_to_ticks(duration);
-    int start = get_time();
-    while (get_time() - start < ticks)
-        thread_yield();
+    int ticks = TimespecToTicks(duration);
+    int start = GetTime();
+    while (GetTime() - start < ticks)
+        ThreadYield();
 
     if (remaining) {
         remaining->tv_sec  = 0;
@@ -111,13 +126,13 @@ int thrd_sleep(const struct timespec *duration, struct timespec *remaining) {
 }
 
 void thrd_yield(void) {
-    thread_yield();
+    ThreadYield();
 }
 
 _Noreturn void thrd_exit(int res) {
-    /* thread_exit() enters the kernel and never returns; the header
+    /* ThreadExit() enters the kernel and never returns; the header
      * declares it plain void, so tell the optimizer the same. */
-    thread_exit(res);
+    ThreadExit(res);
     __builtin_unreachable();
 }
 
@@ -137,7 +152,7 @@ int thrd_join(thrd_t thr, int *res) {
      * the writes), so it is safe to read and reclaim the state. */
     if (thr.st) {
         while (!atomic_load(&thr.st->done))
-            thread_yield();
+            ThreadYield();
         if (res)
             *res = thr.st->result;
         free(thr.st);
@@ -167,7 +182,7 @@ int mtx_lock(mtx_t *mtx) {
     }
 
     while (atomic_exchange(&mtx->flag, 1) == 1)
-        thread_yield();
+        ThreadYield();
     mtx->owner     = self;
     mtx->recursion = 1;
     return thrd_success;
@@ -204,14 +219,14 @@ int mtx_timedlock(mtx_t *mtx, const struct timespec *ts) {
     if (!ts)
         return thrd_error;
 
-    int ticks = timespec_to_ticks(ts);
-    int start = get_time();
+    int ticks = TimespecToTicks(ts);
+    int start = GetTime();
     for (;;) {
         if (mtx_trylock(mtx) == thrd_success)
             return thrd_success;
-        if (get_time() - start >= ticks)
+        if (GetTime() - start >= ticks)
             return thrd_timedout;
-        thread_yield();
+        ThreadYield();
     }
 }
 
@@ -251,7 +266,7 @@ int cnd_wait(cnd_t *cnd, mtx_t *mtx) {
     int gen = atomic_load(&cnd->generation);
     mtx_unlock(mtx);
     while (atomic_load(&cnd->generation) == gen)
-        thread_yield();
+        ThreadYield();
     atomic_fetch_sub(&cnd->waiters, 1);
     return mtx_lock(mtx);
 }
@@ -260,19 +275,19 @@ int cnd_timedwait(cnd_t *cnd, mtx_t *mtx, const struct timespec *ts) {
     if (!ts)
         return thrd_error;
 
-    int ticks = timespec_to_ticks(ts);
-    int start = get_time();
+    int ticks = TimespecToTicks(ts);
+    int start = GetTime();
     int rc    = thrd_success;
 
     atomic_fetch_add(&cnd->waiters, 1);
     int gen = atomic_load(&cnd->generation);
     mtx_unlock(mtx);
     while (atomic_load(&cnd->generation) == gen) {
-        if (get_time() - start >= ticks) {
+        if (GetTime() - start >= ticks) {
             rc = thrd_timedout;
             break;
         }
-        thread_yield();
+        ThreadYield();
     }
     atomic_fetch_sub(&cnd->waiters, 1);
     mtx_lock(mtx);
@@ -298,7 +313,7 @@ void call_once(once_flag *flag, void (*func)(void)) {
     /* Losers (state 1 or 2) wait until init completes.  If state is
      * already 2 the loop body never runs. */
     while (atomic_load(&flag->state) != 2)
-        thread_yield();
+        ThreadYield();
 }
 
 /* ====================================================================

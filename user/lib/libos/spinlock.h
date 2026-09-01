@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * spinlock.h - User-space spinlock (kernel mutex fast-path)
  * Copyright (c) 2026 OpSys Project
  *
@@ -22,24 +35,24 @@
 #ifndef LIBOS_SPINLOCK_H
 #define LIBOS_SPINLOCK_H
 
-#include <libos/syscalls.h> /* thread_yield() */
+#include <libos/syscalls.h> /* ThreadYield() */
 
 typedef volatile int user_spinlock_t;
 
 /* Try to acquire the lock.  Returns 1 on success, 0 if already held. */
-static inline int spin_trylock(user_spinlock_t *l) {
+static inline int SpinTrylock(user_spinlock_t *l) {
     return __atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE) == 0;
 }
 
 /* Acquire the lock.  Uncontended: one atomic exchange, zero syscalls.
  * Contended: yield to the scheduler so the holder can make progress. */
-static inline void spin_lock(user_spinlock_t *l) {
-    while (!spin_trylock(l))
-        thread_yield();
+static inline void SpinLock(user_spinlock_t *l) {
+    while (!SpinTrylock(l))
+        ThreadYield();
 }
 
 /* Release the lock. */
-static inline void spin_unlock(user_spinlock_t *l) {
+static inline void SpinUnlock(user_spinlock_t *l) {
     __atomic_store_n(l, 0, __ATOMIC_RELEASE);
 }
 

@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * term.c - Userspace framebuffer terminal service
  * Copyright (c) 2026 OpSys Project
  *
@@ -10,13 +23,13 @@
  *
  *   manager process (spawned by init via SYS_PROCESS_CREATE)
  *     └─ SYS_PROCESS_CREATE("term")                  term process
- *          └─ main() = term_service_main()           server thread
- *               ├─ fb_get_info(&info)                framebuffer geometry
+ *          └─ main() = TermServiceMain()           server thread
+ *               ├─ FbGetInfo(&info)                framebuffer geometry
  *               ├─ fb_map(fb, size)                  map fb into THIS
  *               │                                   address space
- *               ├─ ipc_port_create() + port_register("term")
- *               └─ loop: ipc_recv(port, req, &len) -> WRITE (render text) /
- *                             CLEAR (blank screen) -> ipc_reply(port, resp)
+ *               ├─ IpcPortCreate() + PortRegister("term")
+ *               └─ loop: IpcRecv(port, req, &len) -> WRITE (render text) /
+ *                             CLEAR (blank screen) -> IpcReply(port, resp)
  *
  * The terminal keeps a full-screen character buffer (s_cells) so the
  * cursor can be erased/redrawn and lines can scroll without needing to
@@ -50,6 +63,31 @@
  * while term waits for the user.
  * All rendering serializes on s_render_lock so the cursor state
  * machine never races.
+ *
+ * ------------------------------------------------------------------
+ * Structure (IPC server, three threads):
+ *   main() → TermServiceMain()            server thread
+ *     ├─ FbGetInfo() + fb_map()           map fb into THIS address space
+ *     ├─ IpcPortCreate() + PortRegister("term")
+ *     └─ loop: IpcRecv -> WRITE/CLEAR -> TermWrite() -> IpcReply
+ *   perm_ui_main         serves "perm.ui" (Powerbox TUI panel)
+ *   perm_ui_input_main   keyboard focus while a query is PENDING
+ *   (all rendering serialized on s_render_lock)
+ * How it works:
+ *   TermServiceMain maps the framebuffer, registers the "term" port
+ *   and loops on IpcRecv; TermWrite decodes UTF-8 and renders into the
+ *   s_cells buffer via the VGA-text or RGB-pixel path with no kernel
+ *   involvement in drawing; the two perm.ui threads serve the Powerbox
+ *   panel so the manager's synchronous push is always acknowledged.
+ * Purpose:
+ *   Ring-3 console renderer: turns client text into framebuffer pixels
+ *   and hosts the permission UI — the only user-space display path.
+ * Caveats:
+ *   Rendering happens in ring 3; the kernel driver owns the mode
+ *   choice (VGA text vs linear RGB); IPC uses flat raw-copy structs,
+ *   native little-endian; the cursor state machine must hold
+ *   s_render_lock.
+ * ------------------------------------------------------------------
  */
 
 #include "../lib/libc/stdio.h"
@@ -234,7 +272,7 @@ static volatile u32 s_clear_gen; /* bumped by every term_clear; invalidates perm
  * Color helpers (mirror of kernel rgb_to_vga_attr)
  * ==================================================================== */
 
-static u8 term_rgb_to_vga_attr(u32 rgb, int bg) {
+static u8 TermRgbToVgaAttr(u32 rgb, int bg) {
     u8 r = (u8)(rgb >> 16);
     u8 g = (u8)(rgb >> 8);
     u8 b = (u8)(rgb);
@@ -265,7 +303,7 @@ static u8 term_rgb_to_vga_attr(u32 rgb, int bg) {
  * Pixel / rectangle drawing (linear RGB mode)
  * ==================================================================== */
 
-static void term_pixel(u32 x, u32 y, u32 c) {
+static void TermPixel(u32 x, u32 y, u32 c) {
     if (x >= s_fb_width || y >= s_fb_height)
         return;
 
@@ -280,7 +318,7 @@ static void term_pixel(u32 x, u32 y, u32 c) {
     }
 }
 
-static void term_fill_rect(u32 x, u32 y, u32 w, u32 h, u32 c) {
+static void TermFillRect(u32 x, u32 y, u32 w, u32 h, u32 c) {
     if (x >= s_fb_width || y >= s_fb_height)
         return;
     if (x + w > s_fb_width)
@@ -315,12 +353,12 @@ static void term_fill_rect(u32 x, u32 y, u32 w, u32 h, u32 c) {
  * ==================================================================== */
 
 /* Convert RGB to the VGA attribute byte: (bg << 4) | fg. */
-static u8 term_cell_attr(u32 fg, u32 bg) {
-    return (u8)((term_rgb_to_vga_attr(bg, 1) << 4) | term_rgb_to_vga_attr(fg, 0));
+static u8 TermCellAttr(u32 fg, u32 bg) {
+    return (u8)((TermRgbToVgaAttr(bg, 1) << 4) | TermRgbToVgaAttr(fg, 0));
 }
 
 /* ANSI colour index -> RGB (clamped to the 16-entry palette). */
-static u32 term_ansi_rgb(u8 idx) {
+static u32 TermAnsiRgb(u8 idx) {
     return s_ansi_palette[idx & 15];
 }
 
@@ -328,10 +366,10 @@ static u32 term_ansi_rgb(u8 idx) {
  * Stamp one glyph into the pixel buffer at cell (cx, cy) using the
  * 8x16 ASCII font (1 cell wide).
  */
-static void term_stamp_ascii(u32 cx, u32 cy, u32 ch, u32 fg, u32 bg) {
+static void TermStampAscii(u32 cx, u32 cy, u32 ch, u32 fg, u32 bg) {
     u32 px = cx * 9;
     u32 py = cy * 20;
-    term_fill_rect(px, py, 9, 20, bg);
+    TermFillRect(px, py, 9, 20, bg);
     if (ch < 0x20 || ch > 0x7E)
         return; /* no glyph for control chars */
 
@@ -340,7 +378,7 @@ static void term_stamp_ascii(u32 cx, u32 cy, u32 ch, u32 fg, u32 bg) {
         u8 bits = glyph[row];
         for (int col = 0; col < 8; col++) {
             if (bits & (0x80 >> col))
-                term_pixel(px + col, py + row, fg);
+                TermPixel(px + col, py + row, fg);
         }
     }
 }
@@ -350,20 +388,20 @@ static void term_stamp_ascii(u32 cx, u32 cy, u32 ch, u32 fg, u32 bg) {
  * glyph bitmap is 16x16; the two cells cover 18px, the glyph is
  * centred at x = cx*9 + (18-16)/2 = cx*9+1.
  */
-static void term_stamp_cjk(u32 cx, u32 cy, const u8 *glyph, u32 fg, u32 bg) {
+static void TermStampCjk(u32 cx, u32 cy, const u8 *glyph, u32 fg, u32 bg) {
     u32 px0 = cx * 9;
     u32 py  = cy * 20;
-    term_fill_rect(px0, py, 18, 20, bg);
+    TermFillRect(px0, py, 18, 20, bg);
     for (int row = 0; row < 16; row++) {
         u8 hi = glyph[row * 2];
         u8 lo = glyph[row * 2 + 1];
         for (int col = 0; col < 8; col++) {
             if (hi & (0x80 >> col))
-                term_pixel(px0 + 1 + col, py + row, fg);
+                TermPixel(px0 + 1 + col, py + row, fg);
         }
         for (int col = 0; col < 8; col++) {
             if (lo & (0x80 >> col))
-                term_pixel(px0 + 1 + 8 + col, py + row, fg);
+                TermPixel(px0 + 1 + 8 + col, py + row, fg);
         }
     }
 }
@@ -374,19 +412,19 @@ static void term_stamp_cjk(u32 cx, u32 cy, const u8 *glyph, u32 fg, u32 bg) {
  * double-width glyph; CELL_WIDE_CONT continuation cells are skipped
  * (they were painted by their lead cell).
  */
-static void term_draw_cell(u32 cx, u32 cy, u32 cell) {
+static void TermDrawCell(u32 cx, u32 cy, u32 cell) {
     if (cx >= s_cols || cy >= s_rows)
         return;
     u32 ch = CELL_CH(cell);
     if (ch == CELL_WIDE_CONT)
         return; /* painted by the lead cell of the pair */
 
-    u32 fg = term_ansi_rgb((u8)CELL_FG(cell));
-    u32 bg = term_ansi_rgb((u8)CELL_BG(cell));
+    u32 fg = TermAnsiRgb((u8)CELL_FG(cell));
+    u32 bg = TermAnsiRgb((u8)CELL_BG(cell));
 
     if (s_vga_text) {
         u8 ach = (ch < 0x20 || ch > 0x7E) ? ' ' : (u8)ch;
-        u8 attr = term_cell_attr(fg, bg);
+        u8 attr = TermCellAttr(fg, bg);
         volatile u16 *buf = (volatile u16 *)s_fb_va;
         buf[cy * s_cols + cx] = (u16)((u16)attr << 8) | ach;
         return;
@@ -395,34 +433,34 @@ static void term_draw_cell(u32 cx, u32 cy, u32 cell) {
     if (ch > 0x7F) {
         const u8 *glyph = font_cjk_lookup((u32)ch);
         if (glyph) {
-            term_stamp_cjk(cx, cy, glyph, fg, bg);
+            TermStampCjk(cx, cy, glyph, fg, bg);
             return;
         }
         ch = '?'; /* no glyph: fall back to a visible placeholder */
     }
-    term_stamp_ascii(cx, cy, ch, fg, bg);
+    TermStampAscii(cx, cy, ch, fg, bg);
 }
 
 /* Legacy RGB-colour cell writer (used by STATUS/BOX/RENDER_LINE and
  * the perm panel): quantise the RGB to the ANSI palette and build a
  * cell.  CJK text is accepted (double-width). */
-static void term_draw_ch(u32 cx, u32 cy, u32 ch, u32 fg_rgb, u32 bg_rgb) {
-    u8 fg = term_rgb_to_vga_attr(fg_rgb, 0);
-    u8 bg = term_rgb_to_vga_attr(bg_rgb, 1);
+static void TermDrawCh(u32 cx, u32 cy, u32 ch, u32 fg_rgb, u32 bg_rgb) {
+    u8 fg = TermRgbToVgaAttr(fg_rgb, 0);
+    u8 bg = TermRgbToVgaAttr(bg_rgb, 1);
     u32 cell;
     CELL_SET(cell, ch, fg, bg);
-    term_draw_cell(cx, cy, cell);
+    TermDrawCell(cx, cy, cell);
 }
 
 /* Store a cell into the screen buffer AND draw it (keeps s_cells in
  * sync with the framebuffer so a later redraw keeps the colours). */
-static void term_set_cell(u32 x, u32 y, u32 ch, u32 fg_rgb, u32 bg_rgb) {
+static void TermSetCell(u32 x, u32 y, u32 ch, u32 fg_rgb, u32 bg_rgb) {
     if (x >= s_cols || y >= s_rows)
         return;
-    u8 fg = term_rgb_to_vga_attr(fg_rgb, 0);
-    u8 bg = term_rgb_to_vga_attr(bg_rgb, 1);
+    u8 fg = TermRgbToVgaAttr(fg_rgb, 0);
+    u8 bg = TermRgbToVgaAttr(bg_rgb, 1);
     CELL_SET(s_cells[y][x], ch, fg, bg);
-    term_draw_cell(x, y, s_cells[y][x]);
+    TermDrawCell(x, y, s_cells[y][x]);
 }
 
 /*
@@ -432,7 +470,7 @@ static void term_set_cell(u32 x, u32 y, u32 ch, u32 fg_rgb, u32 bg_rgb) {
  * framebuffer shows the lead's 16-px paint until BOTH cells are
  * rewritten as spaces).
  */
-static void term_clear_cell(u32 x, u32 y) {
+static void TermClearCell(u32 x, u32 y) {
     if (x >= s_cols || y >= s_rows)
         return;
     u32 ch = CELL_CH(s_cells[y][x]);
@@ -441,17 +479,17 @@ static void term_clear_cell(u32 x, u32 y) {
         u32 lead = CELL_CH(s_cells[y][x - 1]);
         if (lead > 0x7F && lead != CELL_WIDE_CONT) {
             CELL_SET(s_cells[y][x - 1], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
-            term_draw_cell(x - 1, y, s_cells[y][x - 1]);
+            TermDrawCell(x - 1, y, s_cells[y][x - 1]);
         }
     }
     /* Wide char lead: clear its continuation cell as well. */
     if (ch > 0x7F && ch != CELL_WIDE_CONT && x + 1 < s_cols &&
         CELL_CH(s_cells[y][x + 1]) == CELL_WIDE_CONT) {
         CELL_SET(s_cells[y][x + 1], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
-        term_draw_cell(x + 1, y, s_cells[y][x + 1]);
+        TermDrawCell(x + 1, y, s_cells[y][x + 1]);
     }
     CELL_SET(s_cells[y][x], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
-    term_draw_cell(x, y, s_cells[y][x]);
+    TermDrawCell(x, y, s_cells[y][x]);
 }
 
 /*
@@ -461,13 +499,13 @@ static void term_clear_cell(u32 x, u32 y) {
  * columns (never splitting a code point) or the string end.  Returns
  * the column after the last glyph, for callers that pad or centre.
  */
-static u32 term_puts_utf8(u32 x, u32 y, const char *s, u32 max_cols,
+static u32 TermPutsUtf8(u32 x, u32 y, const char *s, u32 max_cols,
                           u32 fg_rgb, u32 bg_rgb) {
     u32 col = x;
     u32 i   = 0;
     while (s[i] && col < max_cols) {
         u32 cp;
-        int n = utf8_decode(s + i, &cp);
+        int n = Utf8Decode(s + i, &cp);
         if (n <= 0) { /* stray byte: render as itself, single width */
             cp = (u32)(u8)s[i];
             n  = 1;
@@ -475,11 +513,11 @@ static u32 term_puts_utf8(u32 x, u32 y, const char *s, u32 max_cols,
         int wide = (cp > 0x7F && font_cjk_lookup(cp) != NULL) ? 1 : 0;
         if (col + 1 > max_cols)
             break; /* glyph would cross the column limit */
-        term_set_cell(col, y, cp, fg_rgb, bg_rgb);
+        TermSetCell(col, y, cp, fg_rgb, bg_rgb);
         col += 1;
         if (wide) {
             if (col < max_cols && col < s_cols)
-                term_set_cell(col, y, CELL_WIDE_CONT, fg_rgb, bg_rgb);
+                TermSetCell(col, y, CELL_WIDE_CONT, fg_rgb, bg_rgb);
             col += 1;
         }
         i += (u32)n;
@@ -506,7 +544,7 @@ static u32 term_puts_utf8(u32 x, u32 y, const char *s, u32 max_cols,
 /* Column where the cursor rectangle must be drawn/erased: the cursor's
  * own column, or the wide-char lead when the cursor is on a
  * continuation cell. */
-static u32 term_cursor_anchor_x(void) {
+static u32 TermCursorAnchorX(void) {
     u32 x = s_cursor_x;
     if (x > 0 && CELL_CH(s_cells[s_cursor_y][x]) == CELL_WIDE_CONT) {
         u32 lead = CELL_CH(s_cells[s_cursor_y][x - 1]);
@@ -516,18 +554,18 @@ static u32 term_cursor_anchor_x(void) {
     return x;
 }
 
-static void term_draw_cursor(void) {
+static void TermDrawCursor(void) {
     if (!s_cursor_visible)
         return;
-    u32 x    = term_cursor_anchor_x();
+    u32 x    = TermCursorAnchorX();
     u32 cell = s_cells[s_cursor_y][x];
     CELL_SET(cell, CELL_CH(cell), (u8)CELL_BG(cell), (u8)CELL_FG(cell)); /* swap */
-    term_draw_cell(x, s_cursor_y, cell);
+    TermDrawCell(x, s_cursor_y, cell);
 }
 
-static void term_erase_cursor(void) {
-    u32 x = term_cursor_anchor_x();
-    term_draw_cell(x, s_cursor_y, s_cells[s_cursor_y][x]);
+static void TermEraseCursor(void) {
+    u32 x = TermCursorAnchorX();
+    TermDrawCell(x, s_cursor_y, s_cells[s_cursor_y][x]);
 }
 
 /* ====================================================================
@@ -539,7 +577,7 @@ static void term_erase_cursor(void) {
  * Both the pixel buffer and the s_cells screen buffer are shifted;
  * the new bottom row is cleared with the background color.
  */
-static void term_scroll(void) {
+static void TermScroll(void) {
     /* Preserve the row being scrolled off into the scrollback ring. */
     memcpy(s_sb[s_sb_next], s_cells[0], s_cols * sizeof(u32));
     s_sb_next = (s_sb_next + 1) % SCROLLBACK_ROWS;
@@ -557,8 +595,8 @@ static void term_scroll(void) {
         u32 row_bytes = s_cols * 2;
         memmove((void *)s_fb_va, (const void *)(s_fb_va + row_bytes), row_bytes * (s_rows - 1));
         /* Clear the bottom row with background attribute + space */
-        u8            attr = term_cell_attr(term_ansi_rgb(CELL_DEFAULT_FG),
-                                            term_ansi_rgb(CELL_DEFAULT_BG));
+        u8            attr = TermCellAttr(TermAnsiRgb(CELL_DEFAULT_FG),
+                                            TermAnsiRgb(CELL_DEFAULT_BG));
         volatile u16 *buf  = (volatile u16 *)s_fb_va;
         for (u32 c = 0; c < s_cols; c++)
             buf[(s_rows - 1) * s_cols + c] = (u16)((u16)attr << 8) | ' ';
@@ -567,8 +605,8 @@ static void term_scroll(void) {
         u32 shift  = row_px * s_fb_pitch;
         u32 bytes  = (s_rows - 1) * row_px * s_fb_pitch;
         memmove((void *)s_fb_va, (const void *)(s_fb_va + shift), bytes);
-        term_fill_rect(0, (s_rows - 1) * row_px, s_fb_width, row_px,
-                       term_ansi_rgb(CELL_DEFAULT_BG));
+        TermFillRect(0, (s_rows - 1) * row_px, s_fb_width, row_px,
+                       TermAnsiRgb(CELL_DEFAULT_BG));
     }
 }
 
@@ -577,7 +615,7 @@ static void term_scroll(void) {
  * ==================================================================== */
 
 /* Write one decoded code point at the cursor. */
-static void term_put_code_point(u32 cp) {
+static void TermPutCodePoint(u32 cp) {
     /* Control characters (except those handled by the state machine). */
     switch (cp) {
     case '\n':
@@ -596,12 +634,12 @@ static void term_put_code_point(u32 cp) {
             if (ch == CELL_WIDE_CONT && x > 0) {
                 u32 lead = CELL_CH(s_cells[s_cursor_y][x - 1]);
                 if (lead > 0x7F && lead != CELL_WIDE_CONT) {
-                    term_clear_cell(x - 1, s_cursor_y);
+                    TermClearCell(x - 1, s_cursor_y);
                     s_cursor_x = x - 1;
                     goto finish;
                 }
             }
-            term_clear_cell(x, s_cursor_y);
+            TermClearCell(x, s_cursor_y);
             s_cursor_x = x;
         }
         goto finish;
@@ -613,13 +651,13 @@ static void term_put_code_point(u32 cp) {
         /* A tab stop can land inside a wide character.  Clear the pair
          * so the next write does not orphan a half glyph. */
         if (CELL_CH(s_cells[s_cursor_y][s_cursor_x]) == CELL_WIDE_CONT)
-            term_clear_cell(s_cursor_x, s_cursor_y);
+            TermClearCell(s_cursor_x, s_cursor_y);
         goto finish;
     case 0x0C: /* \f form feed = clear screen */
         for (u32 r = 0; r < s_rows; r++)
             for (u32 c = 0; c < s_cols; c++)
                 CELL_SET(s_cells[r][c], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
-        term_fill_rect(0, 0, s_fb_width, s_fb_height, term_ansi_rgb(CELL_DEFAULT_BG));
+        TermFillRect(0, 0, s_fb_width, s_fb_height, TermAnsiRgb(CELL_DEFAULT_BG));
         s_cursor_x = 0;
         s_cursor_y = 0;
         goto finish;
@@ -644,7 +682,7 @@ static void term_put_code_point(u32 cp) {
         x = 0;
         s_cursor_y++;
         if (s_cursor_y >= s_rows) {
-            term_scroll();
+            TermScroll();
             s_cursor_y = s_rows - 1;
         }
     }
@@ -656,10 +694,10 @@ static void term_put_code_point(u32 cp) {
         if (tgt == CELL_WIDE_CONT ||
             (tgt > 0x7F && tgt != CELL_WIDE_CONT && x + 1 < s_cols &&
              CELL_CH(s_cells[s_cursor_y][x + 1]) == CELL_WIDE_CONT))
-            term_clear_cell(x, s_cursor_y);
+            TermClearCell(x, s_cursor_y);
     }
     CELL_SET(s_cells[s_cursor_y][x], cp, s_cur_fg, s_cur_bg);
-    term_draw_cell(x, s_cursor_y, s_cells[s_cursor_y][x]);
+    TermDrawCell(x, s_cursor_y, s_cells[s_cursor_y][x]);
     s_cursor_x = x + 1;
     if (wide) {
         if (s_cursor_x < s_cols) {
@@ -675,13 +713,13 @@ finish:
         s_cursor_y++;
     }
     if (s_cursor_y >= s_rows) {
-        term_scroll();
+        TermScroll();
         s_cursor_y = s_rows - 1;
     }
 }
 
 /* ANSI SGR (Select Graphic Rendition): parse s_csi_params. */
-static void term_sgr(void) {
+static void TermSgr(void) {
     if (s_csi_nparams == 0) { /* ESC[m = reset */
         s_cur_fg = CELL_DEFAULT_FG;
         s_cur_bg = CELL_DEFAULT_BG;
@@ -733,12 +771,12 @@ static void term_sgr(void) {
 
 /* Redraw every live row from s_cells (forward decl; defined below the
  * input path so the bulk-edit CSI handlers can call it). */
-static void term_redraw_screen(void);
+static void TermRedrawScreen(void);
 
 /* Final byte of a CSI sequence dispatches. */
-static void term_csi_final(u8 b) {
+static void TermCsiFinal(u8 b) {
     if (b == 'm') {
-        term_sgr();
+        TermSgr();
         return;
     }
     switch (b) {
@@ -801,24 +839,24 @@ static void term_csi_final(u8 b) {
             for (u32 r = 0; r < s_rows; r++)
                 for (u32 c = 0; c < s_cols; c++)
                     CELL_SET(s_cells[r][c], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
-            term_fill_rect(0, 0, s_fb_width, s_fb_height, term_ansi_rgb(CELL_DEFAULT_BG));
+            TermFillRect(0, 0, s_fb_width, s_fb_height, TermAnsiRgb(CELL_DEFAULT_BG));
             s_cursor_x = 0;
             s_cursor_y = 0;
         } else if (mode == 0) { /* cursor -> end of screen */
             for (u32 c = s_cursor_x; c < s_cols; c++)
-                term_clear_cell(c, s_cursor_y);
+                TermClearCell(c, s_cursor_y);
             for (u32 r = s_cursor_y + 1; r < s_rows; r++)
                 for (u32 c = 0; c < s_cols; c++)
                     CELL_SET(s_cells[r][c], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
-            term_redraw_screen();
+            TermRedrawScreen();
         } else if (mode == 1) { /* start -> cursor */
             for (u32 r = 0; r <= s_cursor_y; r++)
                 for (u32 c = 0; c < s_cols; c++) {
                     if (r == s_cursor_y && c > s_cursor_x)
                         continue;
-                    term_clear_cell(c, r);
+                    TermClearCell(c, r);
                 }
-            term_redraw_screen();
+            TermRedrawScreen();
         }
         break;
     }
@@ -830,7 +868,7 @@ static void term_csi_final(u8 b) {
             start = 0, end = s_cols;
         if (start < end) {
             for (u32 c = start; c < end && c < s_cols; c++)
-                term_clear_cell(c, s_cursor_y);
+                TermClearCell(c, s_cursor_y);
         }
         break;
     }
@@ -840,10 +878,10 @@ static void term_csi_final(u8 b) {
         if (s_csi_priv && (s_csi_nparams == 0 || s_csi_params[0] == 25)) {
             s_cursor_visible = (b == 'h') ? 1 : 0;
             if (!s_cursor_visible)
-                term_draw_cell(s_cursor_x, s_cursor_y,
+                TermDrawCell(s_cursor_x, s_cursor_y,
                                s_cells[s_cursor_y][s_cursor_x]);
             else
-                term_draw_cursor();
+                TermDrawCursor();
         }
         break;
     default:
@@ -856,10 +894,10 @@ static void term_csi_final(u8 b) {
  * render, re-draw.  The caller must hold s_render_lock (term_write
  * does; single-threaded callers are fine too).
  */
-static void term_emit_cp(u32 cp) {
-    term_erase_cursor();
-    term_put_code_point(cp);
-    term_draw_cursor();
+static void TermEmitCp(u32 cp) {
+    TermEraseCursor();
+    TermPutCodePoint(cp);
+    TermDrawCursor();
 }
 
 /*
@@ -868,8 +906,8 @@ static void term_emit_cp(u32 cp) {
  * starts a CSI or two-byte sequence.  (UTF-8 is decoded upstream in
  * term_write and delivered as complete code points via term_emit_cp.)
  */
-static void term_putc(u8 ch) {
-    term_erase_cursor();
+static void TermPutc(u8 ch) {
+    TermEraseCursor();
 
     switch (s_ansi_state) {
     case ANSI_STATE_TEXT:
@@ -883,11 +921,11 @@ static void term_putc(u8 ch) {
         if (ch >= 0x80) {
             /* Should not happen (the decoder consumes them), but a
              * stray continuation byte renders as a placeholder. */
-            term_put_code_point('?');
-            term_draw_cursor();
+            TermPutCodePoint('?');
+            TermDrawCursor();
             return;
         }
-        term_put_code_point(ch);
+        TermPutCodePoint(ch);
         break;
 
     case ANSI_STATE_ESC:
@@ -942,12 +980,12 @@ static void term_putc(u8 ch) {
         if (s_csi_param >= 0 && s_csi_nparams < 16) {
             s_csi_params[s_csi_nparams++] = (u8)s_csi_param;
         }
-        term_csi_final(ch);
+        TermCsiFinal(ch);
         s_ansi_state = ANSI_STATE_TEXT;
         break;
     }
 
-    term_draw_cursor();
+    TermDrawCursor();
 }
 
 /*
@@ -957,16 +995,16 @@ static void term_putc(u8 ch) {
  */
 /* Redraw every live row from s_cells to the framebuffer (used to leave
  * the scrollback view, and after bulk cell edits). */
-static void term_redraw_screen(void) {
+static void TermRedrawScreen(void) {
     for (u32 r = 0; r < s_rows; r++)
         for (u32 c = 0; c < s_cols; c++)
-            term_draw_cell(c, r, s_cells[r][c]);
+            TermDrawCell(c, r, s_cells[r][c]);
 }
 
 /* Render the scrollback view: display the `view` most-recent scrollback
  * rows, oldest first, filling the screen.  The live s_cells buffer is
  * NOT touched — a later write resets the view and redraws live. */
-static void term_show_scrollback(u32 view) {
+static void TermShowScrollback(u32 view) {
     for (u32 r = 0; r < s_rows; r++) {
         for (u32 c = 0; c < s_cols; c++) {
             u32 cell;
@@ -976,26 +1014,26 @@ static void term_show_scrollback(u32 view) {
                 if (idx < SCROLLBACK_ROWS)
                     cell = s_sb[idx][c];
             }
-            term_draw_cell(c, r, cell);
+            TermDrawCell(c, r, cell);
         }
     }
 }
 
-static void term_clear(void); /* forward decl: term_write resets the splash */
+static void TermClear(void); /* forward decl: term_write resets the splash */
 
-static i32 term_write(const u8 *data, u32 len) {
+static i32 TermWrite(const u8 *data, u32 len) {
     if (s_splash_clear) {
         /* First write after the boot splash: clear it entirely so it
          * never lingers under/around later output. */
         s_splash_clear = 0;
-        term_clear();
+        TermClear();
         s_cursor_x = 0;
         s_cursor_y = 0;
     }
     if (s_sb_view != 0) {
         /* Any write while paging through history returns to live. */
         s_sb_view = 0;
-        term_redraw_screen();
+        TermRedrawScreen();
     }
 #ifdef TERM_DEBUG_SERIAL_MIRROR
     /* Debug-only mirror to the kernel serial log (COM1).  Disabled by
@@ -1012,14 +1050,14 @@ static i32 term_write(const u8 *data, u32 len) {
                 buf[i] = (c == '\0') ? ' ' : c;
             }
             buf[n] = '\0';
-            (void)debug_log(buf);
+            (void)DebugLog(buf);
             off += n;
         }
     }
 #endif
 
     if (s_render_lock >= 0)
-        (void)mutex_lock(s_render_lock);
+        (void)MutexLock(s_render_lock);
     /* Feed bytes through the ANSI state machine + incremental UTF-8
      * decoder (decoder state persists across calls, so a multi-byte
      * char split across WRITEs still renders correctly). */
@@ -1032,7 +1070,7 @@ static i32 term_write(const u8 *data, u32 len) {
                     /* Complete code point: bypass the byte state machine
                      * (UTF-8 text cannot appear inside an escape seq). */
                     if (s_ansi_state == ANSI_STATE_TEXT)
-                        term_emit_cp(s_utf8_cp);
+                        TermEmitCp(s_utf8_cp);
                     /* else: part of an escape sequence — dropped. */
                 }
             } else {
@@ -1050,13 +1088,13 @@ static i32 term_write(const u8 *data, u32 len) {
             s_utf8_cp = b & 0x07;
             s_utf8_left = 3;
         } else if (b < 0x80) {
-            term_putc(b);
+            TermPutc(b);
         } else {
-            term_putc('?'); /* stray continuation byte */
+            TermPutc('?'); /* stray continuation byte */
         }
     }
     if (s_render_lock >= 0)
-        (void)mutex_unlock(s_render_lock);
+        (void)MutexUnlock(s_render_lock);
     return (i32)len;
 }
 
@@ -1065,9 +1103,9 @@ static i32 term_write(const u8 *data, u32 len) {
  * Blank cells store ' ' so the cursor erases to a clean background.
  * Serializes with the perm.ui thread on s_render_lock.
  */
-static void term_clear(void) {
+static void TermClear(void) {
     if (s_render_lock >= 0)
-        (void)mutex_lock(s_render_lock);
+        (void)MutexLock(s_render_lock);
 
     /* Reset the incremental UTF-8 decoder and the ANSI state machine so
      * a half-received sequence cannot span the clear boundary. */
@@ -1080,23 +1118,23 @@ static void term_clear(void) {
             CELL_SET(s_cells[r][c], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
 
     if (s_vga_text) {
-        u8            attr = term_cell_attr(term_ansi_rgb(CELL_DEFAULT_FG),
-                                            term_ansi_rgb(CELL_DEFAULT_BG));
+        u8            attr = TermCellAttr(TermAnsiRgb(CELL_DEFAULT_FG),
+                                            TermAnsiRgb(CELL_DEFAULT_BG));
         volatile u16 *buf  = (volatile u16 *)s_fb_va;
         for (u32 i = 0; i < s_cols * s_rows; i++)
             buf[i] = (u16)((u16)attr << 8) | ' ';
     } else {
-        term_fill_rect(0, 0, s_fb_width, s_fb_height,
-                       term_ansi_rgb(CELL_DEFAULT_BG));
+        TermFillRect(0, 0, s_fb_width, s_fb_height,
+                       TermAnsiRgb(CELL_DEFAULT_BG));
     }
 
     s_cursor_x = 0;
     s_cursor_y = 0;
-    term_draw_cursor();
+    TermDrawCursor();
     s_clear_gen++; /* invalidate any perm-UI panel snapshot */
 
     if (s_render_lock >= 0)
-        (void)mutex_unlock(s_render_lock);
+        (void)MutexUnlock(s_render_lock);
 }
 
 /* ====================================================================
@@ -1108,9 +1146,9 @@ static void term_clear(void) {
  * Format: "prefix: msg [time]" where time is optional.
  * Used for displaying system status, connection state, etc.
  */
-static void term_render_status(const char *prefix, const char *msg) {
+static void TermRenderStatus(const char *prefix, const char *msg) {
     if (s_render_lock >= 0)
-        (void)mutex_lock(s_render_lock);
+        (void)MutexLock(s_render_lock);
 
     u32 row = TERM_STATUS_ROW;
     if (row >= s_rows)
@@ -1118,38 +1156,38 @@ static void term_render_status(const char *prefix, const char *msg) {
 
     /* Clear the status row with highlight color */
     if (s_vga_text) {
-        u8            status_attr = term_cell_attr(TERM_FG, TERM_STATUS_BG);
+        u8            status_attr = TermCellAttr(TERM_FG, TERM_STATUS_BG);
         volatile u16 *buf         = (volatile u16 *)s_fb_va;
         for (u32 c = 0; c < s_cols; c++)
             buf[row * s_cols + c] = (u16)((u16)status_attr << 8) | ' ';
     } else {
-        term_fill_rect(0, row * 20, s_fb_width, 20, TERM_STATUS_BG);
+        TermFillRect(0, row * 20, s_fb_width, 20, TERM_STATUS_BG);
     }
     for (u32 c = 0; c < s_cols; c++)
         CELL_SET(s_cells[row][c], ' ', CELL_DEFAULT_FG, CELL_DEFAULT_BG);
 
     /* Render prefix and message (UTF-8 aware: CJK advances 2 columns) */
-    u32 col = term_puts_utf8(0, row, prefix, s_cols, TERM_FG, TERM_STATUS_BG);
+    u32 col = TermPutsUtf8(0, row, prefix, s_cols, TERM_FG, TERM_STATUS_BG);
 
     if (col < s_cols) {
-        term_set_cell(col, row, ':', TERM_FG, TERM_STATUS_BG);
+        TermSetCell(col, row, ':', TERM_FG, TERM_STATUS_BG);
         col++;
     }
     if (col < s_cols) {
-        term_set_cell(col, row, ' ', TERM_FG, TERM_STATUS_BG);
+        TermSetCell(col, row, ' ', TERM_FG, TERM_STATUS_BG);
         col++;
     }
 
-    col = term_puts_utf8(col, row, msg, s_cols - 1, TERM_FG, TERM_STATUS_BG);
+    col = TermPutsUtf8(col, row, msg, s_cols - 1, TERM_FG, TERM_STATUS_BG);
 
     /* Pad to end of row */
     while (col < s_cols) {
-        term_set_cell(col, row, ' ', TERM_FG, TERM_STATUS_BG);
+        TermSetCell(col, row, ' ', TERM_FG, TERM_STATUS_BG);
         col++;
     }
 
     if (s_render_lock >= 0)
-        (void)mutex_unlock(s_render_lock);
+        (void)MutexUnlock(s_render_lock);
 }
 
 /*
@@ -1157,7 +1195,7 @@ static void term_render_status(const char *prefix, const char *msg) {
  * (simplified: uses ASCII +, -, | for compatibility with VGA text mode).
  * Region: (x, y) to (x+w-1, y+h-1).
  */
-static void term_render_box(u32 x, u32 y, u32 w, u32 h, const char *title) {
+static void TermRenderBox(u32 x, u32 y, u32 w, u32 h, const char *title) {
     if (x >= s_cols || y >= s_rows || w == 0 || h == 0)
         return;
     if (x + w > s_cols)
@@ -1166,26 +1204,26 @@ static void term_render_box(u32 x, u32 y, u32 w, u32 h, const char *title) {
         h = s_rows - y;
 
     if (s_render_lock >= 0)
-        (void)mutex_lock(s_render_lock);
+        (void)MutexLock(s_render_lock);
 
     /* Top border */
-    term_draw_ch(x, y, '+', TERM_FG, TERM_BG);
+    TermDrawCh(x, y, '+', TERM_FG, TERM_BG);
     for (u32 i = 1; i < w - 1; i++)
-        term_draw_ch(x + i, y, '-', TERM_FG, TERM_BG);
-    term_draw_ch(x + w - 1, y, '+', TERM_FG, TERM_BG);
+        TermDrawCh(x + i, y, '-', TERM_FG, TERM_BG);
+    TermDrawCh(x + w - 1, y, '+', TERM_FG, TERM_BG);
 
     /* Side borders */
     for (u32 i = 1; i < h - 1; i++) {
-        term_draw_ch(x, y + i, '|', TERM_FG, TERM_BG);
-        term_draw_ch(x + w - 1, y + i, '|', TERM_FG, TERM_BG);
+        TermDrawCh(x, y + i, '|', TERM_FG, TERM_BG);
+        TermDrawCh(x + w - 1, y + i, '|', TERM_FG, TERM_BG);
     }
 
     /* Bottom border */
     if (h > 1) {
-        term_draw_ch(x, y + h - 1, '+', TERM_FG, TERM_BG);
+        TermDrawCh(x, y + h - 1, '+', TERM_FG, TERM_BG);
         for (u32 i = 1; i < w - 1; i++)
-            term_draw_ch(x + i, y + h - 1, '-', TERM_FG, TERM_BG);
-        term_draw_ch(x + w - 1, y + h - 1, '+', TERM_FG, TERM_BG);
+            TermDrawCh(x + i, y + h - 1, '-', TERM_FG, TERM_BG);
+        TermDrawCh(x + w - 1, y + h - 1, '+', TERM_FG, TERM_BG);
     }
 
     /* Blank the box interior.  A menu/dialog is redrawn on every key
@@ -1196,32 +1234,32 @@ static void term_render_box(u32 x, u32 y, u32 w, u32 h, const char *title) {
      * content back intact. */
     for (u32 r = 1; r + 1 < h; r++)
         for (u32 c = 1; c + 1 < w; c++)
-            term_draw_ch(x + c, y + r, ' ', TERM_FG, TERM_BG);
+            TermDrawCh(x + c, y + r, ' ', TERM_FG, TERM_BG);
 
     /* Title bar (if provided) — centred by DISPLAY width so a CJK
      * title (2 columns per glyph) is not misaligned by byte count. */
     if (title && h > 2) {
-        u32 tw = (u32)utf8_str_width(title, (int)strlen(title));
+        u32 tw = (u32)Utf8StrWidth(title, (int)strlen(title));
         if (tw > w - 4)
             tw = w - 4;
         u32 start = x + (w - tw) / 2;
-        (void)term_puts_utf8(start, y, title, x + w - 1, TERM_FG, TERM_BG);
+        (void)TermPutsUtf8(start, y, title, x + w - 1, TERM_FG, TERM_BG);
     }
 
     if (s_render_lock >= 0)
-        (void)mutex_unlock(s_render_lock);
+        (void)MutexUnlock(s_render_lock);
 }
 
 /*
  * Render a line of text at row (x, y) without updating the global cursor.
  * Useful for status lines, dialog boxes, etc.
  */
-static void term_render_line_at(u32 x, u32 y, const char *text, u32 maxlen) {
+static void TermRenderLineAt(u32 x, u32 y, const char *text, u32 maxlen) {
     if (x >= s_cols || y >= s_rows)
         return;
 
     if (s_render_lock >= 0)
-        (void)mutex_lock(s_render_lock);
+        (void)MutexLock(s_render_lock);
 
     /* Bounded copy; trim back to a UTF-8 character boundary so a
      * truncated multi-byte character is never rendered as garbage. */
@@ -1232,63 +1270,63 @@ static void term_render_line_at(u32 x, u32 y, const char *text, u32 maxlen) {
     while (back < 3 && n > 0 && ((unsigned char)tmp[n - 1 - back] & 0xC0) == 0x80)
         back++;
     if (back > 0) {
-        int need = utf8_seq_len(tmp + (n - 1 - back));
+        int need = Utf8SeqLen(tmp + (n - 1 - back));
         if (need == 0 || need > back + 1)
             n -= (u32)back; /* drop the incomplete trailing character */
     }
     tmp[n] = '\0';
 
-    (void)term_puts_utf8(x, y, tmp, s_cols, TERM_FG, TERM_BG);
+    (void)TermPutsUtf8(x, y, tmp, s_cols, TERM_FG, TERM_BG);
 
     if (s_render_lock >= 0)
-        (void)mutex_unlock(s_render_lock);
+        (void)MutexUnlock(s_render_lock);
 }
 
 /*
  * Get the current cursor position (for interactive TUI elements).
  * Returns the cursor coordinates in cell units.
  */
-static void term_get_cursor_pos(u32 *x, u32 *y) {
+static void TermGetCursorPos(u32 *x, u32 *y) {
     if (s_render_lock >= 0)
-        (void)mutex_lock(s_render_lock);
+        (void)MutexLock(s_render_lock);
     if (x)
         *x = s_cursor_x;
     if (y)
         *y = s_cursor_y;
     if (s_render_lock >= 0)
-        (void)mutex_unlock(s_render_lock);
+        (void)MutexUnlock(s_render_lock);
 }
 
 /*
  * Set the cursor position (for programmatic control).
  * Used by TUI elements that need to position the cursor manually.
  */
-static void term_set_cursor_pos(u32 x, u32 y) {
+static void TermSetCursorPos(u32 x, u32 y) {
     if (x >= s_cols)
         x = s_cols - 1;
     if (y >= s_rows)
         y = s_rows - 1;
 
     if (s_render_lock >= 0)
-        (void)mutex_lock(s_render_lock);
+        (void)MutexLock(s_render_lock);
 
-    term_erase_cursor();
+    TermEraseCursor();
     s_cursor_x = x;
     s_cursor_y = y;
-    term_draw_cursor();
+    TermDrawCursor();
 
     if (s_render_lock >= 0)
-        (void)mutex_unlock(s_render_lock);
+        (void)MutexUnlock(s_render_lock);
 }
 
 /* ====================================================================
  * Server side
  * ==================================================================== */
 
-static void term_reply(int token, i32 ret) {
+static void TermReply(int token, i32 ret) {
     term_resp_t *resp = (term_resp_t *)s_resp_buf;
     resp->ret         = ret;
-    int r             = ipc_reply(token, s_resp_buf, (int)TERM_RESP_HDR);
+    int r             = IpcReply(token, s_resp_buf, (int)TERM_RESP_HDR);
     if (r < 0)
         printf("term: ipc_reply failed (%d)\n", r);
 }
@@ -1298,12 +1336,12 @@ static void term_reply(int token, i32 ret) {
  * input: the opcode is validated and the payload length is capped at
  * TERM_MAX_DATA (and checked against what ipc_recv actually reported).
  */
-static void term_handle_request(int token, int msg_len) {
+static void TermHandleRequest(int token, int msg_len) {
     if (msg_len > (int)sizeof(s_req_buf))
         msg_len = (int)sizeof(s_req_buf);
 
     if (msg_len < (int)TERM_REQ_HDR) {
-        term_reply(token, ERR_INVAL);
+        TermReply(token, ERR_INVAL);
         return;
     }
 
@@ -1311,17 +1349,17 @@ static void term_handle_request(int token, int msg_len) {
 
     if (req->op == TERM_OP_WRITE) {
         if (req->len > TERM_MAX_DATA || msg_len < (int)(TERM_REQ_HDR + req->len)) {
-            term_reply(token, ERR_INVAL);
+            TermReply(token, ERR_INVAL);
             return;
         }
-        term_reply(token, term_write(req->data, req->len));
+        TermReply(token, TermWrite(req->data, req->len));
     } else if (req->op == TERM_OP_CLEAR) {
-        term_clear();
-        term_reply(token, 0);
+        TermClear();
+        TermReply(token, 0);
     } else if (req->op == TERM_OP_STATUS) {
         /* STATUS: 2 + len pairs of (prefix_len, msg_len) + strings */
         if (req->len < 4 || msg_len < (int)(TERM_REQ_HDR + 4)) {
-            term_reply(token, ERR_INVAL);
+            TermReply(token, ERR_INVAL);
             return;
         }
         u32 *status_args  = (u32 *)req->data;
@@ -1329,7 +1367,7 @@ static void term_handle_request(int token, int msg_len) {
         u32  msg_len_arg  = status_args[1];
         u32  total_needed = 8 + prefix_len + msg_len_arg;
         if (req->len < total_needed || msg_len < (int)(TERM_REQ_HDR + total_needed)) {
-            term_reply(token, ERR_INVAL);
+            TermReply(token, ERR_INVAL);
             return;
         }
         char *prefix_str = (char *)(status_args + 2);
@@ -1344,12 +1382,12 @@ static void term_handle_request(int token, int msg_len) {
         memcpy(msg_tmp, msg_str, mlen);
         msg_tmp[mlen] = '\0';
 
-        term_render_status(prefix_tmp, msg_tmp);
-        term_reply(token, 0);
+        TermRenderStatus(prefix_tmp, msg_tmp);
+        TermReply(token, 0);
     } else if (req->op == TERM_OP_BOX) {
         /* BOX: x, y, w, h, title_len + title string */
         if (req->len < 16) {
-            term_reply(token, ERR_INVAL);
+            TermReply(token, ERR_INVAL);
             return;
         }
         u32 *box_args  = (u32 *)req->data;
@@ -1360,7 +1398,7 @@ static void term_handle_request(int token, int msg_len) {
         u32  title_len = box_args[4];
 
         if (req->len < 20 + title_len) {
-            term_reply(token, ERR_INVAL);
+            TermReply(token, ERR_INVAL);
             return;
         }
         char *title_str = (char *)(box_args + 5);
@@ -1370,12 +1408,12 @@ static void term_handle_request(int token, int msg_len) {
             memcpy(title_tmp, title_str, tlen);
         title_tmp[tlen] = '\0';
 
-        term_render_box(x, y, w, h, (title_len > 0) ? title_tmp : NULL);
-        term_reply(token, 0);
+        TermRenderBox(x, y, w, h, (title_len > 0) ? title_tmp : NULL);
+        TermReply(token, 0);
     } else if (req->op == TERM_OP_RENDER_LINE) {
         /* RENDER_LINE: x, y + text data */
         if (req->len < 8 || msg_len < (int)(TERM_REQ_HDR + 8)) {
-            term_reply(token, ERR_INVAL);
+            TermReply(token, ERR_INVAL);
             return;
         }
         u32 *line_args = (u32 *)req->data;
@@ -1386,32 +1424,32 @@ static void term_handle_request(int token, int msg_len) {
             textlen = TERM_MAX_DATA;
         char *text = (char *)(line_args + 2);
 
-        term_render_line_at(x, y, text, textlen);
-        term_reply(token, 0);
+        TermRenderLineAt(x, y, text, textlen);
+        TermReply(token, 0);
     } else if (req->op == TERM_OP_SET_CURSOR) {
         /* SET_CURSOR: x, y */
         if (req->len < 8) {
-            term_reply(token, ERR_INVAL);
+            TermReply(token, ERR_INVAL);
             return;
         }
         u32 *cursor_args = (u32 *)req->data;
-        term_set_cursor_pos(cursor_args[0], cursor_args[1]);
-        term_reply(token, 0);
+        TermSetCursorPos(cursor_args[0], cursor_args[1]);
+        TermReply(token, 0);
     } else if (req->op == TERM_OP_GET_CURSOR) {
         /* GET_CURSOR: return cursor position in response */
         term_resp_t *resp      = (term_resp_t *)s_resp_buf;
         u32         *resp_data = (u32 *)(resp + 1);
-        term_get_cursor_pos(&resp_data[0], &resp_data[1]);
+        TermGetCursorPos(&resp_data[0], &resp_data[1]);
         resp->ret    = 0;
         int resp_len = (int)(sizeof(term_resp_t) + 8);
-        (void)ipc_reply(token, resp, resp_len);
+        (void)IpcReply(token, resp, resp_len);
         return;
     } else if (req->op == TERM_OP_SNAPSHOT) {
         /* SNAPSHOT: {x, y, w, h} -> response = {ret; u16 cells[w*h]}.
          * Cells travel as 16-bit code points (CELL_WIDE_CONT = 0xFFFE
          * round-trips), so CJK survives a menu/dialog overlay. */
         if (req->len < 16) {
-            term_reply(token, ERR_INVAL);
+            TermReply(token, ERR_INVAL);
             return;
         }
         u32 *snap    = (u32 *)req->data;
@@ -1420,14 +1458,14 @@ static void term_handle_request(int token, int msg_len) {
         u32  w       = snap[2];
         u32  h       = snap[3];
         if (w == 0 || h == 0 || (u64)w * h > TERM_MAX_REGION_CELLS) {
-            term_reply(token, ERR_INVAL);
+            TermReply(token, ERR_INVAL);
             return;
         }
         term_resp_t *resp = (term_resp_t *)s_resp_buf;
         resp->ret         = 0;
         u16 *dst          = (u16 *)(resp + 1);
         if (s_render_lock >= 0)
-            (void)mutex_lock(s_render_lock);
+            (void)MutexLock(s_render_lock);
         u32 n = 0;
         for (u32 r = 0; r < h && y + r < s_rows; r++)
             for (u32 c = 0; c < w && x + c < s_cols; c++) {
@@ -1435,14 +1473,14 @@ static void term_handle_request(int token, int msg_len) {
                 dst[n++] = (u16)cp;
             }
         if (s_render_lock >= 0)
-            (void)mutex_unlock(s_render_lock);
-        (void)ipc_reply(token, s_resp_buf,
+            (void)MutexUnlock(s_render_lock);
+        (void)IpcReply(token, s_resp_buf,
                         (int)(sizeof(term_resp_t) + n * 2));
         return;
     } else if (req->op == TERM_OP_RESTORE) {
         /* RESTORE: {x, y, w, h, u16 cells[w*h]} — redraw a saved region. */
         if (req->len < 16) {
-            term_reply(token, ERR_INVAL);
+            TermReply(token, ERR_INVAL);
             return;
         }
         u32 *snap = (u32 *)req->data;
@@ -1452,26 +1490,26 @@ static void term_handle_request(int token, int msg_len) {
         u32  h    = snap[3];
         if (w == 0 || h == 0 || (u64)w * h > TERM_MAX_REGION_CELLS ||
             req->len < 16 + (u32)(w * h * 2)) {
-            term_reply(token, ERR_INVAL);
+            TermReply(token, ERR_INVAL);
             return;
         }
         const u16 *cells = (const u16 *)(snap + 4);
         if (s_render_lock >= 0)
-            (void)mutex_lock(s_render_lock);
+            (void)MutexLock(s_render_lock);
         u32 n = 0;
         for (u32 r = 0; r < h && y + r < s_rows; r++)
             for (u32 c = 0; c < w && x + c < s_cols; c++) {
                 u32 ch = cells[n++];
-                term_set_cell(x + c, y + r, ch, TERM_FG, TERM_BG);
+                TermSetCell(x + c, y + r, ch, TERM_FG, TERM_BG);
             }
         if (s_render_lock >= 0)
-            (void)mutex_unlock(s_render_lock);
-        term_reply(token, 0);
+            (void)MutexUnlock(s_render_lock);
+        TermReply(token, 0);
     } else if (req->op == TERM_OP_SCROLLVIEW) {
         /* SCROLLVIEW: {i32 delta}.  delta > 0 pages back (older),
          * delta < 0 pages forward, delta == 0 returns to live. */
         if (req->len < 4) {
-            term_reply(token, ERR_INVAL);
+            TermReply(token, ERR_INVAL);
             return;
         }
         i32 delta = (i32)((u32 *)req->data)[0];
@@ -1482,59 +1520,59 @@ static void term_handle_request(int token, int msg_len) {
         if (delta < -(i32)SCROLLBACK_ROWS)
             delta = -(i32)SCROLLBACK_ROWS;
         if (s_render_lock >= 0)
-            (void)mutex_lock(s_render_lock);
+            (void)MutexLock(s_render_lock);
         if (delta == 0) {
             s_sb_view = 0;
-            term_redraw_screen();
+            TermRedrawScreen();
         } else if (delta < 0) {
             u32 back = (u32)(-delta);
             s_sb_view = (back >= s_sb_view) ? 0 : s_sb_view - back;
-            term_show_scrollback(s_sb_view);
+            TermShowScrollback(s_sb_view);
         } else {
             s_sb_view += (u32)delta;
             if (s_sb_view > s_sb_count)
                 s_sb_view = s_sb_count;
-            term_show_scrollback(s_sb_view);
+            TermShowScrollback(s_sb_view);
         }
         if (s_render_lock >= 0)
-            (void)mutex_unlock(s_render_lock);
-        term_reply(token, 0);
+            (void)MutexUnlock(s_render_lock);
+        TermReply(token, 0);
     } else if (req->op == TERM_OP_REDRAW) {
         /* REDRAW: repaint the whole screen from s_cells.  The GUI
          * compositor calls this after releasing the framebuffer so the
          * text screen reappears exactly as the shell left it. */
         if (s_render_lock >= 0)
-            (void)mutex_lock(s_render_lock);
+            (void)MutexLock(s_render_lock);
         for (u32 r = 0; r < s_rows; r++)
             for (u32 c = 0; c < s_cols; c++)
-                term_draw_cell(c, r, s_cells[r][c]);
-        term_draw_cursor();
+                TermDrawCell(c, r, s_cells[r][c]);
+        TermDrawCursor();
         if (s_render_lock >= 0)
-            (void)mutex_unlock(s_render_lock);
-        term_reply(token, 0);
+            (void)MutexUnlock(s_render_lock);
+        TermReply(token, 0);
     } else if (req->op == TERM_OP_GET_SIZE) {
         /* GET_SIZE: reply {i32 ret; u32 cols; u32 rows}. */
         u32 *resp = (u32 *)s_resp_buf;
         resp[0]   = 0;
         resp[1]   = s_cols;
         resp[2]   = s_rows;
-        (void)ipc_reply(token, s_resp_buf, 12);
+        (void)IpcReply(token, s_resp_buf, 12);
     } else {
-        term_reply(token, ERR_INVAL);
+        TermReply(token, ERR_INVAL);
     }
 }
 
-static void term_server_loop(int port) {
+static void TermServerLoop(int port) {
     for (;;) {
         int msg_len = (int)sizeof(s_req_buf);
         int token   = 0;
-        int ret     = ipc_recv(port, s_req_buf, &msg_len, &token);
+        int ret     = IpcRecv(port, s_req_buf, &msg_len, &token);
         if (ret < 0) {
             printf("term: ipc_recv failed (%d)\n", ret);
-            thread_exit(1);
+            ThreadExit(1);
         }
 
-        term_handle_request(token, msg_len);
+        TermHandleRequest(token, msg_len);
     }
 }
 
@@ -1544,7 +1582,7 @@ static void term_server_loop(int port) {
  *
  * Two cooperating threads render and answer the permission panel:
  *
- *   perm_ui_main        (thread A) — owns the "perm.ui" port and is
+ *   PermUiMain(thread A) — owns the "perm.ui" port and is
  *                       ALWAYS parked in ipc_recv, so the perm-manager's
  *                       synchronous UI_SHOW push (ipc_call) is answered
  *                       immediately.  It snapshots the screen when a
@@ -1552,9 +1590,9 @@ static void term_server_loop(int port) {
  *                       the verdict, holds it, then restores the area
  *                       the panel covered.
  *
- *   perm_ui_input_main  (thread B) — the keyboard front-end.  It polls
+ *   PermUiInputMain(thread B) — the keyboard front-end.  It polls
  *                       s_ui_await, takes the keyboard focus, reads a
- *                       y/n key, sends PERM_OP_ANSWER via ipc_send (NOT
+ *                       y/n key, sends PERM_OP_ANSWER via IpcSend(NOT
  *                       ipc_call: perm-manager's do_answer synchronously
  *                       pushes the result UI_SHOW back here, so a
  *                       blocking call would deadlock), releases focus.
@@ -1602,35 +1640,35 @@ static int          s_ui_active;         /* 1 = panel on screen (A only) */
 static volatile u32 s_ui_snapshot_gen;   /* s_clear_gen at snapshot time  */
 static volatile u32 s_ui_await;          /* 1 = input thread should run  */
 static volatile u32 s_ui_query_id;       /* query being answered (u32)   */
-static int          s_ui_perm_port = -1; /* lazy port_get("perm")        */
-static int          s_ui_kbd_port  = -1; /* lazy port_get("keyboard")    */
+static int          s_ui_perm_port = -1; /* lazy PortGet("perm")        */
+static int          s_ui_kbd_port  = -1; /* lazy PortGet("keyboard")    */
 
 /* Draw one cell into the panel (keeps s_cells in sync with the fb). */
-static void perm_ui_cell(u32 x, u32 y, char ch, u32 fg) {
+static void PermUiCell(u32 x, u32 y, char ch, u32 fg) {
     if (x >= s_cols || y >= s_rows)
         return;
     if (ch < 0x20 || ch > 0x7E)
         ch = ' ';
-    term_set_cell(x, y, (u8)ch, fg, TERM_BG);
+    TermSetCell(x, y, (u8)ch, fg, TERM_BG);
 }
 
 /* Render a line of `width` columns, padded with spaces, sanitized.
  * UTF-8 aware: CJK code points advance 2 columns, so a Chinese URL or
  * file name in a permission query renders correctly. */
-static void perm_ui_line(u32 x, u32 y, u32 fg, const char *s, u32 maxlen, u32 width) {
+static void PermUiLine(u32 x, u32 y, u32 fg, const char *s, u32 maxlen, u32 width) {
     char tmp[TERM_MAX_DATA + 1];
     u32  n = (maxlen < TERM_MAX_DATA) ? maxlen : TERM_MAX_DATA;
     memcpy(tmp, s, n);
     tmp[n] = '\0';
-    u32 col = term_puts_utf8(x, y, tmp, x + width, fg, TERM_BG);
+    u32 col = TermPutsUtf8(x, y, tmp, x + width, fg, TERM_BG);
     while (col < x + width) {
-        term_set_cell(col, y, ' ', fg, TERM_BG);
+        TermSetCell(col, y, ' ', fg, TERM_BG);
         col++;
     }
 }
 
 /* Write decimal of v into out; returns the digit count. */
-static u32 perm_ui_dec(char *out, u32 v) {
+static u32 PermUiDec(char *out, u32 v) {
     char tmp[12];
     u32  n = 0;
     if (v == 0)
@@ -1645,7 +1683,7 @@ static u32 perm_ui_dec(char *out, u32 v) {
 }
 
 /* Access mask -> "R"/"W"/"RW"/"X"... (empty -> "-"). */
-static u32 perm_ui_access(char *out, u32 access) {
+static u32 PermUiAccess(char *out, u32 access) {
     u32 n = 0;
     if (access & VFS_ACCESS_READ)
         out[n++] = 'R';
@@ -1663,7 +1701,7 @@ static u32 perm_ui_access(char *out, u32 access) {
  * arm the input thread (first PENDING); fresh=0: re-draw in place
  * (another PENDING while active, or the ALLOWED/DENIED verdict).
  */
-static void perm_ui_render_panel(const perm_req_ui_t *req, int fresh) {
+static void PermUiRenderPanel(const perm_req_ui_t *req, int fresh) {
     u32 w = PERM_UI_PANEL_W;
     u32 h = PERM_UI_PANEL_H;
     if (w > s_cols)
@@ -1674,7 +1712,7 @@ static void perm_ui_render_panel(const perm_req_ui_t *req, int fresh) {
     u32 py = (s_rows - h) / 2;
 
     if (s_render_lock >= 0)
-        (void)mutex_lock(s_render_lock);
+        (void)MutexLock(s_render_lock);
 
     if (fresh) {
         for (u32 r = 0; r < s_rows; r++) {
@@ -1689,28 +1727,28 @@ static void perm_ui_render_panel(const perm_req_ui_t *req, int fresh) {
     /* Interior clear (no stale glyphs) */
     for (u32 r = 1; r < h - 1; r++)
         for (u32 c = 1; c < w - 1; c++)
-            perm_ui_cell(px + c, py + r, ' ', TERM_FG);
+            PermUiCell(px + c, py + r, ' ', TERM_FG);
 
     /* Border (+ - | only: the font has no box-drawing glyphs) */
-    perm_ui_cell(px, py, '+', PERM_UI_BORDER_FG);
+    PermUiCell(px, py, '+', PERM_UI_BORDER_FG);
     for (u32 c = 1; c < w - 1; c++)
-        perm_ui_cell(px + c, py, '-', PERM_UI_BORDER_FG);
-    perm_ui_cell(px + w - 1, py, '+', PERM_UI_BORDER_FG);
+        PermUiCell(px + c, py, '-', PERM_UI_BORDER_FG);
+    PermUiCell(px + w - 1, py, '+', PERM_UI_BORDER_FG);
     for (u32 r = 1; r < h - 1; r++) {
-        perm_ui_cell(px, py + r, '|', PERM_UI_BORDER_FG);
-        perm_ui_cell(px + w - 1, py + r, '|', PERM_UI_BORDER_FG);
+        PermUiCell(px, py + r, '|', PERM_UI_BORDER_FG);
+        PermUiCell(px + w - 1, py + r, '|', PERM_UI_BORDER_FG);
     }
-    perm_ui_cell(px, py + h - 1, '+', PERM_UI_BORDER_FG);
+    PermUiCell(px, py + h - 1, '+', PERM_UI_BORDER_FG);
     for (u32 c = 1; c < w - 1; c++)
-        perm_ui_cell(px + c, py + h - 1, '-', PERM_UI_BORDER_FG);
-    perm_ui_cell(px + w - 1, py + h - 1, '+', PERM_UI_BORDER_FG);
+        PermUiCell(px + c, py + h - 1, '-', PERM_UI_BORDER_FG);
+    PermUiCell(px + w - 1, py + h - 1, '+', PERM_UI_BORDER_FG);
 
     /* Title, centered on the top border */
     static const char k_title[] = "Permission Request";
     u32               tl        = (sizeof(k_title) - 1 < w - 4) ? sizeof(k_title) - 1 : w - 4;
     u32               tx        = px + (w - tl) / 2;
     for (u32 i = 0; i < tl; i++)
-        perm_ui_cell(tx + i, py, k_title[i], PERM_UI_TITLE_FG);
+        PermUiCell(tx + i, py, k_title[i], PERM_UI_TITLE_FG);
 
     /* Requestor: "<name> (PID <pid>)" */
     {
@@ -1723,13 +1761,13 @@ static void perm_ui_render_panel(const perm_req_ui_t *req, int fresh) {
         for (i = 0; k_pid[i] && n < sizeof(line) - 1; i++)
             line[n++] = k_pid[i];
         char dec[12];
-        u32  dn = perm_ui_dec(dec, req->pid);
+        u32  dn = PermUiDec(dec, req->pid);
         for (i = 0; i < dn && n < sizeof(line) - 1; i++)
             line[n++] = dec[i];
         if (n < sizeof(line) - 1)
             line[n++] = ')';
         line[n] = '\0';
-        perm_ui_line(px + 2, py + 1, TERM_FG, line, n, w - 4);
+        PermUiLine(px + 2, py + 1, TERM_FG, line, n, w - 4);
     }
 
     /* Resource URL (find its real length first: the field need not be
@@ -1738,13 +1776,13 @@ static void perm_ui_render_panel(const perm_req_ui_t *req, int fresh) {
         u32 ulen = 0;
         while (ulen < sizeof(req->url) - 1 && req->url[ulen])
             ulen++;
-        perm_ui_line(px + 2, py + 2, TERM_FG, req->url, ulen, w - 4);
+        PermUiLine(px + 2, py + 2, TERM_FG, req->url, ulen, w - 4);
     }
 
     /* Access mask */
     {
         char              acc[8];
-        u32               an = perm_ui_access(acc, req->access);
+        u32               an = PermUiAccess(acc, req->access);
         char              line[32];
         u32               n       = 0;
         static const char k_acc[] = "Access: ";
@@ -1753,27 +1791,27 @@ static void perm_ui_render_panel(const perm_req_ui_t *req, int fresh) {
         for (u32 i = 0; i < an && n < sizeof(line) - 1; i++)
             line[n++] = acc[i];
         line[n] = '\0';
-        perm_ui_line(px + 2, py + 3, TERM_FG, line, n, w - 4);
+        PermUiLine(px + 2, py + 3, TERM_FG, line, n, w - 4);
     }
 
     /* Aggregated description (PENDING only; sanitized to the ASCII font) */
     if (req->state == PERM_QUERY_PENDING)
-        perm_ui_line(px + 2, py + 4, TERM_FG, req->label, sizeof(req->label), w - 4);
+        PermUiLine(px + 2, py + 4, TERM_FG, req->label, sizeof(req->label), w - 4);
 
     /* Prompt or verdict line */
     if (req->state == PERM_QUERY_PENDING) {
         static const char k_q[] = "Allow? (y/n)";
-        perm_ui_line(px + 2, py + 5, TERM_FG, k_q, sizeof(k_q) - 1, w - 4);
+        PermUiLine(px + 2, py + 5, TERM_FG, k_q, sizeof(k_q) - 1, w - 4);
     } else if (req->state == PERM_QUERY_ALLOWED) {
         static const char k_ok[] = "Result: ALLOWED";
-        perm_ui_line(px + 2, py + 5, PERM_UI_OK_FG, k_ok, sizeof(k_ok) - 1, w - 4);
+        PermUiLine(px + 2, py + 5, PERM_UI_OK_FG, k_ok, sizeof(k_ok) - 1, w - 4);
     } else {
         static const char k_bad[] = "Result: DENIED";
-        perm_ui_line(px + 2, py + 5, PERM_UI_BAD_FG, k_bad, sizeof(k_bad) - 1, w - 4);
+        PermUiLine(px + 2, py + 5, PERM_UI_BAD_FG, k_bad, sizeof(k_bad) - 1, w - 4);
     }
 
     if (s_render_lock >= 0)
-        (void)mutex_unlock(s_render_lock);
+        (void)MutexUnlock(s_render_lock);
 }
 
 /* Restore the screen area the panel covered (its centered rectangle),
@@ -1782,7 +1820,7 @@ static void perm_ui_render_panel(const perm_req_ui_t *req, int fresh) {
  * shell's last write left it: the shell never re-prints its prompt, so
  * resetting the cursor to the pre-panel position would orphan future
  * keystrokes off the visible prompt line. */
-static void perm_ui_restore(void) {
+static void PermUiRestore(void) {
     u32 w = PERM_UI_PANEL_W;
     u32 h = PERM_UI_PANEL_H;
     if (w > s_cols)
@@ -1793,7 +1831,7 @@ static void perm_ui_restore(void) {
     u32 py = (s_rows - h) / 2;
 
     if (s_render_lock >= 0)
-        (void)mutex_lock(s_render_lock);
+        (void)MutexLock(s_render_lock);
     if (s_ui_snapshot_gen != s_clear_gen) {
         /* The screen was cleared after this snapshot was taken (e.g.
          * the boot-splash clear on the shell's first write, or an
@@ -1803,37 +1841,37 @@ static void perm_ui_restore(void) {
          * after the clear. */
         for (u32 r = py; r < py + h; r++)
             for (u32 c = px; c < px + w; c++) {
-                term_set_cell(c, r, ' ', TERM_FG, TERM_BG);
+                TermSetCell(c, r, ' ', TERM_FG, TERM_BG);
             }
-        term_draw_cursor();
+        TermDrawCursor();
         s_ui_active = 0;
         if (s_render_lock >= 0)
-            (void)mutex_unlock(s_render_lock);
+            (void)MutexUnlock(s_render_lock);
         return;
     }
     for (u32 r = py; r < py + h; r++) {
         memcpy(s_cells[r] + px, s_ui_snapshot[r] + px, w * sizeof(u32));
         for (u32 c = px; c < px + w; c++)
-            term_draw_cell(c, r, s_cells[r][c]);
+            TermDrawCell(c, r, s_cells[r][c]);
     }
-    term_draw_cursor();
+    TermDrawCursor();
     s_ui_active = 0;
     if (s_render_lock >= 0)
-        (void)mutex_unlock(s_render_lock);
+        (void)MutexUnlock(s_render_lock);
 }
 
 /* --- keyboard helper: flat {u32 op; u32 len} -> {i32 ret; u8 data[]} --- */
 
-static int perm_ui_kbd_port(void) {
+static int PermUiKbdPort(void) {
     if (s_ui_kbd_port < 0)
-        s_ui_kbd_port = port_get("keyboard");
+        s_ui_kbd_port = PortGet("keyboard");
     return s_ui_kbd_port;
 }
 
 /* One synchronous call to the keyboard service.  Returns 0 and fills
  * ret/data on success. */
-static int perm_ui_kbd_req(u32 op, u32 len, i32 *ret, u8 *data, u32 data_cap) {
-    int port = perm_ui_kbd_port();
+static int PermUiKbdReq(u32 op, u32 len, i32 *ret, u8 *data, u32 data_cap) {
+    int port = PermUiKbdPort();
     if (port < 0)
         return -1;
     static u8 s_req[8];
@@ -1842,7 +1880,7 @@ static int perm_ui_kbd_req(u32 op, u32 len, i32 *ret, u8 *data, u32 data_cap) {
     h[0]         = op;
     h[1]         = len;
     int resp_len = (int)sizeof(s_resp);
-    if (ipc_call(port, s_req, (int)sizeof(s_req), s_resp, &resp_len) < 0)
+    if (IpcCall(port, s_req, (int)sizeof(s_req), s_resp, &resp_len) < 0)
         return -1;
     if (resp_len < 4)
         return -1;
@@ -1860,9 +1898,9 @@ static int perm_ui_kbd_req(u32 op, u32 len, i32 *ret, u8 *data, u32 data_cap) {
 }
 
 /* Take (1) or release (0) the keyboard focus.  < 0 on failure. */
-static int perm_ui_kbd_focus(int take) {
+static int PermUiKbdFocus(int take) {
     i32 ret = 0;
-    if (perm_ui_kbd_req(
+    if (PermUiKbdReq(
             take ? PERM_UI_KBD_TAKE_FOCUS : PERM_UI_KBD_RELEASE_FOCUS, 0, &ret, NULL, 0) < 0)
         return -1;
     return ret;
@@ -1871,10 +1909,10 @@ static int perm_ui_kbd_focus(int take) {
 /* Send the user's verdict for the current query.  ipc_send only: the
  * perm-manager answers with a UI_SHOW result push synchronously inside
  * do_answer, so ipc_call here would deadlock. */
-static void perm_ui_send_answer(int allow) {
+static void PermUiSendAnswer(int allow) {
     int port = s_ui_perm_port;
     if (port < 0) {
-        s_ui_perm_port = port_get(PERM_PORT_NAME);
+        s_ui_perm_port = PortGet(PERM_PORT_NAME);
         port           = s_ui_perm_port;
     }
     if (port < 0)
@@ -1884,7 +1922,7 @@ static void perm_ui_send_answer(int allow) {
     ans.op       = PERM_OP_ANSWER;
     ans.query_id = (u32)s_ui_query_id;
     ans.allow    = allow ? 1 : 0;
-    (void)ipc_send(port, &ans, (int)sizeof(ans));
+    (void)IpcSend(port, &ans, (int)sizeof(ans));
 }
 
 /*
@@ -1892,16 +1930,16 @@ static void perm_ui_send_answer(int allow) {
  * with y/n, then clears s_ui_await so thread A can run the verdict
  * hold + restore.
  */
-static void perm_ui_input_main(void *arg) {
+static void PermUiInputMain(void *arg) {
     (void)arg;
     for (;;) {
         while (!s_ui_await)
-            (void)sleep(1);
+            (void)Sleep(1);
 
         /* Grab the keyboard.  On failure answer deny so the query still
          * resolves and the panel can close. */
-        if (perm_ui_kbd_focus(1) < 0) {
-            perm_ui_send_answer(0);
+        if (PermUiKbdFocus(1) < 0) {
+            PermUiSendAnswer(0);
             s_ui_await = 0;
             continue;
         }
@@ -1913,7 +1951,7 @@ static void perm_ui_input_main(void *arg) {
         while (allow < 0 && s_ui_await) {
             u8 key = 0;
             i32 ret = 0;
-            if (perm_ui_kbd_req(PERM_UI_KBD_READ, 1, &ret, &key, 1) < 0)
+            if (PermUiKbdReq(PERM_UI_KBD_READ, 1, &ret, &key, 1) < 0)
                 break;
             if (ret > 0) {
                 if (key == 'y' || key == 'Y')
@@ -1921,36 +1959,36 @@ static void perm_ui_input_main(void *arg) {
                 else if (key == 'n' || key == 'N')
                     allow = 0;
             }
-            (void)sleep(1);
+            (void)Sleep(1);
         }
-        (void)perm_ui_kbd_focus(0);
+        (void)PermUiKbdFocus(0);
         if (allow < 0) {
             /* Resolved elsewhere or an error: nothing to answer. */
             s_ui_await = 0;
             continue;
         }
-        perm_ui_send_answer(allow);
+        PermUiSendAnswer(allow);
         s_ui_await = 0;
     }
 }
 
 /*
  * Thread A: "perm.ui" port server + panel renderer.  Always parked in
- * ipc_recv (never blocks on the user) so the perm-manager's UI_SHOW
+ * IpcRecv(never blocks on the user) so the perm-manager's UI_SHOW
  * pushes always complete — that is what makes a concurrent CHECK safe.
  */
-static void perm_ui_main(void *arg) {
+static void PermUiMain(void *arg) {
     (void)arg;
 
-    int port = ipc_port_create();
+    int port = IpcPortCreate();
     if (port < 0) {
         printf("term: perm.ui ipc_port_create failed (%d)\n", port);
-        thread_exit(1);
+        ThreadExit(1);
     }
-    int ret = port_register(PERM_UI_PORT_NAME, port);
+    int ret = PortRegister(PERM_UI_PORT_NAME, port);
     if (ret < 0) {
-        printf("term: perm.ui port_register('%s') failed (%d)\n", PERM_UI_PORT_NAME, ret);
-        thread_exit(1);
+        printf("term: perm.ui PortRegister('%s') failed (%d)\n", PERM_UI_PORT_NAME, ret);
+        ThreadExit(1);
     }
     printf("term: perm.ui port %d registered\n", port);
 
@@ -1960,10 +1998,10 @@ static void perm_ui_main(void *arg) {
     for (;;) {
         int msg_len = (int)sizeof(s_ui_req);
         int token   = 0;
-        ret         = ipc_recv(port, s_ui_req, &msg_len, &token);
+        ret         = IpcRecv(port, s_ui_req, &msg_len, &token);
         if (ret < 0) {
             printf("term: perm.ui ipc_recv failed (%d)\n", ret);
-            thread_exit(1);
+            ThreadExit(1);
         }
 
         perm_resp_ui_t *resp = (perm_resp_ui_t *)s_ui_resp;
@@ -1974,7 +2012,7 @@ static void perm_ui_main(void *arg) {
             if (req->op == PERM_OP_UI_SHOW) {
                 if (req->state == PERM_QUERY_PENDING) {
                     int fresh = !s_ui_active;
-                    perm_ui_render_panel(req, fresh);
+                    PermUiRenderPanel(req, fresh);
                     if (fresh) {
                         s_ui_query_id = req->query_id;
                         s_ui_await    = 1;
@@ -1990,17 +2028,17 @@ static void perm_ui_main(void *arg) {
                      * script) — clear s_ui_await so thread B stops waiting and
                      * RELEASES the keyboard focus; otherwise it would hold the
                      * focus forever and starve the shell's input. */
-                    perm_ui_render_panel(req, 0);
-                    (void)ipc_reply(token, s_ui_resp, (int)sizeof(perm_resp_ui_t));
-                    (void)sleep(PERM_UI_RESULT_HOLD_TICKS);
-                    perm_ui_restore();
+                    PermUiRenderPanel(req, 0);
+                    (void)IpcReply(token, s_ui_resp, (int)sizeof(perm_resp_ui_t));
+                    (void)Sleep(PERM_UI_RESULT_HOLD_TICKS);
+                    PermUiRestore();
                     s_ui_await = 0;
                     continue;
                 }
             }
         }
 
-        (void)ipc_reply(token, s_ui_resp, (int)sizeof(perm_resp_ui_t));
+        (void)IpcReply(token, s_ui_resp, (int)sizeof(perm_resp_ui_t));
     }
 }
 
@@ -2013,17 +2051,17 @@ static void perm_ui_main(void *arg) {
  * maps the framebuffer into this address space, registers the "term"
  * IPC port, blanks the screen, then serves clients forever.
  */
-static void term_service_main(void *arg) {
+static void TermServiceMain(void *arg) {
     (void)arg;
 
     printf("term: starting framebuffer terminal service\n");
 
     /* 1. Query the framebuffer descriptor. */
     fb_user_info_t info;
-    int            ret = fb_get_info(&info);
+    int            ret = FbGetInfo(&info);
     if (ret < 0) {
         printf("term: fb_get_info failed (%d)\n", ret);
-        thread_exit(1);
+        ThreadExit(1);
     }
     s_fb_width  = info.width;
     s_fb_height = info.height;
@@ -2051,7 +2089,7 @@ static void term_service_main(void *arg) {
     void *va = fb_map((void *)TERM_FB_VA, fb_size);
     if ((long)va < 0) {
         printf("term: fb_map failed (%d)\n", (int)(long)va);
-        thread_exit(1);
+        ThreadExit(1);
     }
     s_fb_va = (u64)va;
     /* libc printf has no %lx/%p and no width specifiers — print the
@@ -2066,7 +2104,7 @@ static void term_service_main(void *arg) {
     s_rows = s_fb_height / 20;
     if (s_cols == 0 || s_rows == 0) {
         printf("term: degenerate fb geometry (%ux%u)\n", s_cols, s_rows);
-        thread_exit(1);
+        ThreadExit(1);
     }
     if (s_cols > TERM_MAX_COLS)
         s_cols = TERM_MAX_COLS;
@@ -2075,10 +2113,10 @@ static void term_service_main(void *arg) {
     printf("term: %ux%u cells\n", s_cols, s_rows);
 
     /* 4. IPC port, registered under the well-known name "term". */
-    int port = ipc_port_create();
+    int port = IpcPortCreate();
     if (port < 0) {
         printf("term: ipc_port_create failed (%d)\n", port);
-        thread_exit(1);
+        ThreadExit(1);
     }
 
     /* 4b. Boot splash: rendered BEFORE the "term" port is registered so
@@ -2090,7 +2128,7 @@ static void term_service_main(void *arg) {
      * screen forever.  (This ordering also removes the startup race
      * where a concurrent first write could consume the clear flag and
      * then have the splash drawn over it.) */
-    term_clear();
+    TermClear();
     s_splash_clear = 1;
     {
         static const char *const splash[] = {
@@ -2105,42 +2143,42 @@ static void term_service_main(void *arg) {
             u32 len = (u32)strlen(splash[i]);
             u32 col = (len < s_cols) ? (s_cols - len) / 2 : 0;
             for (u32 c = 0; c < col; c++)
-                term_putc(' ');
+                TermPutc(' ');
             for (u32 c = 0; c < len; c++)
-                term_putc(splash[i][c]);
+                TermPutc(splash[i][c]);
             if (i + 1 < nlines)
-                term_putc('\n');
+                TermPutc('\n');
         }
         /* Reset the cursor so the next writer starts at the top. */
         s_cursor_x = 0;
         s_cursor_y = 0;
-        term_draw_cursor();
+        TermDrawCursor();
     }
 
-    ret = port_register("term", port);
+    ret = PortRegister("term", port);
     if (ret < 0) {
-        printf("term: port_register('term') failed (%d)\n", ret);
-        thread_exit(1);
+        printf("term: PortRegister('term') failed (%d)\n", ret);
+        ThreadExit(1);
     }
     printf("term: port %d registered as 'term'\n", port);
 
     /* 5. Render lock (term loop ⇄ perm.ui thread) + Powerbox UI agent. */
-    s_render_lock = mutex_create();
+    s_render_lock = MutexCreate();
     if (s_render_lock < 0) {
         printf("term: mutex_create failed (%d)\n", s_render_lock);
-        thread_exit(1);
+        ThreadExit(1);
     }
-    int ui_tid = thread_create(perm_ui_main, NULL, 10);
+    int ui_tid = ThreadCreate(PermUiMain, NULL, 10);
     if (ui_tid < 0)
-        printf("term: thread_create(perm.ui) failed (%d)\n", ui_tid);
-    int ui_in_tid = thread_create(perm_ui_input_main, NULL, 10);
+        printf("term: ThreadCreate(perm.ui) failed (%d)\n", ui_tid);
+    int ui_in_tid = ThreadCreate(PermUiInputMain, NULL, 10);
     if (ui_in_tid < 0)
-        printf("term: thread_create(perm.ui input) failed (%d)\n", ui_in_tid);
+        printf("term: ThreadCreate(perm.ui input) failed (%d)\n", ui_in_tid);
 
 
     /* 7. Serve clients. */
     printf("term: serving on port %d\n", port);
-    term_server_loop(port);
+    TermServerLoop(port);
 }
 
 /* ====================================================================
@@ -2148,6 +2186,6 @@ static void term_service_main(void *arg) {
  * ==================================================================== */
 
 int main(void) {
-    term_service_main(NULL);
+    TermServiceMain(NULL);
     return 0; /* unreachable */
 }

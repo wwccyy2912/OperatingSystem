@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * keyboard.c - Userspace PS/2 keyboard driver service
  * Copyright (c) 2026 OpSys Project
  *
@@ -9,19 +22,19 @@
  *
  *   manager process (spawned by init via SYS_PROCESS_CREATE)
  *     └─ SYS_PROCESS_CREATE("keyboard")            keyboard process
- *          └─ main() = kbd_service_main()          server thread
- *               ├─ cap_create(CAP_TYPE_IO_PORT, RIGHT_ALL)
+ *          └─ main() = KbdServiceMain()          server thread
+ *               ├─ CapCreate(CAP_TYPE_IO_PORT, RIGHT_ALL)
  *               │           obj_id = (5 << 16) | 0x60   → 0x60..0x64
- *               ├─ ipc_port_create() + port_register("keyboard")
- *               ├─ thread_create(kbd_irq_main)     IRQ thread
- *               │    ├─ cap_create(CAP_TYPE_IRQ, RIGHT_READ, 1)
- *               │    ├─ bind_irq(irq_cap, 1, 1)    IRQ1 → notification bit 0
- *               │    └─ loop: wait_notification(1) → drain 0x60 → decode
+ *               ├─ IpcPortCreate() + PortRegister("keyboard")
+ *               ├─ ThreadCreate(kbd_irq_main)     IRQ thread
+ *               │    ├─ CapCreate(CAP_TYPE_IRQ, RIGHT_READ, 1)
+ *               │    ├─ BindIrq(irq_cap, 1, 1)    IRQ1 → notification bit 0
+ *               │    └─ loop: WaitNotification(1) → drain 0x60 → decode
  *               │         scancode set-1 → ASCII (shift/caps state machine)
  *               │         → SPSC ring buffer
- *               └─ loop: ipc_recv_from(port, req, &len, &subj)
+ *               └─ loop: IpcRecvFrom(port, req, &len, &subj)
  *                          -> READ / READ_BLOCK / TAKE / RELEASE_FOCUS
- *                          (copy ring / park / focus) -> ipc_reply(port, resp, len)
+ *                          (copy ring / park / focus) -> IpcReply(port, resp, len)
  *
  * keyboard runs as its OWN process, so it has a private address space
  * and a private capability table — exactly like the serial driver.
@@ -59,6 +72,26 @@
  * so the TUI panel can own the keyboard without preempting anyone.
  * With focus free the FIRST parked slot is served, which preserves the
  * original single-parking-client behavior exactly.
+ *
+ * ------------------------------------------------------------------
+ * Structure (driver service): one process, two threads —
+ *   KbdServiceMain() serves the "keyboard" port (READ / READ_BLOCK /
+ *   TAKE_FOCUS / RELEASE_FOCUS / MOUSE_READ) while the IRQ thread
+ *   owns IRQ1/IRQ12 and drains ports 0x60/0x64; an SPSC ring plus a
+ *   focus owner and a KBD_PARK_MAX park table bridge the two threads.
+ * How it works:
+ *   The IRQ thread waits on notifications, decodes scancode set-1 to
+ *   ASCII (shift/caps state machine) and mouse packets, pushes bytes
+ *   into the ring and completes parked READ_BLOCK calls; KbdServiceMain
+ *   copies ring data, parks blocked readers and enforces keyboard focus.
+ * Purpose:
+ *   Userspace PS/2 keyboard + mouse driver — decoded keys and mouse
+ *   deltas for terminals, the shell and the TUI panel.
+ * Caveats:
+ *   No controller init commands are sent (no ACK handling); 0xE0
+ *   extended keys are skipped in v0.1; strict SPSC — the IRQ thread
+ *   must be the only ring writer.
+ * ------------------------------------------------------------------
  */
 
 #include "../lib/libc/stdio.h"
@@ -255,7 +288,7 @@ static const char s_key_shift[128] = {
  * RX ring buffer
  * ==================================================================== */
 
-static void kbd_rx_push(u8 c) {
+static void KbdRxPush(u8 c) {
     u32 next = (s_rx_tail + 1) % KBD_RX_RING_SIZE;
     if (next == s_rx_head)
         return; /* ring full: drop the key */
@@ -263,7 +296,7 @@ static void kbd_rx_push(u8 c) {
     s_rx_tail           = next;
 }
 
-static u32 kbd_rx_read(u8 *dst, u32 max) {
+static u32 KbdRxRead(u8 *dst, u32 max) {
     u32 n = 0;
     while (n < max && s_rx_head != s_rx_tail) {
         dst[n]    = s_rx_buf[s_rx_head];
@@ -315,7 +348,7 @@ static kbd_park_t *kbd_park_target(void) {
  * key-repeat / release tracking).  Extended (0xE0-prefixed) keys are
  * skipped.
  */
-static void kbd_decode_byte(u8 sc) {
+static void KbdDecodeByte(u8 sc) {
     if (sc == SC_EXT_PREFIX) {
         s_extended = 1;
         return;
@@ -351,7 +384,7 @@ static void kbd_decode_byte(u8 sc) {
             ((kbd_resp_t *)p->buf)->data[p->resp_len] = (u8)ch;
             p->resp_len++;
         } else {
-            kbd_rx_push((u8)ch);
+            KbdRxPush((u8)ch);
         }
         return;
     }
@@ -425,7 +458,7 @@ static void kbd_decode_byte(u8 sc) {
         ((kbd_resp_t *)p->buf)->data[p->resp_len] = (u8)ch;
         p->resp_len++;
     } else {
-        kbd_rx_push((u8)ch);
+        KbdRxPush((u8)ch);
     }
 }
 
@@ -437,7 +470,7 @@ static void kbd_decode_byte(u8 sc) {
 /* Assemble PS/2 mouse packets.  Standard mode is 3 bytes; after the
  * IntelliMouse enable sequence (200/100/80 sample-rate trick) packets
  * are 4 bytes with byte 3 = wheel delta (signed). */
-static void mouse_parse(u8 b) {
+static void MouseParse(u8 b) {
     s_mouse_pkt[s_mouse_phase++] = b;
     if (s_mouse_phase < (s_mouse_4byte ? 4u : 3u))
         return;
@@ -461,20 +494,20 @@ static void mouse_parse(u8 b) {
     s_mouse_pending = 1;
 }
 
-static void kbd_rx_drain(void) {
+static void KbdRxDrain(void) {
     for (;;) {
-        int st = io_read8(KBD_STATUS_PORT);
+        int st = IoRead8(KBD_STATUS_PORT);
         if (st < 0)
             break; /* I/O error — cannot proceed */
         if (!(st & KBD_STATUS_OBF))
             break; /* output buffer empty */
-        int c = io_read8(KBD_DATA_PORT);
+        int c = IoRead8(KBD_DATA_PORT);
         if (c < 0)
             break;
         if (st & 0x20)
-            mouse_parse((u8)c); /* status bit 5: byte came from the mouse */
+            MouseParse((u8)c); /* status bit 5: byte came from the mouse */
         else
-            kbd_decode_byte((u8)c); /* keyboard scancode */
+            KbdDecodeByte((u8)c); /* keyboard scancode */
     }
 }
 
@@ -482,12 +515,12 @@ static void kbd_rx_drain(void) {
  * Server side
  * ==================================================================== */
 
-static void kbd_reply(int token, i32 ret, const u8 *data, u32 len) {
+static void KbdReply(int token, i32 ret, const u8 *data, u32 len) {
     kbd_resp_t *resp = (kbd_resp_t *)s_resp_buf;
     resp->ret        = ret;
     if (data && len > 0)
         memcpy(resp->data, data, len);
-    int r = ipc_reply(token, s_resp_buf, (int)(KBD_RESP_HDR + len));
+    int r = IpcReply(token, s_resp_buf, (int)(KBD_RESP_HDR + len));
     if (r < 0)
         printf("keyboard: ipc_reply failed (%d)\n", r);
 }
@@ -500,14 +533,14 @@ static void kbd_reply(int token, i32 ret, const u8 *data, u32 len) {
  * as its drain decodes keys into that entry's buffer.  Table full:
  * serve 0 (same fallback as the old single slot being taken).
  */
-static void kbd_reply_read(int token, u32 max, int blocking, u64 owner) {
+static void KbdReplyRead(int token, u32 max, int blocking, u64 owner) {
     kbd_resp_t *resp = (kbd_resp_t *)s_resp_buf;
 
-    u32 n = kbd_rx_read(resp->data, max);
+    u32 n = KbdRxRead(resp->data, max);
     if (n > 0 || !blocking) {
         /* Bytes available or non-blocking request: serve what we have
          * (possibly 0). */
-        kbd_reply(token, (i32)n, resp->data, n);
+        KbdReply(token, (i32)n, resp->data, n);
         return;
     }
 
@@ -521,7 +554,7 @@ static void kbd_reply_read(int token, u32 max, int blocking, u64 owner) {
     }
     if (p == NULL) {
         /* Park table full: serve 0 (existing fallback behavior). */
-        kbd_reply(token, 0, NULL, 0);
+        KbdReply(token, 0, NULL, 0);
         return;
     }
 
@@ -534,29 +567,29 @@ static void kbd_reply_read(int token, u32 max, int blocking, u64 owner) {
 
     /* Re-check once: a drain may have pushed bytes between the first
      * read and the publish.  If so, serve them directly. */
-    n = kbd_rx_read(resp->data, max);
+    n = KbdRxRead(resp->data, max);
     if (n > 0) {
         p->token = -1;
-        kbd_reply(token, (i32)n, resp->data, n);
+        KbdReply(token, (i32)n, resp->data, n);
     }
     /* else: the IRQ thread completes this call when keys arrive. */
 }
 
-static void kbd_handle_request(int token, u64 caller_subject) {
+static void KbdHandleRequest(int token, u64 caller_subject) {
     kbd_req_t *req = (kbd_req_t *)s_req_buf;
 
     if (req->op == KBD_OP_READ || req->op == KBD_OP_READ_BLOCK) {
         if (req->len > KBD_MAX_DATA) {
-            kbd_reply(token, ERR_INVAL, NULL, 0);
+            KbdReply(token, ERR_INVAL, NULL, 0);
             return;
         }
-        kbd_reply_read(token, req->len, req->op == KBD_OP_READ_BLOCK, caller_subject);
+        KbdReplyRead(token, req->len, req->op == KBD_OP_READ_BLOCK, caller_subject);
     } else if (req->op == KBD_OP_TAKE_FOCUS) {
         /* The caller becomes the keyboard owner.  Idempotent: the same
          * owner re-taking is a no-op success.  Never completes anyone's
          * parked read. */
         s_focus_owner = caller_subject;
-        kbd_reply(token, 0, NULL, 0);
+        KbdReply(token, 0, NULL, 0);
     } else if (req->op == KBD_OP_MOUSE_READ) {
         /* Non-blocking mouse poll: drain the accumulated deltas and
          * report { dx, dy, buttons, wheel } (4 x i32).  An idle mouse
@@ -570,38 +603,38 @@ static void kbd_handle_request(int token, u64 caller_subject) {
         s_mouse_dy = 0;
         s_mouse_wheel = 0;
         s_mouse_pending = 0;
-        kbd_reply(token, 16, (const u8 *)m, 16);
+        KbdReply(token, 16, (const u8 *)m, 16);
     } else if (req->op == KBD_OP_RELEASE_FOCUS) {
         /* Only the focus holder may release (the kernel-filled caller
          * subject is never 0, so focus free also means no holder). */
         if (s_focus_owner == 0 || caller_subject != s_focus_owner) {
-            kbd_reply(token, ERR_NOCAP, NULL, 0);
+            KbdReply(token, ERR_NOCAP, NULL, 0);
             return;
         }
         s_focus_owner = 0;
-        kbd_reply(token, 0, NULL, 0);
+        KbdReply(token, 0, NULL, 0);
     } else {
-        kbd_reply(token, ERR_INVAL, NULL, 0);
+        KbdReply(token, ERR_INVAL, NULL, 0);
     }
 }
 
-static void kbd_server_loop(int port) {
+static void KbdServerLoop(int port) {
     for (;;) {
         int msg_len        = (int)sizeof(s_req_buf);
         int token          = 0;
         u64 caller_subject = 0;
         /* ipc_recv_from gives the kernel-filled unforgeable sender
          * subject — the basis for focus ownership and park routing. */
-        int ret = ipc_recv_from(port, s_req_buf, &msg_len, &token, &caller_subject);
+        int ret = IpcRecvFrom(port, s_req_buf, &msg_len, &token, &caller_subject);
         if (ret < 0) {
             printf("keyboard: ipc_recv failed (%d)\n", ret);
-            thread_exit(1);
+            ThreadExit(1);
         }
         if (msg_len < (int)KBD_REQ_HDR) {
-            kbd_reply(token, ERR_INVAL, NULL, 0);
+            KbdReply(token, ERR_INVAL, NULL, 0);
             continue;
         }
-        kbd_handle_request(token, caller_subject);
+        KbdHandleRequest(token, caller_subject);
     }
 }
 
@@ -611,9 +644,9 @@ static void kbd_server_loop(int port) {
 
 /* Wait for the PS/2 controller input buffer to drain (bit 1 of 0x64
  * clear), so a command byte written to 0x64 is not clobbered. */
-static void mouse_wait_input_ready(void) {
+static void MouseWaitInputReady(void) {
     for (int i = 0; i < 100000; i++) {
-        int st = io_read8(KBD_STATUS_PORT);
+        int st = IoRead8(KBD_STATUS_PORT);
         if (st < 0)
             return;
         if (!(st & 0x02))
@@ -626,13 +659,13 @@ static void mouse_wait_input_ready(void) {
  * programming: the byte is DISCARDED, never fed to the packet state
  * machine — an ACK would otherwise shift the 3-byte phase and corrupt
  * every subsequent mouse packet. */
-static int mouse_wait_output(void) {
+static int MouseWaitOutput(void) {
     for (int i = 0; i < 100000; i++) {
-        int st = io_read8(KBD_STATUS_PORT);
+        int st = IoRead8(KBD_STATUS_PORT);
         if (st < 0)
             return -1;
         if (st & KBD_STATUS_OBF) {
-            int c = io_read8(KBD_DATA_PORT);
+            int c = IoRead8(KBD_DATA_PORT);
             if (c < 0)
                 return -1;
             return c;
@@ -646,54 +679,54 @@ static int mouse_wait_output(void) {
  *   2. read cmd byte, set bit1 (aux IRQ) + bit5 (aux clock), write back
  *   3. 0xD4, 0xF6    send "defaults" to the mouse (it ACKs)
  *   4. 0xD4, 0xF4    enable streaming mode (it ACKs) */
-static void mouse_init(void) {
-    mouse_wait_input_ready();
-    io_write8(KBD_STATUS_PORT, 0xA8);
-    mouse_wait_input_ready();
+static void MouseInit(void) {
+    MouseWaitInputReady();
+    IoWrite8(KBD_STATUS_PORT, 0xA8);
+    MouseWaitInputReady();
 
     /* Controller command byte: enable aux IRQ + clock. */
-    io_write8(KBD_STATUS_PORT, 0x20);
-    mouse_wait_output(); /* read the current command byte */
-    int cmd = io_read8(KBD_DATA_PORT);
+    IoWrite8(KBD_STATUS_PORT, 0x20);
+    MouseWaitOutput(); /* read the current command byte */
+    int cmd = IoRead8(KBD_DATA_PORT);
     if (cmd < 0)
         return;
-    mouse_wait_input_ready();
-    io_write8(KBD_STATUS_PORT, 0x60);
-    mouse_wait_input_ready();
-    io_write8(KBD_DATA_PORT, (u8)(cmd | 0x02 | 0x20));
+    MouseWaitInputReady();
+    IoWrite8(KBD_STATUS_PORT, 0x60);
+    MouseWaitInputReady();
+    IoWrite8(KBD_DATA_PORT, (u8)(cmd | 0x02 | 0x20));
 
     /* Device defaults, then streaming on.  Each command is prefixed
      * with 0xD4 (write next byte to the aux device). */
-    mouse_wait_input_ready();
-    io_write8(KBD_STATUS_PORT, 0xD4);
-    mouse_wait_input_ready();
-    io_write8(KBD_DATA_PORT, 0xF6);
-    (void)mouse_wait_output(); /* ACK 0xFA */
+    MouseWaitInputReady();
+    IoWrite8(KBD_STATUS_PORT, 0xD4);
+    MouseWaitInputReady();
+    IoWrite8(KBD_DATA_PORT, 0xF6);
+    (void)MouseWaitOutput(); /* ACK 0xFA */
 
     /* IntelliMouse wheel enable: sample rates 200 -> 100 -> 80 switch
      * the device to 4-byte packets (0xF3 sets the rate). */
     {
         static const u8 rates[3] = {200, 100, 80};
         for (int r = 0; r < 3; r++) {
-            mouse_wait_input_ready();
-            io_write8(KBD_STATUS_PORT, 0xD4);
-            mouse_wait_input_ready();
-            io_write8(KBD_DATA_PORT, 0xF3);
-            (void)mouse_wait_output(); /* ACK */
-            mouse_wait_input_ready();
-            io_write8(KBD_STATUS_PORT, 0xD4);
-            mouse_wait_input_ready();
-            io_write8(KBD_DATA_PORT, rates[r]);
-            (void)mouse_wait_output(); /* ACK */
+            MouseWaitInputReady();
+            IoWrite8(KBD_STATUS_PORT, 0xD4);
+            MouseWaitInputReady();
+            IoWrite8(KBD_DATA_PORT, 0xF3);
+            (void)MouseWaitOutput(); /* ACK */
+            MouseWaitInputReady();
+            IoWrite8(KBD_STATUS_PORT, 0xD4);
+            MouseWaitInputReady();
+            IoWrite8(KBD_DATA_PORT, rates[r]);
+            (void)MouseWaitOutput(); /* ACK */
         }
         s_mouse_4byte = 1;
     }
 
-    mouse_wait_input_ready();
-    io_write8(KBD_STATUS_PORT, 0xD4);
-    mouse_wait_input_ready();
-    io_write8(KBD_DATA_PORT, 0xF4);
-    (void)mouse_wait_output(); /* ACK 0xFA */
+    MouseWaitInputReady();
+    IoWrite8(KBD_STATUS_PORT, 0xD4);
+    MouseWaitInputReady();
+    IoWrite8(KBD_DATA_PORT, 0xF4);
+    (void)MouseWaitOutput(); /* ACK 0xFA */
 
     /* Reset the packet assembler: the ACKs above were consumed raw, so
      * the next bytes on IRQ12 are a fresh packet starting at byte 0. */
@@ -702,41 +735,41 @@ static void mouse_init(void) {
     printf("keyboard: PS/2 mouse enabled (IRQ12)\n");
 }
 
-static void kbd_irq_main(void *arg) {
+static void KbdIrqMain(void *arg) {
     (void)arg;
 
     printf("keyboard: IRQ thread started\n");
 
-    int irq_cap = cap_create_obj(CAP_TYPE_IRQ, RIGHT_READ, KBD_IRQ);
+    int irq_cap = CapCreateObj(CAP_TYPE_IRQ, RIGHT_READ, KBD_IRQ);
     if (irq_cap < 0) {
-        printf("keyboard: cap_create(IRQ) failed (%d)\n", irq_cap);
-        thread_exit(1);
+        printf("keyboard: CapCreate(IRQ) failed (%d)\n", irq_cap);
+        ThreadExit(1);
     }
 
-    int ret = bind_irq(irq_cap, KBD_IRQ, KBD_IRQ_MASK);
+    int ret = BindIrq(irq_cap, KBD_IRQ, KBD_IRQ_MASK);
     if (ret < 0) {
-        printf("keyboard: bind_irq(%d) failed (%d)\n", KBD_IRQ, ret);
-        thread_exit(1);
+        printf("keyboard: BindIrq(%d) failed (%d)\n", KBD_IRQ, ret);
+        ThreadExit(1);
     }
     printf("keyboard: IRQ1 bound, PS/2 drain active\n");
 
     /* Bind the mouse IRQ12 as well — the drain now routes bytes by the
      * status register's device bit.  A failure is non-fatal (no mouse
      * attached): the keyboard still works. */
-    int mouse_cap = cap_create_obj(CAP_TYPE_IRQ, RIGHT_READ, MOUSE_IRQ);
+    int mouse_cap = CapCreateObj(CAP_TYPE_IRQ, RIGHT_READ, MOUSE_IRQ);
     if (mouse_cap < 0) {
         printf("keyboard: mouse cap_create failed (%d)\n", mouse_cap);
     } else {
-        ret = bind_irq(mouse_cap, MOUSE_IRQ, MOUSE_IRQ_MASK);
+        ret = BindIrq(mouse_cap, MOUSE_IRQ, MOUSE_IRQ_MASK);
         if (ret < 0)
-            printf("keyboard: bind_irq(%d) failed (%d)\n", MOUSE_IRQ, ret);
+            printf("keyboard: BindIrq(%d) failed (%d)\n", MOUSE_IRQ, ret);
         else
             printf("keyboard: IRQ12 bound, mouse drain active\n");
     }
 
     for (;;) {
-        wait_notification(KBD_IRQ_MASK | MOUSE_IRQ_MASK);
-        kbd_rx_drain();
+        WaitNotification(KBD_IRQ_MASK | MOUSE_IRQ_MASK);
+        KbdRxDrain();
 
         /* Complete a parked blocking READ if the drain routed keys into
          * its response buffer — the focus owner's entry, or the first
@@ -749,7 +782,7 @@ static void kbd_irq_main(void *arg) {
             p->resp_len        = 0;
             kbd_resp_t *parked = (kbd_resp_t *)p->buf;
             parked->ret        = (i32)n; /* header must carry the byte count */
-            int r              = ipc_reply(tok, p->buf, (int)(KBD_RESP_HDR + n));
+            int r              = IpcReply(tok, p->buf, (int)(KBD_RESP_HDR + n));
             if (r < 0)
                 printf("keyboard: parked-read ipc_reply failed (%d)\n", r);
         }
@@ -760,55 +793,55 @@ static void kbd_irq_main(void *arg) {
  * Entry point (keyboard process main)
  * ==================================================================== */
 
-static void kbd_service_main(void *arg) {
+static void KbdServiceMain(void *arg) {
     (void)arg;
 
     printf("keyboard: starting PS/2 driver service\n");
 
     /* 1. I/O-port capability: covers 0x60..0x64 (data + status). */
-    int io_cap = cap_create_obj(CAP_TYPE_IO_PORT, RIGHT_ALL, (5 << 16) | KBD_DATA_PORT);
+    int io_cap = CapCreateObj(CAP_TYPE_IO_PORT, RIGHT_ALL, (5 << 16) | KBD_DATA_PORT);
     if (io_cap < 0) {
-        printf("keyboard: cap_create(IO_PORT) failed (%d)\n", io_cap);
-        thread_exit(1);
+        printf("keyboard: CapCreate(IO_PORT) failed (%d)\n", io_cap);
+        ThreadExit(1);
     }
     printf("keyboard: caps OK (io_port=%d)\n", io_cap);
 
     /* 2. Flush any scancodes the BIOS left in the PS/2 output buffer,
      *    so stale data never masquerades as a fresh keypress. */
-    kbd_rx_drain();
+    KbdRxDrain();
 
     /* 2b. Programme the PS/2 mouse (aux interface on the same
      *     controller).  Best effort: no mouse -> the IRQ12 path simply
      *     never fires and KBD_OP_MOUSE_READ returns zeros. */
-    mouse_init();
+    MouseInit();
 
     /* 3. IPC port, registered under the well-known name "keyboard". */
-    int port = ipc_port_create();
+    int port = IpcPortCreate();
     if (port < 0) {
         printf("keyboard: ipc_port_create failed (%d)\n", port);
-        thread_exit(1);
+        ThreadExit(1);
     }
-    int ret = port_register("keyboard", port);
+    int ret = PortRegister("keyboard", port);
     if (ret < 0) {
-        printf("keyboard: port_register('keyboard') failed (%d)\n", ret);
-        thread_exit(1);
+        printf("keyboard: PortRegister('keyboard') failed (%d)\n", ret);
+        ThreadExit(1);
     }
     printf("keyboard: port %d registered as 'keyboard'\n", port);
 
     /* 4. Spawn the IRQ thread (binds IRQ1, drains + decodes 0x60). */
-    int irq_tid = thread_create(kbd_irq_main, NULL, 10);
+    int irq_tid = ThreadCreate(KbdIrqMain, NULL, 10);
     if (irq_tid < 0) {
-        printf("keyboard: thread_create(IRQ thread) failed (%d)\n", irq_tid);
-        thread_exit(1);
+        printf("keyboard: ThreadCreate(IRQ thread) failed (%d)\n", irq_tid);
+        ThreadExit(1);
     }
     printf("keyboard: IRQ thread TID=%d\n", irq_tid);
 
     /* 5. Serve clients. */
     printf("keyboard: serving on port %d\n", port);
-    kbd_server_loop(port);
+    KbdServerLoop(port);
 }
 
 int main(void) {
-    kbd_service_main(NULL);
+    KbdServiceMain(NULL);
     return 0; /* unreachable */
 }

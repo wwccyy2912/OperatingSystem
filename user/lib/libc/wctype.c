@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * wctype.c - Wide character classification and mapping (C11 §7.30)
  * Copyright (c) 2026 OpSys Project
  *
@@ -22,8 +35,8 @@ int iswalnum(wint_t wc) {
 int iswalpha(wint_t wc) {
     return (wc <= 127) ? isalpha((int)wc) : 0;
 }
-int iswblank(wint_t wc) {
-    return (wc <= 127) ? isblank((int)wc) : 0;
+int Iswblank(wint_t wc) {
+    return (wc <= 127) ? Isblank((int)wc) : 0;
 }
 int iswcntrl(wint_t wc) {
     return (wc <= 127) ? iscntrl((int)wc) : 0;
@@ -83,7 +96,7 @@ enum {
     _WC_XDIGIT
 };
 
-wctype_t wctype(const char *property) {
+wctype_t Wctype(const char *property) {
     if (property == NULL)
         return 0;
     if (strcmp(property, "alnum") == 0)
@@ -113,14 +126,14 @@ wctype_t wctype(const char *property) {
     return 0;
 }
 
-int iswctype(wint_t wc, wctype_t desc) {
+int Iswctype(wint_t wc, wctype_t desc) {
     switch (desc) {
     case _WC_ALNUM:
         return iswalnum(wc);
     case _WC_ALPHA:
         return iswalpha(wc);
     case _WC_BLANK:
-        return iswblank(wc);
+        return Iswblank(wc);
     case _WC_CNTRL:
         return iswcntrl(wc);
     case _WC_DIGIT:
@@ -153,7 +166,7 @@ enum {
     _WT_TOUPPER
 };
 
-wctrans_t wctrans(const char *property) {
+wctrans_t Wctrans(const char *property) {
     if (property == NULL)
         return 0;
     if (strcmp(property, "tolower") == 0)
@@ -163,7 +176,7 @@ wctrans_t wctrans(const char *property) {
     return 0;
 }
 
-wint_t towctrans(wint_t wc, wctrans_t desc) {
+wint_t Towctrans(wint_t wc, wctrans_t desc) {
     switch (desc) {
     case _WT_TOLOWER:
         return towlower(wc);

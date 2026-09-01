@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * vfs_server.c - VFS namespace server (ring-3, independent process)
  * Copyright (c) 2026 OpSys Project
  *
@@ -28,6 +41,27 @@
  * layer is tolerated and stripped ("/Volumes/System/x" == "System/x").
  * Path resolution walks parent-ID chains via DRV_OP_LOOKUP (Phase 0
  * simple resolution).
+ *
+ * ------------------------------------------------------------------
+ * Structure (namespace): one server loop in main() on the "vfs" port
+ *   over four static tables — s_vols (mount slots), s_handles /
+ *   s_enums (token tables) and s_bookmarks; per-op dispatch on
+ *   VFS_OP_*; drivers are reached via "vfs.fs.<driver>" (drv_req_t).
+ * How it works:
+ *   main() zeroes the tables, creates + registers the "vfs" port, then
+ *   loops IpcRecvFrom -> dispatch VFS_OP_* -> IpcReply, keeping the
+ *   unforgeable caller subject for authz/WHOAMI.  MOUNT handshakes
+ *   fill volume rows; handles/enums are random 32-bit tokens; UNMOUNT
+ *   or a dead driver drops the slot and stales its dependents.
+ * Purpose:
+ *   Holds the system-wide namespace state — names are "always
+ *   resolvable" via the server; nothing else may store paths, and
+ *   permission checks are integrated here (perm port, WHOAMI).
+ * Caveats:
+ *   Phase 0 simple resolution (parent-ID chains via DRV_OP_LOOKUP);
+ *   A2 server-spawned drivers are reserved (no code); the loop is
+ *   single-threaded and blocking.
+ * ------------------------------------------------------------------
  */
 
 #include <stdint.h>
@@ -190,7 +224,7 @@ static drv_resp_t s_drv_resp;
 
 static u32 s_rng_state;
 
-static u32 rng_next(void) {
+static u32 RngNext(void) {
     /* Simple LCG — tokens only need to be unpredictable-ish, not
      * cryptographically secure.  Seeded from time+pid at startup. */
     s_rng_state = s_rng_state * 1103515245u + 12345u;
@@ -205,7 +239,7 @@ static u32 rng_next(void) {
  * would silently alias the old Phase-2 bookmarks to the new volume.
  * Shared by VFS_OP_UNMOUNT and the lazy dead-driver cleanup below.
  */
-static void vfs_vol_drop(u32 vol_index) {
+static void VfsVolDrop(u32 vol_index) {
     if (vol_index >= MAX_VOLS || !s_vols[vol_index].mounted)
         return;
 
@@ -228,7 +262,7 @@ static void vfs_vol_drop(u32 vol_index) {
  * in s_drv_resp.ret.  The driver port is resolved lazily so mount
  * timing does not matter.
  */
-static int vfs_drv_call(u32 vol_index, drv_req_t *req, drv_resp_t *resp) {
+static int VfsDrvCall(u32 vol_index, drv_req_t *req, drv_resp_t *resp) {
     vfs_vol_t *v = &s_vols[vol_index];
     if (!v->mounted)
         return ERR_NOENT;
@@ -238,13 +272,13 @@ static int vfs_drv_call(u32 vol_index, drv_req_t *req, drv_resp_t *resp) {
         strncpy(pname, "vfs.fs.", sizeof(pname) - 1);
         pname[sizeof(pname) - 1] = '\0';
         strncat(pname, v->driver_name, sizeof(pname) - 1 - 7);
-        v->drv_port = port_get(pname);
+        v->drv_port = PortGet(pname);
         if (v->drv_port < 0)
             return v->drv_port;
     }
 
     int resp_len = (int)sizeof(*resp);
-    int ret      = ipc_call(v->drv_port, req, (int)sizeof(*req), resp, &resp_len);
+    int ret      = IpcCall(v->drv_port, req, (int)sizeof(*req), resp, &resp_len);
     if (ret < 0) {
         /* Lazy dead-driver cleanup: Phase 1 has no unmount initiator —
          * a driver process can simply die, so an IPC transport error is
@@ -257,7 +291,7 @@ static int vfs_drv_call(u32 vol_index, drv_req_t *req, drv_resp_t *resp) {
                ret);
         for (u32 i = 0; i < MAX_VOLS; i++)
             if (s_vols[i].mounted && strcmp(s_vols[i].driver_name, v->driver_name) == 0)
-                vfs_vol_drop(i);
+                VfsVolDrop(i);
     }
     return ret;
 }
@@ -283,17 +317,17 @@ static int vfs_drv_call(u32 vol_index, drv_req_t *req, drv_resp_t *resp) {
  * of it was granted.
  */
 static int
-perm_check(const vfs_resource_t *res, u32 access, const char *url, u64 subject_id, u32 *granted) {
+PermCheck(const vfs_resource_t *res, u32 access, const char *url, u64 subject_id, u32 *granted) {
     if (s_perm_port < 0) {
         /* The perm service boots CONCURRENTLY with vfs (manager spawns
          * them back-to-back).  A request that arrives before perm
          * registers its port must retry, not fail: this is a startup
          * race, and the tests exercise the live path immediately. */
         for (int i = 0; i < 200; i++) {
-            s_perm_port = port_get(PERM_PORT_NAME);
+            s_perm_port = PortGet(PERM_PORT_NAME);
             if (s_perm_port >= 0)
                 break;
-            sleep(1);
+            Sleep(1);
         }
         if (s_perm_port < 0)
             return s_perm_port;
@@ -310,7 +344,7 @@ perm_check(const vfs_resource_t *res, u32 access, const char *url, u64 subject_i
 
     perm_resp_check_t resp;
     int               resp_len = (int)sizeof(resp);
-    int               r        = ipc_call(s_perm_port, &req, (int)sizeof(req), &resp, &resp_len);
+    int               r        = IpcCall(s_perm_port, &req, (int)sizeof(req), &resp, &resp_len);
     if (r < 0)
         return r;
     if (granted)
@@ -328,7 +362,7 @@ perm_check(const vfs_resource_t *res, u32 access, const char *url, u64 subject_i
  * Returns 0, or a negative error (ERR_INVAL malformed, ERR_OVERFLOW
  * too deep).
  */
-static int vfs_parse_url(const char *url, char mount[64], char segs[][VFS_SEG_MAX], int *nsegs) {
+static int VfsParseUrl(const char *url, char mount[64], char segs[][VFS_SEG_MAX], int *nsegs) {
     const char *p = url;
     while (*p == '/')
         p++;
@@ -375,7 +409,7 @@ static int vfs_parse_url(const char *url, char mount[64], char segs[][VFS_SEG_MA
                    ((unsigned char)seg[l - 1 - back] & 0xC0) == 0x80)
                 back++;
             if (back > 0) {
-                int need = utf8_seq_len(seg + (l - 1 - back));
+                int need = Utf8SeqLen(seg + (l - 1 - back));
                 if (need == 0 || need > back + 1)
                     l -= back;
             }
@@ -397,7 +431,7 @@ static int vfs_parse_url(const char *url, char mount[64], char segs[][VFS_SEG_MA
     return 0;
 }
 
-static int vfs_find_vol(const char *mount, u32 *vol_index) {
+static int VfsFindVol(const char *mount, u32 *vol_index) {
     for (u32 i = 0; i < MAX_VOLS; i++) {
         if (s_vols[i].mounted && strcmp(s_vols[i].mount_name, mount) == 0) {
             *vol_index = i;
@@ -409,7 +443,7 @@ static int vfs_find_vol(const char *mount, u32 *vol_index) {
 
 /* Walk a segment chain from the volume root via parent-ID LOOKUPs. */
 static int
-vfs_lookup_path(u32 vol_index, char segs[][VFS_SEG_MAX], int nsegs, vfs_item_id_t *out_id) {
+VfsLookupPath(u32 vol_index, char segs[][VFS_SEG_MAX], int nsegs, vfs_item_id_t *out_id) {
     vfs_vol_t    *v   = &s_vols[vol_index];
     vfs_item_id_t cur = v->root_item_id;
 
@@ -421,7 +455,7 @@ vfs_lookup_path(u32 vol_index, char segs[][VFS_SEG_MAX], int nsegs, vfs_item_id_
         strncpy(s_drv_req.payload.name, segs[i], DRV_PATH_MAX - 1);
         s_drv_req.payload.name[DRV_PATH_MAX - 1] = '\0';
 
-        int r = vfs_drv_call(vol_index, &s_drv_req, &s_drv_resp);
+        int r = VfsDrvCall(vol_index, &s_drv_req, &s_drv_resp);
         if (r < 0)
             return r;
         if (s_drv_resp.ret < 0)
@@ -432,13 +466,13 @@ vfs_lookup_path(u32 vol_index, char segs[][VFS_SEG_MAX], int nsegs, vfs_item_id_
     return 0;
 }
 
-static int vfs_getattr(u32 vol_index, vfs_item_id_t id, vfs_item_info_t *out) {
+static int VfsGetattr(u32 vol_index, vfs_item_id_t id, vfs_item_info_t *out) {
     memset(&s_drv_req, 0, sizeof(s_drv_req));
     s_drv_req.op      = DRV_OP_GETATTR;
     s_drv_req.volume  = s_vols[vol_index].drv_vol;
     s_drv_req.item_id = id;
 
-    int r = vfs_drv_call(vol_index, &s_drv_req, &s_drv_resp);
+    int r = VfsDrvCall(vol_index, &s_drv_req, &s_drv_resp);
     if (r < 0)
         return r;
     if (s_drv_resp.ret < 0)
@@ -461,7 +495,7 @@ static vfs_handle_ent_t *handle_alloc(u32                   vol_index,
         if (!s_handles[i].in_use) {
             vfs_handle_ent_t *h = &s_handles[i];
             do {
-                h->token = rng_next();
+                h->token = RngNext();
             } while (h->token == 0);
             h->in_use     = 1;
             h->vol_index  = vol_index;
@@ -497,7 +531,7 @@ static vfs_enum_ent_t *enum_alloc(u32                   vol_index,
         if (!s_enums[i].in_use) {
             vfs_enum_ent_t *e = &s_enums[i];
             do {
-                e->token = rng_next();
+                e->token = RngNext();
             } while (e->token == 0);
             e->in_use     = 1;
             e->vol_index  = vol_index;
@@ -523,7 +557,7 @@ static vfs_bookmark_ent_t *bookmark_alloc(
         if (!s_bookmarks[i].in_use) {
             vfs_bookmark_ent_t *b = &s_bookmarks[i];
             do {
-                b->token = rng_next();
+                b->token = RngNext();
             } while (b->token == 0);
             b->in_use        = 1;
             b->vol_index     = vol_index;
@@ -545,7 +579,7 @@ static vfs_bookmark_ent_t *bookmark_alloc(
  * mac[16] stays zero (real MAC is Phase 3, docs §5 "阶段化说明");
  * validity comes from the server-side record, not the blob bytes.
  */
-static void bookmark_fill_blob(const vfs_bookmark_ent_t *b,
+static void BookmarkFillBlob(const vfs_bookmark_ent_t *b,
                                const vfs_resource_t     *res,
                                vfs_item_id_t             parent_id,
                                vfs_bookmark_t           *blob) {
@@ -567,7 +601,7 @@ static void bookmark_fill_blob(const vfs_bookmark_ent_t *b,
  * match a record (a hand-crafted blob cannot mint access).  The
  * blob carries no server-side token, so the record is found by field
  * match; identity is bound separately to the caller's ipc_recv_from
- * subject in do_resolve_bookmark (the blob's own subject field is
+ * subject in DoResolveBookmark(the blob's own subject field is
  * client-held and forgeable).  Returns the record, or NULL (blob
  * invalid).
  */
@@ -588,7 +622,7 @@ static vfs_bookmark_ent_t *bookmark_validate(const vfs_bookmark_t *blob) {
             b->access != blob->access || b->subject_id != blob->subject_id ||
             b->created_ticks != blob->created_ticks || b->expiry_ticks != blob->expiry_ticks)
             continue;
-        if (b->expiry_ticks != 0 && (u64)get_time() > b->expiry_ticks) {
+        if (b->expiry_ticks != 0 && (u64)GetTime() > b->expiry_ticks) {
             memset(b, 0, sizeof(*b)); /* expired: drop the record */
             return NULL;
         }
@@ -601,7 +635,7 @@ static vfs_bookmark_ent_t *bookmark_validate(const vfs_bookmark_t *blob) {
  * Protocol handlers (each replies via the shared s_resp buffer)
  * ==================================================================== */
 
-static void do_mount(int token, int msg_len, u64 caller_subject) {
+static void DoMount(int token, int msg_len, u64 caller_subject) {
     vfs_resp_mount_t *resp = (vfs_resp_mount_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_mount_t)) {
         resp->ret = ERR_INVAL;
@@ -666,10 +700,10 @@ static void do_mount(int token, int msg_len, u64 caller_subject) {
     resp->ret = ERR_NOMEM; /* mount table full */
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_unmount(int token, int msg_len, u64 caller_subject) {
+static void DoUnmount(int token, int msg_len, u64 caller_subject) {
     vfs_resp_unmount_t *resp = (vfs_resp_unmount_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_unmount_t)) {
         resp->ret = ERR_INVAL;
@@ -717,14 +751,14 @@ static void do_unmount(int token, int msg_len, u64 caller_subject) {
     printf("vfs: volume '%s' unmounted (driver '%s')\n",
            s_vols[vi].mount_name,
            s_vols[vi].driver_name);
-    vfs_vol_drop((u32)vi);
+    VfsVolDrop((u32)vi);
     resp->ret = 0;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_get_item(int token, int msg_len) {
+static void DoGetItem(int token, int msg_len) {
     vfs_resp_get_item_t *resp = (vfs_resp_get_item_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_get_item_t)) {
         resp->ret = ERR_INVAL;
@@ -735,26 +769,26 @@ static void do_get_item(int token, int msg_len) {
     char mount[64];
     char segs[VFS_MAX_DEPTH][VFS_SEG_MAX];
     int  nsegs;
-    int  r = vfs_parse_url(req->path, mount, segs, &nsegs);
+    int  r = VfsParseUrl(req->path, mount, segs, &nsegs);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
     u32 vi;
-    r = vfs_find_vol(mount, &vi);
+    r = VfsFindVol(mount, &vi);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
 
     vfs_item_id_t id;
-    r = vfs_lookup_path(vi, segs, nsegs, &id);
+    r = VfsLookupPath(vi, segs, nsegs, &id);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
 
-    r = vfs_getattr(vi, id, &resp->item);
+    r = VfsGetattr(vi, id, &resp->item);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -762,10 +796,10 @@ static void do_get_item(int token, int msg_len) {
     resp->ret = 0;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_create_dir(int token, int msg_len, u64 caller_subject) {
+static void DoCreateDir(int token, int msg_len, u64 caller_subject) {
     vfs_resp_create_dir_t *resp = (vfs_resp_create_dir_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_create_dir_t)) {
         resp->ret = ERR_INVAL;
@@ -776,13 +810,13 @@ static void do_create_dir(int token, int msg_len, u64 caller_subject) {
     char mount[64];
     char segs[VFS_MAX_DEPTH][VFS_SEG_MAX];
     int  nsegs;
-    int  r = vfs_parse_url(req->path, mount, segs, &nsegs);
+    int  r = VfsParseUrl(req->path, mount, segs, &nsegs);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
     u32 vi;
-    r = vfs_find_vol(mount, &vi);
+    r = VfsFindVol(mount, &vi);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -793,7 +827,7 @@ static void do_create_dir(int token, int msg_len, u64 caller_subject) {
     } /* no root mkdir */
 
     vfs_item_id_t id;
-    r = vfs_lookup_path(vi, segs, nsegs - 1, &id);
+    r = VfsLookupPath(vi, segs, nsegs - 1, &id);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -805,7 +839,7 @@ static void do_create_dir(int token, int msg_len, u64 caller_subject) {
     vfs_resource_t res;
     res.vol = s_vols[vi].uuid;
     res.id  = id;
-    r       = perm_check(&res, VFS_ACCESS_WRITE, req->path, caller_subject, NULL);
+    r       = PermCheck(&res, VFS_ACCESS_WRITE, req->path, caller_subject, NULL);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -817,7 +851,7 @@ static void do_create_dir(int token, int msg_len, u64 caller_subject) {
     s_drv_req.parent_id = id;
     strncpy(s_drv_req.payload.name, segs[nsegs - 1], DRV_PATH_MAX - 1);
     s_drv_req.payload.name[DRV_PATH_MAX - 1] = '\0';
-    r                                        = vfs_drv_call(vi, &s_drv_req, &s_drv_resp);
+    r                                        = VfsDrvCall(vi, &s_drv_req, &s_drv_resp);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -827,7 +861,7 @@ static void do_create_dir(int token, int msg_len, u64 caller_subject) {
         goto out;
     }
 
-    r = vfs_getattr(vi, s_drv_resp.u.item_id, &resp->item);
+    r = VfsGetattr(vi, s_drv_resp.u.item_id, &resp->item);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -835,10 +869,10 @@ static void do_create_dir(int token, int msg_len, u64 caller_subject) {
     resp->ret = 0;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_delete(int token, int msg_len, u64 caller_subject) {
+static void DoDelete(int token, int msg_len, u64 caller_subject) {
     vfs_resp_delete_t *resp = (vfs_resp_delete_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_delete_t)) {
         resp->ret = ERR_INVAL;
@@ -849,13 +883,13 @@ static void do_delete(int token, int msg_len, u64 caller_subject) {
     char mount[64];
     char segs[VFS_MAX_DEPTH][VFS_SEG_MAX];
     int  nsegs;
-    int  r = vfs_parse_url(req->path, mount, segs, &nsegs);
+    int  r = VfsParseUrl(req->path, mount, segs, &nsegs);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
     u32 vi;
-    r = vfs_find_vol(mount, &vi);
+    r = VfsFindVol(mount, &vi);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -866,7 +900,7 @@ static void do_delete(int token, int msg_len, u64 caller_subject) {
     } /* no root delete */
 
     vfs_item_id_t id;
-    r = vfs_lookup_path(vi, segs, nsegs, &id);
+    r = VfsLookupPath(vi, segs, nsegs, &id);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -878,7 +912,7 @@ static void do_delete(int token, int msg_len, u64 caller_subject) {
     vfs_resource_t res;
     res.vol = s_vols[vi].uuid;
     res.id  = id;
-    r       = perm_check(&res, VFS_ACCESS_WRITE, req->path, caller_subject, NULL);
+    r       = PermCheck(&res, VFS_ACCESS_WRITE, req->path, caller_subject, NULL);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -889,7 +923,7 @@ static void do_delete(int token, int msg_len, u64 caller_subject) {
     s_drv_req.volume    = s_vols[vi].drv_vol;
     s_drv_req.item_id   = id;
     s_drv_req.recursive = req->recursive;
-    r                   = vfs_drv_call(vi, &s_drv_req, &s_drv_resp);
+    r                   = VfsDrvCall(vi, &s_drv_req, &s_drv_resp);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -897,10 +931,10 @@ static void do_delete(int token, int msg_len, u64 caller_subject) {
     resp->ret = s_drv_resp.ret;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_open(int token, int msg_len, u64 caller_subject) {
+static void DoOpen(int token, int msg_len, u64 caller_subject) {
     vfs_resp_open_t *resp = (vfs_resp_open_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_open_t)) {
         resp->ret = ERR_INVAL;
@@ -911,13 +945,13 @@ static void do_open(int token, int msg_len, u64 caller_subject) {
     char mount[64];
     char segs[VFS_MAX_DEPTH][VFS_SEG_MAX];
     int  nsegs;
-    int  r = vfs_parse_url(req->path, mount, segs, &nsegs);
+    int  r = VfsParseUrl(req->path, mount, segs, &nsegs);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
     u32 vi;
-    r = vfs_find_vol(mount, &vi);
+    r = VfsFindVol(mount, &vi);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -930,7 +964,7 @@ static void do_open(int token, int msg_len, u64 caller_subject) {
 
     /* Resolve the parent directory. */
     vfs_item_id_t id;
-    r = vfs_lookup_path(vi, segs, nsegs - 1, &id);
+    r = VfsLookupPath(vi, segs, nsegs - 1, &id);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -944,7 +978,7 @@ static void do_open(int token, int msg_len, u64 caller_subject) {
     s_drv_req.parent_id = id;
     strncpy(s_drv_req.payload.name, segs[nsegs - 1], DRV_PATH_MAX - 1);
     s_drv_req.payload.name[DRV_PATH_MAX - 1] = '\0';
-    r                                        = vfs_drv_call(vi, &s_drv_req, &s_drv_resp);
+    r                                        = VfsDrvCall(vi, &s_drv_req, &s_drv_resp);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -959,7 +993,7 @@ static void do_open(int token, int msg_len, u64 caller_subject) {
             s_drv_req.parent_id = id;
             strncpy(s_drv_req.payload.name, segs[nsegs - 1], DRV_PATH_MAX - 1);
             s_drv_req.payload.name[DRV_PATH_MAX - 1] = '\0';
-            r                                        = vfs_drv_call(vi, &s_drv_req, &s_drv_resp);
+            r                                        = VfsDrvCall(vi, &s_drv_req, &s_drv_resp);
             if (r < 0) {
                 resp->ret = r;
                 goto out;
@@ -981,7 +1015,7 @@ static void do_open(int token, int msg_len, u64 caller_subject) {
      * directory target with ERR_INVAL, matching do_enum_begin's
      * file-vs-dir rule. */
     vfs_item_info_t oinfo;
-    r = vfs_getattr(vi, fid, &oinfo);
+    r = VfsGetattr(vi, fid, &oinfo);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1010,7 +1044,7 @@ static void do_open(int token, int msg_len, u64 caller_subject) {
     res.vol     = v->uuid;
     res.id      = fid;
     u32 granted = 0;
-    r           = perm_check(&res, req->access, req->path, caller_subject, &granted);
+    r           = PermCheck(&res, req->access, req->path, caller_subject, &granted);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1030,7 +1064,7 @@ static void do_open(int token, int msg_len, u64 caller_subject) {
         s_drv_req.item_id = fid;
         s_drv_req.offset  = 0;
         s_drv_req.len     = 0;
-        r                 = vfs_drv_call(vi, &s_drv_req, &s_drv_resp);
+        r                 = VfsDrvCall(vi, &s_drv_req, &s_drv_resp);
         if (r < 0) {
             resp->ret = r;
             goto out;
@@ -1049,7 +1083,7 @@ static void do_open(int token, int msg_len, u64 caller_subject) {
     }
     resp->handle = htok;
 
-    r = vfs_getattr(vi, fid, &resp->item);
+    r = VfsGetattr(vi, fid, &resp->item);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1058,10 +1092,10 @@ static void do_open(int token, int msg_len, u64 caller_subject) {
     resp->ret = 0;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_read(int token, int msg_len, u64 caller_subject) {
+static void DoRead(int token, int msg_len, u64 caller_subject) {
     vfs_resp_read_t *resp = (vfs_resp_read_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_read_t)) {
         resp->ret = ERR_INVAL;
@@ -1095,7 +1129,7 @@ static void do_read(int token, int msg_len, u64 caller_subject) {
         resp->ret = VFS_ERR_ACCESS;
         goto out;
     }
-    int r = perm_check(&h->resource, VFS_ACCESS_READ, "", h->subject_id, NULL);
+    int r = PermCheck(&h->resource, VFS_ACCESS_READ, "", h->subject_id, NULL);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1107,7 +1141,7 @@ static void do_read(int token, int msg_len, u64 caller_subject) {
     s_drv_req.item_id = h->item_id;
     s_drv_req.offset  = req->offset;
     s_drv_req.len     = req->len;
-    r                 = vfs_drv_call(h->vol_index, &s_drv_req, &s_drv_resp);
+    r                 = VfsDrvCall(h->vol_index, &s_drv_req, &s_drv_resp);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1122,10 +1156,10 @@ static void do_read(int token, int msg_len, u64 caller_subject) {
     resp->ret = n;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_write(int token, int msg_len, u64 caller_subject) {
+static void DoWrite(int token, int msg_len, u64 caller_subject) {
     vfs_resp_write_t *resp = (vfs_resp_write_t *)s_resp;
     if (msg_len < (int)sizeof(u32) * 3 + (int)sizeof(u64)) { /* header */
         resp->ret = ERR_INVAL;
@@ -1158,7 +1192,7 @@ static void do_write(int token, int msg_len, u64 caller_subject) {
         resp->ret = VFS_ERR_ACCESS;
         goto out;
     }
-    int r = perm_check(&h->resource, VFS_ACCESS_WRITE, "", h->subject_id, NULL);
+    int r = PermCheck(&h->resource, VFS_ACCESS_WRITE, "", h->subject_id, NULL);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1171,7 +1205,7 @@ static void do_write(int token, int msg_len, u64 caller_subject) {
     s_drv_req.offset  = req->offset;
     s_drv_req.len     = req->len;
     memcpy(s_drv_req.payload.data, req->data, req->len);
-    r = vfs_drv_call(h->vol_index, &s_drv_req, &s_drv_resp);
+    r = VfsDrvCall(h->vol_index, &s_drv_req, &s_drv_resp);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1184,10 +1218,10 @@ static void do_write(int token, int msg_len, u64 caller_subject) {
     resp->ret = s_drv_resp.ret;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_close(int token, int msg_len, u64 caller_subject) {
+static void DoClose(int token, int msg_len, u64 caller_subject) {
     vfs_resp_close_t *resp = (vfs_resp_close_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_close_t)) {
         resp->ret = ERR_INVAL;
@@ -1223,10 +1257,10 @@ static void do_close(int token, int msg_len, u64 caller_subject) {
     resp->ret = VFS_ERR_STALE;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_enum_begin(int token, int msg_len, u64 caller_subject) {
+static void DoEnumBegin(int token, int msg_len, u64 caller_subject) {
     vfs_resp_enum_begin_t *resp = (vfs_resp_enum_begin_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_enum_begin_t)) {
         resp->ret = ERR_INVAL;
@@ -1237,27 +1271,27 @@ static void do_enum_begin(int token, int msg_len, u64 caller_subject) {
     char mount[64];
     char segs[VFS_MAX_DEPTH][VFS_SEG_MAX];
     int  nsegs;
-    int  r = vfs_parse_url(req->path, mount, segs, &nsegs);
+    int  r = VfsParseUrl(req->path, mount, segs, &nsegs);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
     u32 vi;
-    r = vfs_find_vol(mount, &vi);
+    r = VfsFindVol(mount, &vi);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
 
     vfs_item_id_t id;
-    r = vfs_lookup_path(vi, segs, nsegs, &id);
+    r = VfsLookupPath(vi, segs, nsegs, &id);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
 
     vfs_item_info_t info;
-    r = vfs_getattr(vi, id, &info);
+    r = VfsGetattr(vi, id, &info);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1274,7 +1308,7 @@ static void do_enum_begin(int token, int msg_len, u64 caller_subject) {
     vfs_resource_t res;
     res.vol = s_vols[vi].uuid;
     res.id  = id;
-    r       = perm_check(&res, VFS_ACCESS_READ, req->path, caller_subject, NULL);
+    r       = PermCheck(&res, VFS_ACCESS_READ, req->path, caller_subject, NULL);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1289,10 +1323,10 @@ static void do_enum_begin(int token, int msg_len, u64 caller_subject) {
     resp->ret    = 0;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_enum_next(int token, int msg_len, u64 caller_subject) {
+static void DoEnumNext(int token, int msg_len, u64 caller_subject) {
     vfs_resp_enum_next_t *resp = (vfs_resp_enum_next_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_enum_next_t)) {
         resp->ret = ERR_INVAL;
@@ -1320,7 +1354,7 @@ static void do_enum_next(int token, int msg_len, u64 caller_subject) {
         resp->ret = VFS_ERR_ACCESS;
         goto out;
     }
-    int r = perm_check(&e->resource, VFS_ACCESS_READ, "", e->subject_id, NULL);
+    int r = PermCheck(&e->resource, VFS_ACCESS_READ, "", e->subject_id, NULL);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1331,7 +1365,7 @@ static void do_enum_next(int token, int msg_len, u64 caller_subject) {
     s_drv_req.volume    = s_vols[e->vol_index].drv_vol;
     s_drv_req.parent_id = e->dir_id;
     s_drv_req.from      = e->from;
-    r                   = vfs_drv_call(e->vol_index, &s_drv_req, &s_drv_resp);
+    r                   = VfsDrvCall(e->vol_index, &s_drv_req, &s_drv_resp);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1348,10 +1382,10 @@ static void do_enum_next(int token, int msg_len, u64 caller_subject) {
     resp->ret = (i32)resp->count;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_stat_volume(int token, int msg_len) {
+static void DoStatVolume(int token, int msg_len) {
     vfs_resp_stat_volume_t *resp = (vfs_resp_stat_volume_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_stat_volume_t)) {
         resp->ret = ERR_INVAL;
@@ -1362,13 +1396,13 @@ static void do_stat_volume(int token, int msg_len) {
     char mount[64];
     char segs[VFS_MAX_DEPTH][VFS_SEG_MAX];
     int  nsegs;
-    int  r = vfs_parse_url(req->path, mount, segs, &nsegs);
+    int  r = VfsParseUrl(req->path, mount, segs, &nsegs);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
     u32 vi;
-    r = vfs_find_vol(mount, &vi);
+    r = VfsFindVol(mount, &vi);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1377,7 +1411,7 @@ static void do_stat_volume(int token, int msg_len) {
     memset(&s_drv_req, 0, sizeof(s_drv_req));
     s_drv_req.op     = DRV_OP_STAT;
     s_drv_req.volume = s_vols[vi].drv_vol;
-    r                = vfs_drv_call(vi, &s_drv_req, &s_drv_resp);
+    r                = VfsDrvCall(vi, &s_drv_req, &s_drv_resp);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1393,13 +1427,13 @@ static void do_stat_volume(int token, int msg_len) {
     resp->ret         = 0;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* VFS_OP_LIST_VOLUMES — enumerate currently-mounted volumes.  There is
  * no root item to enum_begin("/") on: URLs start at a volume name, so
  * the "/" root view is served from the mount table itself. */
-static void do_list_volumes(int token, int msg_len) {
+static void DoListVolumes(int token, int msg_len) {
     vfs_resp_list_volumes_t *resp = (vfs_resp_list_volumes_t *)s_resp;
     (void)msg_len;
     resp->ret   = 0;
@@ -1418,7 +1452,7 @@ static void do_list_volumes(int token, int msg_len) {
         resp->vols[resp->count].read_only = s_vols[i].read_only;
         resp->count++;
     }
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* ====================================================================
@@ -1435,7 +1469,7 @@ static void do_list_volumes(int token, int msg_len) {
  *                returns -EACCES (record gone ⇒ VFS_ERR_ACCESS).
  * ==================================================================== */
 
-static void do_create_bookmark(int token, int msg_len, u64 subject_id) {
+static void DoCreateBookmark(int token, int msg_len, u64 subject_id) {
     vfs_resp_create_bookmark_t *resp = (vfs_resp_create_bookmark_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_create_bookmark_t)) {
         resp->ret = ERR_INVAL;
@@ -1446,27 +1480,27 @@ static void do_create_bookmark(int token, int msg_len, u64 subject_id) {
     char mount[64];
     char segs[VFS_MAX_DEPTH][VFS_SEG_MAX];
     int  nsegs;
-    int  r = vfs_parse_url(req->path, mount, segs, &nsegs);
+    int  r = VfsParseUrl(req->path, mount, segs, &nsegs);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
     u32 vi;
-    r = vfs_find_vol(mount, &vi);
+    r = VfsFindVol(mount, &vi);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
 
     vfs_item_id_t id;
-    r = vfs_lookup_path(vi, segs, nsegs, &id);
+    r = VfsLookupPath(vi, segs, nsegs, &id);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
 
     vfs_item_info_t info;
-    r = vfs_getattr(vi, id, &info);
+    r = VfsGetattr(vi, id, &info);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1474,7 +1508,7 @@ static void do_create_bookmark(int token, int msg_len, u64 subject_id) {
 
     /* Authorization gate (Powerbox): denied ⇒ -EACCES (VFS_ERR_ACCESS),
      * with a pending query + UI_SHOW pushed by the perm-manager.  The
-     * subject is the real requester from ipc_recv_from (unforgeable).
+     * subject is the real requester from IpcRecvFrom(unforgeable).
      * P2 抹位: the bookmark stores ONLY the granted bits (a READ-only
      * grant can never mint a WRITE-carrying bookmark). */
     vfs_resource_t res;
@@ -1482,7 +1516,7 @@ static void do_create_bookmark(int token, int msg_len, u64 subject_id) {
     res.vol     = s_vols[vi].uuid;
     res.id      = id;
     u32 granted = 0;
-    r           = perm_check(&res, req->access, req->path, subject_id, &granted);
+    r           = PermCheck(&res, req->access, req->path, subject_id, &granted);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1492,7 +1526,7 @@ static void do_create_bookmark(int token, int msg_len, u64 subject_id) {
 
     u32                 tok;
     vfs_bookmark_ent_t *b =
-        bookmark_alloc(vi, id, granted, subject_id, (u64)get_time(), req->expiry_ticks, &tok);
+        bookmark_alloc(vi, id, granted, subject_id, (u64)GetTime(), req->expiry_ticks, &tok);
     if (!b) {
         resp->ret = ERR_NOMEM;
         goto out;
@@ -1502,17 +1536,17 @@ static void do_create_bookmark(int token, int msg_len, u64 subject_id) {
     b->name[sizeof(b->name) - 1] = '\0';
 
     vfs_bookmark_t blob;
-    bookmark_fill_blob(b, &res, info.parent_id, &blob);
+    BookmarkFillBlob(b, &res, info.parent_id, &blob);
 
     resp->bk_len = (u32)sizeof(blob);
     memcpy(resp->data, &blob, sizeof(blob));
     resp->ret = 0;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_resolve_bookmark(int token, int msg_len, u64 subject_id) {
+static void DoResolveBookmark(int token, int msg_len, u64 subject_id) {
     vfs_resp_resolve_bookmark_t *resp = (vfs_resp_resolve_bookmark_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_resolve_bookmark_t)) {
         resp->ret = ERR_INVAL;
@@ -1547,7 +1581,7 @@ static void do_resolve_bookmark(int token, int msg_len, u64 subject_id) {
 
     /* Locate the item.  itemID is stable across DRV_OP_MOVE, but a
      * driver may re-ID on move (copy+delete): fall back to the
-     * parent_id chain + stored name (design §5: "用 parent_id 链重新
+     * parent_id chain + stored name(design §5: "用 parent_id 链重新
      * 定位").  The relocated id is used for THIS resolve only — the
      * record's item_id stays anchored to the original id so the
      * client's blob (carrying the original resource.id) keeps matching
@@ -1556,7 +1590,7 @@ static void do_resolve_bookmark(int token, int msg_len, u64 subject_id) {
      * the second resolve onward. */
     vfs_item_id_t live_id = b->item_id;
     vfs_item_info_t info;
-    int             r = vfs_getattr(b->vol_index, live_id, &info);
+    int             r = VfsGetattr(b->vol_index, live_id, &info);
     if (r == ERR_NOENT && b->parent_id != 0) {
         memset(&s_drv_req, 0, sizeof(s_drv_req));
         s_drv_req.op        = DRV_OP_LOOKUP;
@@ -1564,10 +1598,10 @@ static void do_resolve_bookmark(int token, int msg_len, u64 subject_id) {
         s_drv_req.parent_id = b->parent_id;
         strncpy(s_drv_req.payload.name, b->name, DRV_PATH_MAX - 1);
         s_drv_req.payload.name[DRV_PATH_MAX - 1] = '\0';
-        int r2 = vfs_drv_call(b->vol_index, &s_drv_req, &s_drv_resp);
+        int r2 = VfsDrvCall(b->vol_index, &s_drv_req, &s_drv_resp);
         if (r2 >= 0 && s_drv_resp.ret >= 0) {
             live_id = s_drv_resp.u.item_id;
-            r       = vfs_getattr(b->vol_index, live_id, &info);
+            r       = VfsGetattr(b->vol_index, live_id, &info);
         }
     }
     if (r < 0) {
@@ -1584,7 +1618,7 @@ static void do_resolve_bookmark(int token, int msg_len, u64 subject_id) {
     res.vol = s_vols[b->vol_index].uuid;
     res.id  = live_id;
     u32 granted = 0;
-    r           = perm_check(&res, b->access, "", subject_id, &granted);
+    r           = PermCheck(&res, b->access, "", subject_id, &granted);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1606,10 +1640,10 @@ static void do_resolve_bookmark(int token, int msg_len, u64 subject_id) {
     resp->ret    = 0;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_revoke_bookmark(int token, int msg_len, u64 caller_subject) {
+static void DoRevokeBookmark(int token, int msg_len, u64 caller_subject) {
     vfs_resp_revoke_bookmark_t *resp = (vfs_resp_revoke_bookmark_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_revoke_bookmark_t)) {
         resp->ret = ERR_INVAL;
@@ -1640,7 +1674,7 @@ static void do_revoke_bookmark(int token, int msg_len, u64 caller_subject) {
     resp->ret = 0; /* idempotent: revoke is revoke */
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* ====================================================================
@@ -1652,7 +1686,7 @@ out:
  * 仍有效」的地基), so existing bookmarks keep working after a move.
  * ==================================================================== */
 
-static void do_move(int token, int msg_len, u64 caller_subject) {
+static void DoMove(int token, int msg_len, u64 caller_subject) {
     vfs_resp_move_t *resp = (vfs_resp_move_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_move_t)) {
         resp->ret = ERR_INVAL;
@@ -1663,24 +1697,24 @@ static void do_move(int token, int msg_len, u64 caller_subject) {
     /* Source item. (scratch buffers are file-scope statics — see top of
      * file: do_move's 4 KB segment arrays don't fit the 4 KB user stack) */
     int snsegs, dnsegs;
-    int r = vfs_parse_url(req->src, s_mount, s_segs, &snsegs);
+    int r = VfsParseUrl(req->src, s_mount, s_segs, &snsegs);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
-    r = vfs_parse_url(req->dst_dir, d_mount, d_segs, &dnsegs);
+    r = VfsParseUrl(req->dst_dir, d_mount, d_segs, &dnsegs);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
 
     u32 svi, dvi;
-    r = vfs_find_vol(s_mount, &svi);
+    r = VfsFindVol(s_mount, &svi);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
-    r = vfs_find_vol(d_mount, &dvi);
+    r = VfsFindVol(d_mount, &dvi);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1691,7 +1725,7 @@ static void do_move(int token, int msg_len, u64 caller_subject) {
     }
 
     vfs_item_id_t sid;
-    r = vfs_lookup_path(svi, s_segs, snsegs, &sid);
+    r = VfsLookupPath(svi, s_segs, snsegs, &sid);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1702,14 +1736,14 @@ static void do_move(int token, int msg_len, u64 caller_subject) {
     }
 
     vfs_item_id_t did;
-    r = vfs_lookup_path(dvi, d_segs, dnsegs, &did);
+    r = VfsLookupPath(dvi, d_segs, dnsegs, &did);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
 
     vfs_item_info_t dinfo;
-    r = vfs_getattr(dvi, did, &dinfo);
+    r = VfsGetattr(dvi, did, &dinfo);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1726,14 +1760,14 @@ static void do_move(int token, int msg_len, u64 caller_subject) {
     vfs_resource_t res;
     res.vol = s_vols[svi].uuid;
     res.id  = sid;
-    r       = perm_check(&res, VFS_ACCESS_WRITE, req->src, caller_subject, NULL);
+    r       = PermCheck(&res, VFS_ACCESS_WRITE, req->src, caller_subject, NULL);
     if (r < 0) {
         resp->ret = r;
         goto out;
     }
     res.vol = s_vols[dvi].uuid;
     res.id  = did;
-    r       = perm_check(&res, VFS_ACCESS_WRITE, req->dst_dir, caller_subject, NULL);
+    r       = PermCheck(&res, VFS_ACCESS_WRITE, req->dst_dir, caller_subject, NULL);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1748,7 +1782,7 @@ static void do_move(int token, int msg_len, u64 caller_subject) {
         strncpy(s_drv_req.payload.name, req->new_name, DRV_PATH_MAX - 1);
         s_drv_req.payload.name[DRV_PATH_MAX - 1] = '\0';
     }
-    r = vfs_drv_call(svi, &s_drv_req, &s_drv_resp);
+    r = VfsDrvCall(svi, &s_drv_req, &s_drv_resp);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1758,7 +1792,7 @@ static void do_move(int token, int msg_len, u64 caller_subject) {
         goto out;
     }
 
-    r = vfs_getattr(svi, sid, &resp->item);
+    r = VfsGetattr(svi, sid, &resp->item);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1766,7 +1800,7 @@ static void do_move(int token, int msg_len, u64 caller_subject) {
     resp->ret = 0;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* WHOAMI — P1 地基: a client asks the service layer for its
@@ -1775,12 +1809,12 @@ out:
  * the subject comes from THIS server's ipc_recv_from, never from the
  * request bytes. */
 /* VFS_OP_READ_MAP — Phase 3 zero-copy read.  The caller's read
- * authorization is re-checked exactly like do_read (handle owner +
+ * authorization is re-checked exactly like DoRead(handle owner +
  * live perm_check); the file's pool-backed physical range is then
  * mapped READ-ONLY into the caller's address space via SYS_SHM_MAP.
  * Returns the mapped size, or ERR_NOENT when the file is not
  * pool-backed (client falls back to chunked reads). */
-static void do_read_map(int token, int msg_len, u64 caller_subject) {
+static void DoReadMap(int token, int msg_len, u64 caller_subject) {
     vfs_resp_read_map_t *resp = (vfs_resp_read_map_t *)s_resp;
     if (msg_len < (int)sizeof(vfs_req_read_map_t)) {
         resp->ret = ERR_INVAL;
@@ -1807,7 +1841,7 @@ static void do_read_map(int token, int msg_len, u64 caller_subject) {
         resp->ret = VFS_ERR_ACCESS;
         goto out;
     }
-    int r = perm_check(&h->resource, VFS_ACCESS_READ, "", h->subject_id, NULL);
+    int r = PermCheck(&h->resource, VFS_ACCESS_READ, "", h->subject_id, NULL);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1818,7 +1852,7 @@ static void do_read_map(int token, int msg_len, u64 caller_subject) {
     s_drv_req.op      = DRV_OP_PHYS_RANGE;
     s_drv_req.volume  = s_vols[h->vol_index].drv_vol;
     s_drv_req.item_id = h->item_id;
-    r                 = vfs_drv_call(h->vol_index, &s_drv_req, &s_drv_resp);
+    r                 = VfsDrvCall(h->vol_index, &s_drv_req, &s_drv_resp);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1830,7 +1864,7 @@ static void do_read_map(int token, int msg_len, u64 caller_subject) {
 
     /* Map the pool pages READ-ONLY into the caller. */
     u32 pages = (s_drv_resp.u.pr.size + PAGE_SIZE - 1) / PAGE_SIZE;
-    r         = shm_map(s_drv_resp.u.pr.phys_base, pages, caller_subject, req->map_virt);
+    r         = ShmMap(s_drv_resp.u.pr.phys_base, pages, caller_subject, req->map_virt);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1838,84 +1872,84 @@ static void do_read_map(int token, int msg_len, u64 caller_subject) {
     resp->ret = (i32)s_drv_resp.u.pr.size;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* VFS_OP_WHOAMI — report the CALLER's kernel-issued subject_id.  Proxies
  * SYS_GET_SUBJECT through the trusted server (sandboxed clients never
  * talk to the kernel directly); the subject comes from THIS server's
  * ipc_recv_from, never from the request bytes. */
-static void do_whoami(int token, int msg_len, u64 subject_id) {
+static void DoWhoami(int token, int msg_len, u64 subject_id) {
     vfs_resp_whoami_t *resp = (vfs_resp_whoami_t *)s_resp;
     (void)msg_len;
     resp->ret        = 0;
     resp->subject_id = subject_id;
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void vfs_handle_request(int token, u32 op, int msg_len, u64 caller_subject) {
+static void VfsHandleRequest(int token, u32 op, int msg_len, u64 caller_subject) {
     switch (op) {
     case VFS_OP_GET_ITEM:
-        do_get_item(token, msg_len);
+        DoGetItem(token, msg_len);
         break;
     case VFS_OP_CREATE_DIR:
-        do_create_dir(token, msg_len, caller_subject);
+        DoCreateDir(token, msg_len, caller_subject);
         break;
     case VFS_OP_DELETE_ITEM:
-        do_delete(token, msg_len, caller_subject);
+        DoDelete(token, msg_len, caller_subject);
         break;
     case VFS_OP_OPEN_ITEM:
-        do_open(token, msg_len, caller_subject);
+        DoOpen(token, msg_len, caller_subject);
         break;
     case VFS_OP_READ:
-        do_read(token, msg_len, caller_subject);
+        DoRead(token, msg_len, caller_subject);
         break;
     case VFS_OP_READ_MAP:
-        do_read_map(token, msg_len, caller_subject);
+        DoReadMap(token, msg_len, caller_subject);
         break;
     case VFS_OP_WRITE:
-        do_write(token, msg_len, caller_subject);
+        DoWrite(token, msg_len, caller_subject);
         break;
     case VFS_OP_CLOSE:
-        do_close(token, msg_len, caller_subject);
+        DoClose(token, msg_len, caller_subject);
         break;
     case VFS_OP_ENUM_BEGIN:
-        do_enum_begin(token, msg_len, caller_subject);
+        DoEnumBegin(token, msg_len, caller_subject);
         break;
     case VFS_OP_ENUM_NEXT:
-        do_enum_next(token, msg_len, caller_subject);
+        DoEnumNext(token, msg_len, caller_subject);
         break;
     case VFS_OP_MOUNT:
-        do_mount(token, msg_len, caller_subject);
+        DoMount(token, msg_len, caller_subject);
         break;
     case VFS_OP_UNMOUNT:
-        do_unmount(token, msg_len, caller_subject);
+        DoUnmount(token, msg_len, caller_subject);
         break;
     case VFS_OP_STAT_VOLUME:
-        do_stat_volume(token, msg_len);
+        DoStatVolume(token, msg_len);
         break;
     case VFS_OP_CREATE_BOOKMARK:
-        do_create_bookmark(token, msg_len, caller_subject);
+        DoCreateBookmark(token, msg_len, caller_subject);
         break;
     case VFS_OP_RESOLVE_BOOKMARK:
-        do_resolve_bookmark(token, msg_len, caller_subject);
+        DoResolveBookmark(token, msg_len, caller_subject);
         break;
     case VFS_OP_REVOKE_BOOKMARK:
-        do_revoke_bookmark(token, msg_len, caller_subject);
+        DoRevokeBookmark(token, msg_len, caller_subject);
         break;
     case VFS_OP_MOVE:
-        do_move(token, msg_len, caller_subject);
+        DoMove(token, msg_len, caller_subject);
         break;
     case VFS_OP_WHOAMI:
-        do_whoami(token, msg_len, caller_subject);
+        DoWhoami(token, msg_len, caller_subject);
         break;
     case VFS_OP_LIST_VOLUMES:
-        do_list_volumes(token, msg_len);
+        DoListVolumes(token, msg_len);
         break;
     default: {
         i32 *resp = (i32 *)s_resp;
         *resp     = ERR_INVAL;
-        (void)ipc_reply(token, resp, (int)sizeof(i32));
+        (void)IpcReply(token, resp, (int)sizeof(i32));
         break;
     }
     }
@@ -1939,17 +1973,17 @@ int main(void) {
     memset(s_enums, 0, sizeof(s_enums));
     memset(s_bookmarks, 0, sizeof(s_bookmarks));
     s_perm_port = -1;
-    s_rng_state = (u32)get_time() ^ ((u32)get_pid() << 16) ^ 0x9e3779b9u;
+    s_rng_state = (u32)GetTime() ^ ((u32)GetPid() << 16) ^ 0x9e3779b9u;
 
-    int port = ipc_port_create();
+    int port = IpcPortCreate();
     if (port < 0) {
         printf("vfs: ipc_port_create failed (%d)\n", port);
-        thread_exit(1);
+        ThreadExit(1);
     }
-    int ret = port_register("vfs", port);
+    int ret = PortRegister("vfs", port);
     if (ret < 0) {
-        printf("vfs: port_register('vfs') failed (%d)\n", ret);
-        thread_exit(1);
+        printf("vfs: PortRegister('vfs') failed (%d)\n", ret);
+        ThreadExit(1);
     }
     printf("vfs: port %d registered as 'vfs'\n", port);
 
@@ -1964,18 +1998,18 @@ int main(void) {
         /* P1 地基: ipc_recv_from gives the kernel-filled unforgeable
          * sender subject — the basis for every authz decision and for
          * the WHOAMI op. */
-        ret = ipc_recv_from(port, s_req, &msg_len, &token, &caller_subject);
+        ret = IpcRecvFrom(port, s_req, &msg_len, &token, &caller_subject);
         if (ret < 0) {
             printf("vfs: ipc_recv failed (%d)\n", ret);
-            thread_exit(1);
+            ThreadExit(1);
         }
         if (msg_len < (int)sizeof(u32)) { /* no op code */
             i32 *resp = (i32 *)s_resp;
             *resp     = ERR_INVAL;
-            (void)ipc_reply(token, resp, (int)sizeof(i32));
+            (void)IpcReply(token, resp, (int)sizeof(i32));
             continue;
         }
         u32 op = *(u32 *)s_req;
-        vfs_handle_request(token, op, msg_len, caller_subject);
+        VfsHandleRequest(token, op, msg_len, caller_subject);
     }
 }

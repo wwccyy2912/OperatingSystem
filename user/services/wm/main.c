@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * wm.c - Window Manager service (v0.4)
  * Copyright (c) 2026 OpSys Project
  *
@@ -25,6 +38,27 @@
  *
  * Spawned by the manager before the shell; idles (no focus, no screen
  * changes) until a client calls ACTIVATE.
+ *
+ * ------------------------------------------------------------------
+ * Structure (WmMain):
+ *   main() spawns two threads:
+ *     WmServerMain   "wm" port, ipc_recv_from, applies registry ops
+ *     WmInputMain    TAKE_FOCUS, reads keys, focus/move/quit
+ *   window registry (title, geometry, body buffer, owner subject)
+ *   compositor -> term service (focused window drawn last, '*')
+ *   registry + compositing serialized on s_lock
+ * How it works:
+ *   Clients create/mutate windows over the "wm" port; mutation ops are
+ *   gated to the owning subject or an admin caller.  Every change
+ *   recomposites through the term service; the input thread drives the
+ *   desktop (1-9 focus, h/j/k/l move, q quit) while the session is on.
+ * Purpose:
+ *   Character-cell window manager: owns the DESKTOP window registry,
+ *   term-backed compositing, and keyboard input routing for clients.
+ * Caveats:
+ *   Never maps the framebuffer — a pure IPC client of term.  Idles
+ *   (no focus, no screen changes) until a client calls ACTIVATE.
+ * ------------------------------------------------------------------
  */
 
 #include "wm.h"
@@ -74,15 +108,15 @@ static int      s_lock;      /* registry + compositor mutex */
 
 static int s_kbd_port = -2; /* -2 unresolved, -1 failed, >=0 port */
 
-static int wm_kbd_get(void) {
+static int WmKbdGet(void) {
     if (s_kbd_port >= -1)
         return s_kbd_port;
-    s_kbd_port = port_get("keyboard");
+    s_kbd_port = PortGet("keyboard");
     return s_kbd_port;
 }
 
-static int wm_kbd_req(u32 op, u8 *key) {
-    int port = wm_kbd_get();
+static int WmKbdReq(u32 op, u8 *key) {
+    int port = WmKbdGet();
     if (port < 0)
         return -1;
     u32 req[2]; /* { op; len } */
@@ -90,7 +124,7 @@ static int wm_kbd_req(u32 op, u8 *key) {
     req[0] = op;
     req[1] = 1;
     int resp_len = (int)sizeof(resp);
-    if (ipc_call(port, req, 8, resp, &resp_len) < 0 || resp_len < 4)
+    if (IpcCall(port, req, 8, resp, &resp_len) < 0 || resp_len < 4)
         return -1;
     if (key)
         *key = resp[4];
@@ -108,7 +142,7 @@ static wm_win_t *win_find(u32 id) {
     return NULL;
 }
 
-static int win_count(void) {
+static int WinCount(void) {
     int n = 0;
     for (int i = 0; i < WM_MAX_WINDOWS; i++)
         if (s_wins[i].in_use)
@@ -119,18 +153,18 @@ static int win_count(void) {
 /* Is the caller allowed to mutate win w?  Owner, or admin (SERVICE_MANAGE
  * atom — the user account service grants OWNER/ADMIN roles; a management
  * caller may manage any window). */
-static int win_can_mutate(const wm_win_t *w, u64 caller) {
+static int WinCanMutate(const wm_win_t *w, u64 caller) {
     if (w->owner == caller)
         return 1;
-    return cap_has_atom(caller, ATOM_SERVICE_MANAGE) == 1;
+    return CapHasAtom(caller, ATOM_SERVICE_MANAGE) == 1;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Compositor (renders through term — the display owner)             */
 /* ------------------------------------------------------------------ */
 
-static void wm_composite(void) {
-    tui_clear();
+static void WmComposite(void) {
+    TuiClear();
     for (int i = 0; i < WM_MAX_WINDOWS; i++) {
         if (!s_wins[i].in_use)
             continue;
@@ -150,7 +184,7 @@ static void wm_composite(void) {
         char title[WM_TITLE_MAX + 4];
         int  focused = (w->win_id == s_focus);
         snprintf(title, sizeof(title), "%c %s", focused ? '*' : ' ', w->title);
-        tui_render_box(w->x, w->y, cw, ch, title);
+        TuiRenderBox(w->x, w->y, cw, ch, title);
 
         /* Body rows (clamped to the box interior). */
         u32 rows = (ch >= 3) ? ch - 2 : 0;
@@ -159,7 +193,7 @@ static void wm_composite(void) {
             if (tlen > cw - 2)
                 tlen = cw - 2;
             if (tlen > 0)
-                tui_render_line_at(w->x + 1, w->y + 1 + r, w->body[r], tlen);
+                TuiRenderLineAt(w->x + 1, w->y + 1 + r, w->body[r], tlen);
         }
     }
 
@@ -168,19 +202,19 @@ static void wm_composite(void) {
         wm_win_t *f = win_find(s_focus);
         snprintf(st, sizeof(st),
                  "wm: %d window(s) - focus %s (1-9 focus, hjkl move, q quit)",
-                 win_count(), f ? f->title : "?");
+                 WinCount(), f ? f->title : "?");
     } else {
         snprintf(st, sizeof(st), "wm: %d window(s) - 1-9 focus, hjkl move, q quit",
-                 win_count());
+                 WinCount());
     }
-    tui_render_status("System", st);
+    TuiRenderStatus("System", st);
 }
 
 /* ------------------------------------------------------------------ */
 /*  Server thread: IPC ops                                            */
 /* ------------------------------------------------------------------ */
 
-static void wm_apply_create(wm_req_t *req, wm_resp_t *resp, u64 caller) {
+static void WmApplyCreate(wm_req_t *req, wm_resp_t *resp, u64 caller) {
     req->title[WM_TITLE_MAX - 1] = '\0';
     u32 w = req->w, h = req->h;
     if (w < 4)
@@ -222,13 +256,13 @@ static void wm_apply_create(wm_req_t *req, wm_resp_t *resp, u64 caller) {
     resp->win_id = n->win_id;
 }
 
-static void wm_apply_destroy(wm_req_t *req, wm_resp_t *resp, u64 caller) {
+static void WmApplyDestroy(wm_req_t *req, wm_resp_t *resp, u64 caller) {
     wm_win_t *w = win_find(req->win_id);
     if (!w) {
         resp->ret = -4; /* ERR_NOENT */
         return;
     }
-    if (!win_can_mutate(w, caller)) {
+    if (!WinCanMutate(w, caller)) {
         resp->ret = -9; /* ERR_DENIED */
         return;
     }
@@ -238,7 +272,7 @@ static void wm_apply_destroy(wm_req_t *req, wm_resp_t *resp, u64 caller) {
     resp->ret = 0;
 }
 
-static void wm_apply_list(wm_resp_t *resp) {
+static void WmApplyList(wm_resp_t *resp) {
     resp->count = 0;
     for (int i = 0; i < WM_MAX_WINDOWS; i++) {
         if (!s_wins[i].in_use)
@@ -252,7 +286,7 @@ static void wm_apply_list(wm_resp_t *resp) {
     resp->ret = 0;
 }
 
-static void wm_apply_focus(wm_req_t *req, wm_resp_t *resp) {
+static void WmApplyFocus(wm_req_t *req, wm_resp_t *resp) {
     if (req->win_id != 0 && !win_find(req->win_id)) {
         resp->ret = -4; /* ERR_NOENT */
         return;
@@ -261,13 +295,13 @@ static void wm_apply_focus(wm_req_t *req, wm_resp_t *resp) {
     resp->ret = 0;
 }
 
-static void wm_apply_move(wm_req_t *req, wm_resp_t *resp, u64 caller) {
+static void WmApplyMove(wm_req_t *req, wm_resp_t *resp, u64 caller) {
     wm_win_t *w = win_find(req->win_id);
     if (!w) {
         resp->ret = -4;
         return;
     }
-    if (!win_can_mutate(w, caller)) {
+    if (!WinCanMutate(w, caller)) {
         resp->ret = -9;
         return;
     }
@@ -286,13 +320,13 @@ static void wm_apply_move(wm_req_t *req, wm_resp_t *resp, u64 caller) {
     resp->ret = 0;
 }
 
-static void wm_apply_write(wm_req_t *req, wm_resp_t *resp, u64 caller) {
+static void WmApplyWrite(wm_req_t *req, wm_resp_t *resp, u64 caller) {
     wm_win_t *w = win_find(req->win_id);
     if (!w) {
         resp->ret = -4;
         return;
     }
-    if (!win_can_mutate(w, caller)) {
+    if (!WinCanMutate(w, caller)) {
         resp->ret = -9;
         return;
     }
@@ -312,37 +346,37 @@ static void wm_apply_write(wm_req_t *req, wm_resp_t *resp, u64 caller) {
     resp->ret = 0;
 }
 
-static void wm_apply_activate(wm_resp_t *resp) {
+static void WmApplyActivate(wm_resp_t *resp) {
     s_active  = 1;
     resp->ret = 0;
 }
 
-static void wm_apply_deactivate(wm_resp_t *resp) {
+static void WmApplyDeactivate(wm_resp_t *resp) {
     s_active  = 0;
     s_focus   = 0;
     resp->ret = 0;
 }
 
-static void wm_apply_get_state(wm_resp_t *resp) {
+static void WmApplyGetState(wm_resp_t *resp) {
     resp->active = (u32)s_active;
     resp->focus  = s_focus;
-    resp->count  = (u32)win_count();
+    resp->count  = (u32)WinCount();
     resp->ret    = 0;
 }
 
 /* Server thread entry. */
-static void wm_server_main(void *arg) {
+static void WmServerMain(void *arg) {
     (void)arg;
 
-    int port = ipc_port_create();
+    int port = IpcPortCreate();
     if (port < 0) {
         printf("wm: ipc_port_create failed (%d)\n", port);
-        thread_exit(1);
+        ThreadExit(1);
     }
-    int ret = port_register(WM_PORT_NAME, port);
+    int ret = PortRegister(WM_PORT_NAME, port);
     if (ret < 0) {
-        printf("wm: port_register('%s') failed (%d)\n", WM_PORT_NAME, ret);
-        thread_exit(1);
+        printf("wm: PortRegister('%s') failed (%d)\n", WM_PORT_NAME, ret);
+        ThreadExit(1);
     }
     printf("wm: port %d registered as '%s'\n", port, WM_PORT_NAME);
 
@@ -352,7 +386,7 @@ static void wm_server_main(void *arg) {
         int       msg_len = (int)sizeof(req);
         int       token   = 0;
         u64       caller  = 0;
-        int       r       = ipc_recv_from(port, &req, &msg_len, &token, &caller);
+        int       r       = IpcRecvFrom(port, &req, &msg_len, &token, &caller);
         if (r < 0) {
             printf("wm: ipc_recv failed (%d)\n", r);
             continue;
@@ -361,34 +395,34 @@ static void wm_server_main(void *arg) {
         resp.ret = -2; /* ERR_INVAL until an op fills it */
 
         if (s_lock >= 0)
-            (void)mutex_lock(s_lock);
+            (void)MutexLock(s_lock);
         switch (req.op) {
         case WM_OP_CREATE:
-            wm_apply_create(&req, &resp, caller);
+            WmApplyCreate(&req, &resp, caller);
             break;
         case WM_OP_DESTROY:
-            wm_apply_destroy(&req, &resp, caller);
+            WmApplyDestroy(&req, &resp, caller);
             break;
         case WM_OP_LIST:
-            wm_apply_list(&resp);
+            WmApplyList(&resp);
             break;
         case WM_OP_FOCUS:
-            wm_apply_focus(&req, &resp);
+            WmApplyFocus(&req, &resp);
             break;
         case WM_OP_MOVE:
-            wm_apply_move(&req, &resp, caller);
+            WmApplyMove(&req, &resp, caller);
             break;
         case WM_OP_WRITE:
-            wm_apply_write(&req, &resp, caller);
+            WmApplyWrite(&req, &resp, caller);
             break;
         case WM_OP_ACTIVATE:
-            wm_apply_activate(&resp);
+            WmApplyActivate(&resp);
             break;
         case WM_OP_DEACTIVATE:
-            wm_apply_deactivate(&resp);
+            WmApplyDeactivate(&resp);
             break;
         case WM_OP_GET_STATE:
-            wm_apply_get_state(&resp);
+            WmApplyGetState(&resp);
             break;
         default:
             break;
@@ -396,11 +430,11 @@ static void wm_server_main(void *arg) {
         /* Recomposite whenever a mutation may have changed the screen
          * (skipped for LIST/GET_STATE/DEACTIVATE no-ops is not worth
          * the branch — a full redraw is cheap and idempotent). */
-        wm_composite();
+        WmComposite();
         if (s_lock >= 0)
-            (void)mutex_unlock(s_lock);
+            (void)MutexUnlock(s_lock);
 
-        (void)ipc_reply(token, &resp, (int)sizeof(resp));
+        (void)IpcReply(token, &resp, (int)sizeof(resp));
     }
 }
 
@@ -408,7 +442,7 @@ static void wm_server_main(void *arg) {
 /*  Input thread: keyboard focus routing while the session is active  */
 /* ------------------------------------------------------------------ */
 
-static void wm_input_main(void *arg) {
+static void WmInputMain(void *arg) {
     (void)arg;
 
     for (;;) {
@@ -416,29 +450,29 @@ static void wm_input_main(void *arg) {
         for (;;) {
             int active = 0;
             if (s_lock >= 0)
-                (void)mutex_lock(s_lock);
+                (void)MutexLock(s_lock);
             active = s_active;
             if (s_lock >= 0)
-                (void)mutex_unlock(s_lock);
+                (void)MutexUnlock(s_lock);
             if (active)
                 break;
-            thread_yield();
+            ThreadYield();
         }
 
-        if (wm_kbd_req(KBD_OP_TAKE_FOCUS, NULL) < 0) {
+        if (WmKbdReq(KBD_OP_TAKE_FOCUS, NULL) < 0) {
             printf("wm: TAKE_FOCUS failed\n");
-            sleep(50);
+            Sleep(50);
             continue;
         }
         printf("wm: desktop session active, keyboard focus taken\n");
 
         for (;;) {
             u8 key = 0;
-            if (wm_kbd_req(KBD_OP_READ_BLOCK, &key) < 0)
+            if (WmKbdReq(KBD_OP_READ_BLOCK, &key) < 0)
                 break;
 
             if (s_lock >= 0)
-                (void)mutex_lock(s_lock);
+                (void)MutexLock(s_lock);
 
             if (key >= '1' && key <= '9') {
                 /* Focus the Nth existing window (1-based). */
@@ -452,7 +486,7 @@ static void wm_input_main(void *arg) {
                         break;
                     }
                 }
-                wm_composite();
+                WmComposite();
             } else if (key == 'h' || key == 'j' || key == 'k' || key == 'l') {
                 wm_win_t *f = win_find(s_focus);
                 if (f) {
@@ -477,23 +511,23 @@ static void wm_input_main(void *arg) {
                         ny = (i32)(WM_SCREEN_ROWS - f->h);
                     f->x = (u32)nx;
                     f->y = (u32)ny;
-                    wm_composite();
+                    WmComposite();
                 }
             } else if (key == 'q' || key == 'Q') {
                 s_active = 0;
                 s_focus  = 0;
-                wm_composite();
+                WmComposite();
                 if (s_lock >= 0)
-                    (void)mutex_unlock(s_lock);
-                (void)wm_kbd_req(KBD_OP_RELEASE_FOCUS, NULL);
-                tui_clear();
+                    (void)MutexUnlock(s_lock);
+                (void)WmKbdReq(KBD_OP_RELEASE_FOCUS, NULL);
+                TuiClear();
                 printf("wm: desktop session closed, focus released\n");
-                sleep(30); /* let the server observe deactivation */
+                Sleep(30); /* let the server observe deactivation */
                 break;
             }
 
             if (s_lock >= 0)
-                (void)mutex_unlock(s_lock);
+                (void)MutexUnlock(s_lock);
         }
     }
 }
@@ -510,26 +544,26 @@ int main(void) {
     s_active  = 0;
     s_lock    = -1;
 
-    if (tui_port_get() < 0) {
+    if (TuiPortGet() < 0) {
         printf("wm: term service unavailable\n");
         return 1;
     }
-    s_lock = mutex_create();
+    s_lock = MutexCreate();
     if (s_lock < 0) {
         printf("wm: mutex_create failed (%d)\n", s_lock);
         return 1;
     }
 
-    if (thread_create(wm_server_main, NULL, 10) < 0) {
+    if (ThreadCreate(WmServerMain, NULL, 10) < 0) {
         printf("wm: server thread_create failed\n");
         return 1;
     }
-    if (thread_create(wm_input_main, NULL, 10) < 0) {
+    if (ThreadCreate(WmInputMain, NULL, 10) < 0) {
         printf("wm: input thread_create failed\n");
         return 1;
     }
 
     for (;;)
-        thread_yield();
+        ThreadYield();
     return 0;
 }

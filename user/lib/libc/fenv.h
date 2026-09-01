@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * fenv.h - Floating-point environment (C11 §7.6)
  * Copyright (c) 2026 OpSys Project
  *
@@ -65,47 +78,47 @@ extern const fenv_t __fe_dfl_env;
  * ==================================================================== */
 
 /* Clear the given exception flags.  Returns 0 on success. */
-int feclearexcept(int excepts);
+int Feclearexcept(int excepts);
 
 /* Store the current state of the given exception flags in *flagp. */
-int fegetexceptflag(fexcept_t *flagp, int excepts);
+int Fegetexceptflag(fexcept_t *flagp, int excepts);
 
 /* Raise the given exceptions. */
-int feraiseexcept(int excepts);
+int Feraiseexcept(int excepts);
 
 /* Set the given exception flags from *flagp (does not raise them). */
-int fesetexceptflag(const fexcept_t *flagp, int excepts);
+int Fesetexceptflag(const fexcept_t *flagp, int excepts);
 
 /* Return the bitwise OR of the exception flags that are set among
  * `excepts`. */
-int fetestexcept(int excepts);
+int Fetestexcept(int excepts);
 
 /* ====================================================================
  * Functions — rounding mode (C11 §7.6.3.1-7.6.3.2)
  * ==================================================================== */
 
 /* Return the current rounding mode (one of the FE_* macros). */
-int fegetround(void);
+int Fegetround(void);
 
 /* Set the rounding mode.  Returns 0 on success. */
-int fesetround(int round);
+int Fesetround(int round);
 
 /* ====================================================================
  * Functions — environment (C11 §7.6.4.1-7.6.4.4)
  * ==================================================================== */
 
 /* Store the current FP environment in *envp. */
-int fegetenv(fenv_t *envp);
+int Fegetenv(fenv_t *envp);
 
 /* Save the current environment in *envp, clear exception flags, and
  * install a non-stop mode for all exceptions. */
-int feholdexcept(fenv_t *envp);
+int Feholdexcept(fenv_t *envp);
 
 /* Restore the FP environment from *envp. */
-int fesetenv(const fenv_t *envp);
+int Fesetenv(const fenv_t *envp);
 
 /* Save the current exceptions, install *envp, then raise the saved
  * exceptions. */
-int feupdateenv(const fenv_t *envp);
+int Feupdateenv(const fenv_t *envp);
 
 #endif /* LIBC_FENV_H */

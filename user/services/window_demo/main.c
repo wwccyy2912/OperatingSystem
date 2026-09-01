@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * window_demo.c - Minimal windowing demo (v0.4 图形最小闭环)
  * Copyright (c) 2026 OpSys Project
  *
@@ -40,24 +53,24 @@ static int s_focus = 0;
 
 /* Redraw one window; the focused one carries a '*' marker and is drawn
  * last so it reads as "on top". */
-static void draw_window(int idx, int focused) {
+static void DrawWindow(int idx, int focused) {
     char title[48];
     snprintf(title, sizeof(title), "%c %s", focused ? '*' : ' ', s_windows[idx].title);
-    tui_render_box(s_windows[idx].x, s_windows[idx].y, s_windows[idx].w, s_windows[idx].h, title);
+    TuiRenderBox(s_windows[idx].x, s_windows[idx].y, s_windows[idx].w, s_windows[idx].h, title);
     for (int i = 0; i < 3; i++)
-        tui_render_line_at(s_windows[idx].x + 2,
+        TuiRenderLineAt(s_windows[idx].x + 2,
                            s_windows[idx].y + 2 + (uint32_t)i,
                            s_windows[idx].body[i],
                            (uint32_t)strlen(s_windows[idx].body[i]));
 }
 
-static void redraw(void) {
+static void Redraw(void) {
     for (int i = 0; i < WIN_COUNT; i++)
-        draw_window(i, i == s_focus);
+        DrawWindow(i, i == s_focus);
     char st[64];
     snprintf(st, sizeof(st), "window-demo: Focus = Window %d (1/2/3 switch, q quit)",
              s_focus + 1);
-    tui_render_status("System", st);
+    TuiRenderStatus("System", st);
 }
 
 /* Keyboard protocol (user/services/keyboard/keyboard.c) */
@@ -65,15 +78,15 @@ static void redraw(void) {
 #define KBD_OP_TAKE_FOCUS    3
 #define KBD_OP_RELEASE_FOCUS 4
 
-static int kbd_req(uint32_t op, uint8_t *key) {
+static int KbdReq(uint32_t op, uint8_t *key) {
     static uint8_t s_req[8];
     static uint8_t s_resp[8];
     uint32_t      *h = (uint32_t *)s_req;
     h[0]        = op;
     h[1]        = 1; /* max data bytes */
     int resp_len = (int)sizeof(s_resp);
-    int port     = port_get("keyboard");
-    if (port < 0 || ipc_call(port, s_req, 8, s_resp, &resp_len) < 0 || resp_len < 4)
+    int port     = PortGet("keyboard");
+    if (port < 0 || IpcCall(port, s_req, 8, s_resp, &resp_len) < 0 || resp_len < 4)
         return -1;
     if (key)
         *key = s_resp[4];
@@ -83,40 +96,40 @@ static int kbd_req(uint32_t op, uint8_t *key) {
 int main(void) {
     printf("[window-demo] starting\n");
 
-    if (tui_port_get() < 0) {
+    if (TuiPortGet() < 0) {
         printf("[window-demo] term service unavailable\n");
         return 1;
     }
-    if (port_get("keyboard") < 0) {
+    if (PortGet("keyboard") < 0) {
         printf("[window-demo] keyboard service unavailable\n");
         return 1;
     }
 
-    tui_clear();
-    redraw();
+    TuiClear();
+    Redraw();
     printf("[window-demo] desktop rendered, focus=1\n");
 
     /* Take the keyboard: while held, only this process receives keys. */
-    if (kbd_req(KBD_OP_TAKE_FOCUS, NULL) < 0) {
+    if (KbdReq(KBD_OP_TAKE_FOCUS, NULL) < 0) {
         printf("[window-demo] TAKE_FOCUS failed\n");
         return 1;
     }
 
     for (;;) {
         uint8_t key = 0;
-        if (kbd_req(KBD_OP_READ_BLOCK, &key) < 0)
+        if (KbdReq(KBD_OP_READ_BLOCK, &key) < 0)
             break;
         if (key >= '1' && key <= '3') {
             s_focus = key - '1';
-            redraw();
+            Redraw();
             printf("[window-demo] focus=%d\n", s_focus + 1);
         } else if (key == 'q' || key == 'Q') {
             break;
         }
     }
 
-    (void)kbd_req(KBD_OP_RELEASE_FOCUS, NULL);
-    tui_render_status("System", "window-demo quit");
+    (void)KbdReq(KBD_OP_RELEASE_FOCUS, NULL);
+    TuiRenderStatus("System", "window-demo quit");
     printf("[window-demo] quit\n");
     return 0;
 }

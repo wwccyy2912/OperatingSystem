@@ -1,11 +1,27 @@
 /*
  * utf8.c - UTF-8 helpers (see utf8.h)
  * Copyright (c) 2026 OpSys Project
+ 
+ *
+ * ------------------------------------------------------------------
+ * Structure (utf8):
+ *   Utf8SeqLen/Utf8Decode (1..4-byte decode), Utf8CharWidth (wcwidth
+ *   approximation: 0/1/2 columns), Utf8Prev/Next/Advance/StrWidth.
+ * How it works:
+ *   Lead-byte length table + continuation checks; width uses CJK
+ *   range tests; Prev walks back over continuation bytes.
+ * Purpose:
+ *   Character-boundary-safe byte-string editing everywhere (shell
+ *   line editor, cat, VFS names, term rendering).
+ * Caveats:
+ *   No normalization (NFC/NFD); malformed sequences degrade to
+ *   single-byte passthrough rather than failing hard.
+ * ------------------------------------------------------------------
  */
 
 #include "utf8.h"
 
-int utf8_seq_len(const char *s) {
+int Utf8SeqLen(const char *s) {
     if (!s || !s[0])
         return 0;
     unsigned char b = (unsigned char)s[0];
@@ -20,12 +36,12 @@ int utf8_seq_len(const char *s) {
     return 0; /* stray continuation or invalid lead */
 }
 
-int utf8_decode(const char *s, uint32_t *cp) {
+int Utf8Decode(const char *s, uint32_t *cp) {
     if (!s)
         return 0;
     unsigned char b = (unsigned char)s[0];
     uint32_t c;
-    int n = utf8_seq_len(s);
+    int n = Utf8SeqLen(s);
     if (n == 0)
         return 0;
     switch (n) {
@@ -61,7 +77,7 @@ int utf8_decode(const char *s, uint32_t *cp) {
     return n;
 }
 
-int utf8_char_width(uint32_t cp) {
+int Utf8CharWidth(uint32_t cp) {
     /* Control / format characters: no column. */
     if (cp < 0x20 || (cp >= 0x7F && cp < 0xA0))
         return 0;
@@ -101,7 +117,7 @@ int utf8_char_width(uint32_t cp) {
     return 1;
 }
 
-int utf8_prev(const char *s, int pos) {
+int Utf8Prev(const char *s, int pos) {
     if (pos <= 0)
         return 0;
     /* Walk back over continuation bytes to the lead. */
@@ -111,39 +127,39 @@ int utf8_prev(const char *s, int pos) {
     return i > 0 ? i - 1 : 0;
 }
 
-int utf8_next(const char *s, int pos, int len) {
+int Utf8Next(const char *s, int pos, int len) {
     if (pos >= len)
         return len;
-    int n = utf8_seq_len(s + pos);
+    int n = Utf8SeqLen(s + pos);
     if (n <= 0)
         n = 1;
     int p = pos + n;
     return p > len ? len : p;
 }
 
-int utf8_advance(const char *s, int pos, int len, int delta) {
+int Utf8Advance(const char *s, int pos, int len, int delta) {
     if (delta < 0) {
         while (delta++ < 0 && pos > 0)
-            pos = utf8_prev(s, pos);
+            pos = Utf8Prev(s, pos);
     } else {
         while (delta-- > 0 && pos < len)
-            pos = utf8_next(s, pos, len);
+            pos = Utf8Next(s, pos, len);
     }
     return pos;
 }
 
-int utf8_str_width(const char *s, int len) {
+int Utf8StrWidth(const char *s, int len) {
     int w = 0;
     int pos = 0;
     while (pos < len) {
         uint32_t cp;
-        int n = utf8_decode(s + pos, &cp);
+        int n = Utf8Decode(s + pos, &cp);
         if (n <= 0) {
             w += 1; /* stray byte: count as one narrow column */
             pos++;
             continue;
         }
-        w += utf8_char_width(cp);
+        w += Utf8CharWidth(cp);
         pos += n;
     }
     return w;

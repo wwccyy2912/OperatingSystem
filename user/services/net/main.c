@@ -1,11 +1,24 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * main.c - PCnet-Fast III (AMD AM79C973) Ethernet driver + net service
  * Copyright (c) 2026 OpSys Project
  *
  * The driver owns the PCnet adapter (PCI vendor 0x1022 / device
  * 0x2000), programmed over its IO BAR (RAP/RDP registers) with DMA
  * rings + buffers allocated from a contiguous physical-page pool
- * (shm_create, gated on ATOM_SERVICE_MANAGE — the net service is in
+ * (ShmCreate, gated on ATOM_SERVICE_MANAGE — the net service is in
  * the kernel blob-identity seed list).  Received frames are drained
  * by polling the Rx ring (QEMU's pcnet INTx path is left disabled:
  * the 8259 is level-sensitive and an unmasked shared line storms the
@@ -21,6 +34,26 @@
  *   0x0400  Rx buffers     (8 x 2048 B)
  *   0x4400  Tx buffers     (8 x 2048 B)
  *   total   0x8400 -> 10 pages
+ *
+ * ------------------------------------------------------------------
+ * Structure (driver + stack): one process owns the PCnet adapter
+ *   (RAP/RDP over the IO BAR) and a 10-page contiguous DMA pool
+ *   (InitBlock, 8 Rx + 8 Tx rings, 2 KiB buffers); the protocol stack
+ *   lives in proto.c (ARP/IP/ICMP/UDP/TCP) fed by the frame queue;
+ *   the "net" port serves GET_MAC / SEND / RECV / STATS.
+ * How it works:
+ *   NetServerLoop() programs the adapter, polls the Rx ring (INTx is
+ *   disabled), feeds every frame to ProtoRx() (ARP cache learning,
+ *   ICMP echo, UDP/TCP demux) and sends via NetSendRaw(); client
+ *   requests are served on the "net" port in the same loop.
+ * Purpose:
+ *   Network protocol stack service — raw Ethernet plus ARP/IP/ICMP/
+ *   UDP/TCP endpoints for user clients over IPC.
+ * Caveats:
+ *   Rx is polled, not interrupt-driven (QEMU pcnet INTx storms the
+ *   level-sensitive 8259); single-service-thread model; the ShmCreate
+ *   pool is gated on ATOM_SERVICE_MANAGE.
+ * ------------------------------------------------------------------
  */
 
 #include "net.h"
@@ -74,7 +107,7 @@
 
 /* ---- DMA ring geometry ---- */
 #define NET_RINGS      8
-#define NET_RING_LOG   3 /* log2(8) -> encoded in InitBlock rlen/tlen */
+#define NET_RING_LOG   3 /* Log2(8) -> encoded in InitBlock rlen/tlen */
 #define NET_BUF_SIZE   2048
 #define NET_OFF_INIT   0x0000
 #define NET_OFF_RXRING 0x0100
@@ -102,7 +135,7 @@ typedef struct {
 _Static_assert(sizeof(pcnet_desc_t) == 16, "pcnet desc must be 16 bytes");
 
 /* PCnet InitBlock — SSIZE32 layout (QEMU pcnet_initblk32, 28 bytes):
- *   +0  mode (u16)         +2  rlen (u8, log2(ring) << 4)
+ *   +0  mode (u16)         +2  rlen (u8, Log2(ring) << 4)
  *   +3  tlen (u8, same)    +4  phys_addr[6] (MAC, byte order)
  *   +10 reserved (u16)     +12 logical_addr[8] (LADRF, zero)
  *   +20 rdra (u32 phys)    +24 tdra (u32 phys)
@@ -151,45 +184,45 @@ static u8 s_resp[4096];
 
 /* ---- IO register access ---- */
 
-static void csr_write(u16 reg, u16 val) {
-    int r1 = io_write16((u16)(s_io_base + PCNET_RAP), reg);
-    int r2 = io_write16((u16)(s_io_base + PCNET_RDP), val);
+static void CsrWrite(u16 reg, u16 val) {
+    int r1 = IoWrite16((u16)(s_io_base + PCNET_RAP), reg);
+    int r2 = IoWrite16((u16)(s_io_base + PCNET_RDP), val);
     if (r1 < 0 || r2 < 0)
-        printf("net: csr_write(%u,%04x) io err %d/%d\n", reg, val, r1, r2);
+        printf("net: CsrWrite(%u,%04x) io err %d/%d\n", reg, val, r1, r2);
 }
 
-static u16 csr_read(u16 reg) {
-    io_write16((u16)(s_io_base + PCNET_RAP), reg);
-    return (u16)io_read16((u16)(s_io_base + PCNET_RDP));
+static u16 CsrRead(u16 reg) {
+    IoWrite16((u16)(s_io_base + PCNET_RAP), reg);
+    return (u16)IoRead16((u16)(s_io_base + PCNET_RDP));
 }
 
-static void bcr_write(u16 reg, u16 val) {
+static void BcrWrite(u16 reg, u16 val) {
     /* QEMU: IO+0x16 writes bcr[RAP]; BCR20 (SWSTYLE) values are
      * auto-encoded: 2 -> 0x0302 => SWSTYLE=2 AND SSIZE32=1 (16-byte
      * descriptors + flat 32-bit DMA addressing). */
-    io_write16((u16)(s_io_base + PCNET_RAP), reg);
-    io_write16((u16)(s_io_base + PCNET_BCR), val);
+    IoWrite16((u16)(s_io_base + PCNET_RAP), reg);
+    IoWrite16((u16)(s_io_base + PCNET_BCR), val);
 }
 
 /* ---- init ---- */
 
-static void pcnet_reset(void) {
-    csr_write(0, CSR0_STOP); /* stop (QEMU: bit2) */
-    bcr_write(BCR20, 0x0002); /* SWSTYLE 2: QEMU walks 16-byte descriptors */
-    csr_write(CSR4, 0x0915);  /* QEMU-compatible default config */
+static void PcnetReset(void) {
+    CsrWrite(0, CSR0_STOP); /* stop (QEMU: bit2) */
+    BcrWrite(BCR20, 0x0002); /* SWSTYLE 2: QEMU walks 16-byte descriptors */
+    CsrWrite(CSR4, 0x0915);  /* QEMU-compatible default config */
 }
 
 /* Read the 6-byte MAC from the APROM (IO + 0x00..0x0B). */
-static void pcnet_read_mac(void) {
+static void PcnetReadMac(void) {
     for (int i = 0; i < 6; i++)
-        s_mac[i] = (u8)io_read8((u16)(s_io_base + i));
+        s_mac[i] = (u8)IoRead8((u16)(s_io_base + i));
 }
 
-static void pcnet_init_rings(void) {
+static void PcnetInitRings(void) {
     memset(s_pool_va, 0, NET_POOL_SIZE);
 
     /* InitBlock: mode 0 (normal), MAC, ring pointers + lengths.
-     * rlen/tlen hold log2(ring) << 4 (QEMU: rlen = byte >> 4). */
+     * rlen/tlen hold Log2(ring) << 4 (QEMU: rlen = byte >> 4). */
     s_init->mode = 0x0000;
     s_init->rlen = (u8)(NET_RING_LOG << 4);
     s_init->tlen = (u8)(NET_RING_LOG << 4);
@@ -211,20 +244,20 @@ static void pcnet_init_rings(void) {
     }
 }
 
-static int pcnet_start(void) {
+static int PcnetStart(void) {
     /* Load the InitBlock address into CSR1/2 and issue INIT. */
     u32 ip = (u32)(s_pool_phys + NET_OFF_INIT);
-    csr_write(1, (u16)(ip & 0xFFFF));
-    csr_write(2, (u16)(ip >> 16));
-    csr_write(0, CSR0_INIT);
+    CsrWrite(1, (u16)(ip & 0xFFFF));
+    CsrWrite(2, (u16)(ip >> 16));
+    CsrWrite(0, CSR0_INIT);
 
     /* Wait for IDON (init done); fail loudly if the chip never
      * acknowledges (bad InitBlock address / layout / port map). */
     int idon = 0;
     for (int i = 0; i < 1000000; i++) {
-        u16 c = csr_read(0);
+        u16 c = CsrRead(0);
         if (c & CSR0_IDON) {
-            csr_write(0, CSR0_IDON); /* clear */
+            CsrWrite(0, CSR0_IDON); /* clear */
             idon = 1;
             break;
         }
@@ -234,11 +267,11 @@ static int pcnet_start(void) {
         }
     }
     if (!idon) {
-        printf("net: INIT timeout (csr0=%04x) — aborting\n", csr_read(0));
+        printf("net: INIT timeout (csr0=%04x) — aborting\n", CsrRead(0));
         return -7; /* ERR_FAULT */
     }
 
-    csr_write(0, CSR0_STRT); /* start Rx + Tx */
+    CsrWrite(0, CSR0_STRT); /* start Rx + Tx */
     /* NOTE: no INEA / IRQ binding — Rx is delivered by polling the
      * ring (QEMU's pcnet INTx path is unreliable and a latched RINT
      * storms the level-sensitive 8259).  The IRQ line stays masked by
@@ -250,23 +283,23 @@ static int pcnet_start(void) {
 
 /* ---- protocol-stack glue (implementations for proto.c) ---- */
 
-static int net_send(const u8 *data, u32 len); /* fwd */
-static void net_service_rx(void);             /* fwd */
+static int NetSend(const u8 *data, u32 len); /* fwd */
+static void NetServiceRx(void);             /* fwd */
 
 /* Send a raw Ethernet frame (the protocol stack's egress path). */
-int net_send_raw(const u8 *frame, u32 len) {
-    return net_send(frame, len);
+int NetSendRaw(const u8 *frame, u32 len) {
+    return NetSend(frame, len);
 }
 
-void net_get_mac(u8 mac[6]) {
+void NetGetMac(u8 mac[6]) {
     memcpy(mac, s_mac, 6);
 }
 
 /* Pull one received frame out of the driver queue (the protocol stack
  * consumes these).  Returns 1 and fills *out when a frame is pending. */
-int net_rx_pump(u8 *out, u32 *out_len) {
+int NetRxPump(u8 *out, u32 *out_len) {
     if (s_lock >= 0)
-        (void)mutex_lock(s_lock);
+        (void)MutexLock(s_lock);
     int have = 0;
     if (s_rxq_count > 0) {
         u32 slot = s_rxq_head;
@@ -280,26 +313,26 @@ int net_rx_pump(u8 *out, u32 *out_len) {
         have = 1;
     }
     if (s_lock >= 0)
-        (void)mutex_unlock(s_lock);
+        (void)MutexUnlock(s_lock);
     return have;
 }
 
 /* Drain the NIC ring into the driver queue (used by the protocol
  * stack while it waits for ARP/ICMP replies). */
-void net_rx_pump_now(void) {
-    net_service_rx();
+void NetRxPumpNow(void) {
+    NetServiceRx();
 }
 
 /* Yield one scheduling tick while the stack waits for replies. */
-void net_yield(void) {
-    (void)sleep(1); /* 10 ms */
+void NetYield(void) {
+    (void)Sleep(1); /* 10 ms */
 }
 
-static int net_send(const u8 *data, u32 len) {
+static int NetSend(const u8 *data, u32 len) {
     if (!data || len == 0 || len > NET_MTU)
         return -2; /* ERR_INVAL */
     if (s_lock >= 0)
-        (void)mutex_lock(s_lock);
+        (void)MutexLock(s_lock);
 
     /* QEMU's transmitter consumes descriptors strictly in XMTRC order
      * (csr[74]): the next frame must go into slot (XMTRL - XMTRC).
@@ -307,7 +340,7 @@ static int net_send(const u8 *data, u32 len) {
      * pointer on the second packet (the NIC reads a different slot),
      * so the transmit demand never fires.  Read XMTRC, target its
      * slot, and wait for that slot to drain before refilling it. */
-    u16 xmtrc = csr_read(74); /* CSR_XMTRC: 1..XMTRL */
+    u16 xmtrc = CsrRead(74); /* CSR_XMTRC: 1..XMTRL */
     int slot  = (NET_RINGS - (int)xmtrc) % NET_RINGS;
     if (slot < 0)
         slot += NET_RINGS;
@@ -324,7 +357,7 @@ static int net_send(const u8 *data, u32 len) {
             t->mcnt   = 0;
             s_stat_err++;
             if (s_lock >= 0)
-                (void)mutex_unlock(s_lock);
+                (void)MutexUnlock(s_lock);
             return -7; /* ERR_FAULT: ring stuck */
         }
     }
@@ -342,7 +375,7 @@ static int net_send(const u8 *data, u32 len) {
     t->len    = (u16)((4096 - len) | 0xF000); /* BCNT + ONES nibble */
     t->mcnt   = 0;
     t->status = DESC_OWN | DESC_STP | DESC_ENP;
-    csr_write(0, CSR0_TDMD); /* transmit demand */
+    CsrWrite(0, CSR0_TDMD); /* transmit demand */
     /* Wait for the NIC to consume the descriptor (OWN cleared).
      * Confirms the frame was actually transmitted. */
     {
@@ -354,25 +387,25 @@ static int net_send(const u8 *data, u32 len) {
              * the slot so it does not leak (an OWN=1 TMD would make the
              * ring permanently short), then report the fault. */
             printf("net: TX timeout len=%d c0=%04x tstat=%04x\n", len,
-                   csr_read(0), (u16)t->status);
+                   CsrRead(0), (u16)t->status);
             t->status = 0;
             t->len    = (u16)((4096 - NET_BUF_SIZE) | 0xF000);
             t->mcnt   = 0;
             s_stat_err++;
             if (s_lock >= 0)
-                (void)mutex_unlock(s_lock);
+                (void)MutexUnlock(s_lock);
             return -7; /* ERR_FAULT: NIC never transmitted */
         }
     }
     s_stat_tx++;
     if (s_lock >= 0)
-        (void)mutex_unlock(s_lock);
+        (void)MutexUnlock(s_lock);
     return 0;
 }
 
 /* ---- Rx (IRQ thread) ---- */
 
-static void net_service_rx(void) {
+static void NetServiceRx(void) {
     for (int i = 0; i < NET_RINGS; i++) {
         pcnet_desc_t *r = &s_rx_ring[i];
         if (r->status & DESC_OWN)
@@ -396,7 +429,7 @@ static void net_service_rx(void) {
         u16 len = (u16)mcnt;
         const u8 *src = s_pool_va + NET_OFF_RXBUF + i * NET_BUF_SIZE;
         if (s_lock >= 0)
-            (void)mutex_lock(s_lock);
+            (void)MutexLock(s_lock);
         if (s_rxq_count < NET_RXQ_DEPTH) {
             u32 slot = (s_rxq_head + s_rxq_count) % NET_RXQ_DEPTH;
             memcpy(s_rxq[slot], src, len);
@@ -407,7 +440,7 @@ static void net_service_rx(void) {
             s_stat_err++;
         }
         if (s_lock >= 0)
-            (void)mutex_unlock(s_lock);
+            (void)MutexUnlock(s_lock);
         r->status = DESC_OWN; /* hand the descriptor back to the NIC */
 
     }
@@ -416,32 +449,32 @@ static void net_service_rx(void) {
      * keeps the INTx line high and storms the CPU (the line re-asserts
      * on every EOI).  Write-1-to-clear the flag now that the ring has
      * been drained. */
-    csr_write(0, CSR0_RINT);
+    CsrWrite(0, CSR0_RINT);
 }
 
 /* ---- IPC server ---- */
 
-static void net_server_loop(int port) {
+static void NetServerLoop(int port) {
     for (;;) {
         /* Poll the Rx ring first (the QEMU 10.2 pcnet INTx path is
          * unreliable; the IRQ thread is a bonus, not the delivery
          * mechanism).  Draining here keeps RECV latency low. */
-        net_service_rx();
+        NetServiceRx();
         /* Feed every received frame into the protocol stack (ARP
          * cache learning/replies, ICMP echo, UDP queueing). */
         {
             u8 frame[1600];
             u32 flen;
-            while (net_rx_pump(frame, &flen))
-                proto_rx(frame, flen);
+            while (NetRxPump(frame, &flen))
+                ProtoRx(frame, flen);
         }
 
         int msg_len = (int)sizeof(s_req);
         int token   = 0;
-        int ret     = ipc_recv(port, s_req, &msg_len, &token);
+        int ret     = IpcRecv(port, s_req, &msg_len, &token);
         if (ret < 0) {
             printf("net: ipc_recv failed (%d)\n", ret);
-            thread_exit(1);
+            ThreadExit(1);
         }
         net_req_t  *req  = (net_req_t *)s_req;
         net_resp_t *resp = (net_resp_t *)s_resp;
@@ -460,13 +493,13 @@ static void net_server_loop(int port) {
              * lying len would make net_send copy stale bytes. */
             if (req->len > 0 && req->len <= NET_MTU &&
                 req->len <= (u32)(msg_len - 8)) {
-                resp->ret = net_send(req->data, req->len);
+                resp->ret = NetSend(req->data, req->len);
                 resp->len = 0;
             }
             break;
         case NET_OP_RECV:
             if (s_lock >= 0)
-                (void)mutex_lock(s_lock);
+                (void)MutexLock(s_lock);
             if (s_rxq_count > 0) {
                 u32 slot = s_rxq_head;
                 u32 n    = s_rxq_len[slot];
@@ -481,11 +514,11 @@ static void net_server_loop(int port) {
                 resp->ret = -6; /* ERR_AGAIN: nothing pending */
             }
             if (s_lock >= 0)
-                (void)mutex_unlock(s_lock);
+                (void)MutexUnlock(s_lock);
             break;
         case NET_OP_STATS:
             if (s_lock >= 0)
-                (void)mutex_lock(s_lock);
+                (void)MutexLock(s_lock);
             {
                 u32 *st = (u32 *)resp->data;
                 st[0] = s_stat_rx;
@@ -495,14 +528,14 @@ static void net_server_loop(int port) {
             resp->len = 12;
             resp->ret = 0;
             if (s_lock >= 0)
-                (void)mutex_unlock(s_lock);
+                (void)MutexUnlock(s_lock);
             break;
 
         /* ---- L3/L4 protocol ops ---- */
         case NET_OP_SET_IP: {
             /* { ip[4]; gw[4] } — reconfigure the static address. */
             if (req->len >= 8) {
-                proto_init(req->data, req->data + 4);
+                ProtoInit(req->data, req->data + 4);
                 resp->ret = 0;
             }
             break;
@@ -512,7 +545,7 @@ static void net_server_loop(int port) {
             if (req->len >= 5) {
                 u8 dst[4];
                 memcpy(dst, req->data, 4);
-                resp->ret = proto_ip_send(dst, req->data[4],
+                resp->ret = ProtoIpSend(dst, req->data[4],
                                           req->data + 5, req->len - 5);
             }
             break;
@@ -521,21 +554,21 @@ static void net_server_loop(int port) {
             if (req->len >= 4) {
                 u8 dst[4];
                 memcpy(dst, req->data, 4);
-                resp->ret = proto_ping(dst);
+                resp->ret = ProtoPing(dst);
             }
             break;
         }
         case NET_OP_UDP_BIND: {
             if (req->len >= 2) {
                 u16 p = (u16)((req->data[0] << 8) | req->data[1]);
-                resp->ret = proto_udp_bind(p);
+                resp->ret = ProtoUdpBind(p);
             }
             break;
         }
         case NET_OP_UDP_UNBIND: {
             if (req->len >= 2) {
                 u16 p = (u16)((req->data[0] << 8) | req->data[1]);
-                resp->ret = proto_udp_unbind(p);
+                resp->ret = ProtoUdpUnbind(p);
             }
             break;
         }
@@ -546,7 +579,7 @@ static void net_server_loop(int port) {
                 memcpy(dst, req->data, 4);
                 u16 sport = (u16)((req->data[4] << 8) | req->data[5]);
                 u16 dport = (u16)((req->data[6] << 8) | req->data[7]);
-                resp->ret = proto_udp_sendto(dst, sport, dport,
+                resp->ret = ProtoUdpSendto(dst, sport, dport,
                                              req->data + 8, req->len - 8);
             }
             break;
@@ -554,7 +587,7 @@ static void net_server_loop(int port) {
         case NET_OP_UDP_RECV: {
             u8 src[4];
             u16 sport, dport;
-            int n = proto_udp_recv(src, &sport, &dport, resp->data,
+            int n = ProtoUdpRecv(src, &sport, &dport, resp->data,
                                    NET_MTU);
             if (n >= 0) {
                 /* Reply: { srcip[4]; sport; dport; data } */
@@ -576,14 +609,14 @@ static void net_server_loop(int port) {
         case NET_OP_TCP_LISTEN: {
             if (req->len >= 2) {
                 u16 p = (u16)((req->data[0] << 8) | req->data[1]);
-                resp->ret = proto_tcp_listen(p);
+                resp->ret = ProtoTcpListen(p);
             }
             break;
         }
         case NET_OP_TCP_ACCEPT: {
             u8 peer[4];
             u16 pport;
-            int n = proto_tcp_accept(peer, &pport);
+            int n = ProtoTcpAccept(peer, &pport);
             if (n == 0) {
                 resp->data[0] = peer[0];
                 resp->data[1] = peer[1];
@@ -600,12 +633,12 @@ static void net_server_loop(int port) {
         }
         case NET_OP_TCP_SEND: {
             if (req->len > 0)
-                resp->ret = proto_tcp_send(req->data, req->len);
+                resp->ret = ProtoTcpSend(req->data, req->len);
             break;
         }
         case NET_OP_TCP_RECV: {
             u16 pport;
-            int n = proto_tcp_recv(resp->data, NET_MTU, &pport);
+            int n = ProtoTcpRecv(resp->data, NET_MTU, &pport);
             if (n >= 0) {
                 resp->len = (u32)n;
                 resp->ret = 0;
@@ -615,14 +648,14 @@ static void net_server_loop(int port) {
             break;
         }
         case NET_OP_TCP_CLOSE:
-            resp->ret = proto_tcp_close();
+            resp->ret = ProtoTcpClose();
             break;
         default:
             break;
         }
         /* Reply envelope: net_resp_t header is ret(4) + len(4), so the
          * payload begins at offset 8 — 8 + resp->len bytes total. */
-        (void)ipc_reply(token, resp, (int)(8 + resp->len));
+        (void)IpcReply(token, resp, (int)(8 + resp->len));
     }
 }
 
@@ -633,10 +666,10 @@ int main(void) {
 
     /* 1. Find the adapter in the PCI enumeration. */
     int idx = -1;
-    int n   = pci_get_count();
+    int n   = PciGetCount();
     for (int i = 0; i < n; i++) {
         pci_device_info_t dev;
-        if (pci_get_device(i, &dev) < 0)
+        if (PciGetDevice(i, &dev) < 0)
             continue;
         if (dev.vendor_id == PCNET_VENDOR && dev.device_id == PCNET_DEVICE) {
             idx = i;
@@ -650,25 +683,25 @@ int main(void) {
     if (idx < 0) {
         printf("net: no PCnet adapter found\n");
         for (;;)
-            sleep(10); /* stay alive (no NIC in this configuration) */
+            Sleep(10); /* stay alive (no NIC in this configuration) */
     }
     printf("net: IO base 0x%x, IRQ %d\n", s_io_base, s_irq);
 
     /* 2. Capabilities: PCI device + IO ports (0x00..0x1F of the BAR). */
-    int pci_cap = cap_create_obj(CAP_TYPE_PCI_DEV, RIGHT_READ | RIGHT_WRITE, (u32)idx);
+    int pci_cap = CapCreateObj(CAP_TYPE_PCI_DEV, RIGHT_READ | RIGHT_WRITE, (u32)idx);
     if (pci_cap < 0) {
-        printf("net: cap_create(PCI_DEV %d) failed (%d)\n", idx, pci_cap);
-        thread_exit(1);
+        printf("net: CapCreate(PCI_DEV %d) failed (%d)\n", idx, pci_cap);
+        ThreadExit(1);
     }
-    int io_cap = cap_create_obj(CAP_TYPE_IO_PORT, RIGHT_ALL,
+    int io_cap = CapCreateObj(CAP_TYPE_IO_PORT, RIGHT_ALL,
                                 (0x20u << 16) | (u32)s_io_base);
     if (io_cap < 0) {
-        printf("net: cap_create(IO_PORT 0x%x) failed (%d)\n", s_io_base, io_cap);
-        thread_exit(1);
+        printf("net: CapCreate(IO_PORT 0x%x) failed (%d)\n", s_io_base, io_cap);
+        ThreadExit(1);
     }
 
     /* 3. MAC from the APROM. */
-    pcnet_read_mac();
+    PcnetReadMac();
     printf("net: MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
            s_mac[0], s_mac[1], s_mac[2], s_mac[3], s_mac[4], s_mac[5]);
 
@@ -678,24 +711,24 @@ int main(void) {
      * the NIC's DMA reads (InitBlock, descriptors, buffers) all come
      * back zero.  Keep the status register (upper 16 bits) untouched. */
     {
-        u32 cmd = (u32)pci_cfg_read32(idx, 0x04);
+        u32 cmd = (u32)PciCfgRead32(idx, 0x04);
         u32 nv  = (cmd & 0xFFFF0000u) | ((cmd | 0x0007u) & 0xFFFFu); /* IO|MEM|MASTER */
-        int rc  = pci_cfg_write32(idx, 0x04, nv);
+        int rc  = PciCfgWrite32(idx, 0x04, nv);
         if (rc < 0) {
-            printf("net: pci_cfg_write32(0x04) failed (%d)\n", rc);
-            thread_exit(1);
+            printf("net: PciCfgWrite32(0x04) failed (%d)\n", rc);
+            ThreadExit(1);
         }
-        cmd = (u32)pci_cfg_read32(idx, 0x04);
+        cmd = (u32)PciCfgRead32(idx, 0x04);
         printf("net: PCI command=0x%08x (bus master %s)\n", cmd,
                (cmd & 0x0004u) ? "ON" : "OFF");
     }
 
     /* 4. DMA pool: contiguous physical pages for rings + buffers. */
     u64 pool_va = 0x50000000ULL;
-    s_pool_phys = shm_create(NET_POOL_SIZE / 4096 + 1, (void *)pool_va);
+    s_pool_phys = ShmCreate(NET_POOL_SIZE / 4096 + 1, (void *)pool_va);
     if (s_pool_phys == 0) {
         printf("net: shm_create failed (no ATOM_SERVICE_MANAGE?)\n");
-        thread_exit(1);
+        ThreadExit(1);
     }
     s_pool_va   = (u8 *)pool_va;
     s_init      = (pcnet_init_t *)(s_pool_va + NET_OFF_INIT);
@@ -705,18 +738,18 @@ int main(void) {
            (void *)s_pool_va);
 
     /* 5. Reset + program the rings. */
-    pcnet_reset();
-    pcnet_init_rings();
+    PcnetReset();
+    PcnetInitRings();
 
     /* 6. Lock. */
-    s_lock = mutex_create();
+    s_lock = MutexCreate();
 
     /* 7. Start the NIC FIRST (its INTR line is level-triggered; binding
      * the IRQ before INIT/STRT lets a stale assertion storm the CPU). */
-    int r = pcnet_start();
+    int r = PcnetStart();
     if (r < 0) {
         printf("net: NIC start FAILED (%d)\n", r);
-        thread_exit(1);
+        ThreadExit(1);
     }
     printf("net: NIC started (Rx/Tx live)\n");
 
@@ -724,23 +757,23 @@ int main(void) {
     {
         static const u8 ip[4] = {10, 0, 2, 15};
         static const u8 gw[4] = {10, 0, 2, 2};
-        proto_init(ip, gw);
+        ProtoInit(ip, gw);
         printf("net: stack up 10.0.2.15 gw 10.0.2.2\n");
     }
 
     /* 8. IPC port. */
-    int port = ipc_port_create();
+    int port = IpcPortCreate();
     if (port < 0) {
         printf("net: ipc_port_create failed (%d)\n", port);
-        thread_exit(1);
+        ThreadExit(1);
     }
-    int ret = port_register(NET_PORT_NAME, port);
+    int ret = PortRegister(NET_PORT_NAME, port);
     if (ret < 0) {
-        printf("net: port_register('%s') failed (%d)\n", NET_PORT_NAME, ret);
-        thread_exit(1);
+        printf("net: PortRegister('%s') failed (%d)\n", NET_PORT_NAME, ret);
+        ThreadExit(1);
     }
     printf("net: port %d registered as '%s'\n", port, NET_PORT_NAME);
 
-    net_server_loop(port);
+    NetServerLoop(port);
     return 0;
 }

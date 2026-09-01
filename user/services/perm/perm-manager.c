@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * perm-manager.c - Powerbox permission manager (ring-3, independent process)
  * Copyright (c) 2026 OpSys Project
  *
@@ -16,7 +29,7 @@
  *     deny → Powerbox prompt (pending query + UI_SHOW push).
  *   - The check path is decision-encoding: ALLOW lands as an atom
  *     capability issued INTO the subject's kernel table via
- *     cap_grant_to_subject() — the capability IS the encoded decision.
+ *     CapGrantToSubject() — the capability IS the encoded decision.
  *   - Requests carry the caller's kernel subject (ipc_recv_from for
  *     management ops; CHECK requests are filled by the trusted
  *     vfs_server from ITS recv — never app-supplied, unforgeable).
@@ -34,6 +47,26 @@
  *   GRANT   5   direct grant, bypasses Powerbox (tests/management).
  *   ROLE_SET 7   management: set a subject's role (hot reload).
  *   DUMP    8   export role map + rule table (tests/management).
+ *
+ * ------------------------------------------------------------------
+ * Structure (PermManagerMain):
+ *   main() -> registers "perm" port, ipc_recv dispatch loop
+ *     grant table | role table | rule chains   (single source of truth)
+ *     Powerbox panel: pending query queue + "perm.ui" push to term
+ *   CHECK path: vfs_server fills caller subject -> decision encoding
+ *     ALLOW = CapGrantToSubject() atom; else chain -> default deny
+ * How it works:
+ *   vfs_server consults it on CREATE/RESOLVE_BOOKMARK; the decision
+ *   order is explicit grant, role-chain verdict (override-first),
+ *   default deny -> Powerbox prompt.  ALLOW issues an atom capability
+ *   into the subject's kernel table; term renders the "perm.ui" prompt.
+ * Purpose:
+ *   The Powerbox permission manager: single authority for access
+ *   decisions, encoding each ALLOW as a kernel atom capability.
+ * Caveats:
+ *   CHECK requests are filled by trusted vfs_server from its own recv
+ *   (unforgeable); ROLE_SET is management-plane (OWNER/ADMIN) only.
+ * ------------------------------------------------------------------
  */
 
 #include <stdint.h>
@@ -119,7 +152,7 @@ typedef struct {
     u32            atom;       /* P1: atom this decision encodes */
     u64            subject_id; /* P1: requesting subject (unforgeable) */
     u32            pid;        /* requesting process PID (display meta) */
-    char           name[64];   /* requesting process name (NUL-terminated) */
+    char           name[64];   /* requesting process name(NUL-terminated) */
     char           url[PERM_MAX_URL];
     i32            state; /* PERM_QUERY_* */
 } perm_query_t;
@@ -180,7 +213,7 @@ static perm_grant_t *grant_upsert(u64 subject_id, const vfs_resource_t *res, u32
 
 /* Count and drop grants matching subject (0 = all) and resource
  * (zero uuid = all).  Returns the number revoked. */
-static u32 grant_revoke(u64 subject_id, const vfs_resource_t *res) {
+static u32 GrantRevoke(u64 subject_id, const vfs_resource_t *res) {
     u32 revoked = 0;
     for (int i = 0; i < PERM_MAX_GRANTS; i++) {
         perm_grant_t *g = &s_grants[i];
@@ -202,7 +235,7 @@ static u32 grant_revoke(u64 subject_id, const vfs_resource_t *res) {
  * Role table helpers (§二.2)
  * ==================================================================== */
 
-static u32 role_of(u64 subject_id) {
+static u32 RoleOf(u64 subject_id) {
     for (int i = 0; i < PERM_MAX_ROLES; i++) {
         perm_role_t *r = &s_roles[i];
         if (r->in_use && r->subject_id == subject_id)
@@ -212,7 +245,7 @@ static u32 role_of(u64 subject_id) {
 }
 
 /* Set (upsert) a subject's role — the ROLE_SET hot-reload write path. */
-static int role_set(u64 subject_id, u32 role) {
+static int RoleSet(u64 subject_id, u32 role) {
     if (role >= PERM_ROLE_MAX)
         return ERR_INVAL;
     for (int i = 0; i < PERM_MAX_ROLES; i++) {
@@ -234,8 +267,8 @@ static int role_set(u64 subject_id, u32 role) {
 }
 
 /* Management plane: OWNER or ADMIN may change policy (ROLE_SET). */
-static int role_is_management(u64 subject_id) {
-    u32 r = role_of(subject_id);
+static int RoleIsManagement(u64 subject_id) {
+    u32 r = RoleOf(subject_id);
     return (r == PERM_ROLE_OWNER || r == PERM_ROLE_ADMIN) ? 1 : 0;
 }
 
@@ -245,7 +278,7 @@ static int role_is_management(u64 subject_id) {
 
 /* Seed a rule for (role, atom): push onto the chain head so the NEWEST
  * rule wins (override-first). */
-static void rule_seed(u32 role, u32 atom, i32 verdict) {
+static void RuleSeed(u32 role, u32 atom, i32 verdict) {
     if (role >= PERM_ROLE_MAX || atom > ATOM_MAX)
         return;
     if (s_rule_count >= PERM_MAX_RULES)
@@ -262,7 +295,7 @@ static void rule_seed(u32 role, u32 atom, i32 verdict) {
 
 /* Lookup: first matching rule in the (role, atom) chain.  Returns the
  * verdict, or -1 when the chain has no rule for (role, atom). */
-static i32 rule_lookup(u32 role, u32 atom) {
+static i32 RuleLookup(u32 role, u32 atom) {
     if (role >= PERM_ROLE_MAX || atom > ATOM_MAX)
         return -1;
     u32 idx = s_rule_head[role][atom];
@@ -280,8 +313,8 @@ static i32 rule_lookup(u32 role, u32 atom) {
 /* ====================================================================
  * P2: frequency counters (P3 预留 — 频率阈值策略)
  *
- * freq_bump() is the single hook called on every grant-beat in
- * do_check (spec: "授权命中时计数器+1").  do_freq queries/resets.
+ * FreqBump() is the single hook called on every grant-beat in
+ * DoCheck(spec: "授权命中时计数器+1").  do_freq queries/resets.
  * ==================================================================== */
 
 typedef struct {
@@ -295,7 +328,7 @@ typedef struct {
 
 static perm_freq_ent_t s_freq[PERM_FREQ_SLOTS];
 
-static void freq_bump(u64 subject_id, u32 atom) {
+static void FreqBump(u64 subject_id, u32 atom) {
     for (int i = 0; i < PERM_FREQ_SLOTS; i++) {
         perm_freq_ent_t *f = &s_freq[i];
         if (f->in_use && f->subject_id == subject_id && f->atom == atom) {
@@ -331,7 +364,7 @@ typedef struct {
 
 static perm_ctx_ent_t s_ctx[PERM_CTX_SLOTS];
 
-static int ctx_upsert(u64 subject_id, u32 foreground) {
+static int CtxUpsert(u64 subject_id, u32 foreground) {
     if (subject_id == 0)
         return ERR_INVAL;
     for (int i = 0; i < PERM_CTX_SLOTS; i++) {
@@ -364,9 +397,9 @@ static perm_audit_ent_t s_audit[PERM_AUDIT_MAX];
 static u32              s_audit_head;  /* next slot to write */
 static u32              s_audit_count; /* valid entries (≤ PERM_AUDIT_MAX) */
 
-static void audit_append(u64 subject_id, u32 atom, u32 verdict, const vfs_resource_t *res) {
+static void AuditAppend(u64 subject_id, u32 atom, u32 verdict, const vfs_resource_t *res) {
     perm_audit_ent_t *e = &s_audit[s_audit_head];
-    e->tick             = (u64)get_time();
+    e->tick             = (u64)GetTime();
     e->subject_id       = subject_id;
     e->atom             = atom;
     e->verdict          = verdict;
@@ -391,10 +424,10 @@ static void audit_append(u64 subject_id, u32 atom, u32 verdict, const vfs_resour
  * ==================================================================== */
 
 /* Forward decls (defined later in this file) */
-static u32  atom_from_access(u32 access);
-static int  decision_encode(u64 subject_id, u32 atom);
-static void fmt_append(char *dst, int dst_len, int *pos, const char *s);
-static void fmt_uint(char *dst, int dst_len, int *pos, unsigned v, int base);
+static u32  AtomFromAccess(u32 access);
+static int  DecisionEncode(u64 subject_id, u32 atom);
+static void FmtAppend(char *dst, int dst_len, int *pos, const char *s);
+static void FmtUint(char *dst, int dst_len, int *pos, unsigned v, int base);
 
 typedef struct __attribute__((packed)) {
     u64            subject_id; /* enforcement identity (0 = any subject) */
@@ -416,7 +449,7 @@ typedef struct __attribute__((packed)) {
     perm_policy_role_ent_t  roles[PERM_MAX_ROLES];
 } perm_policy_blob_t;
 
-static int policy_serialize(u8 *out, int out_len) {
+static int PolicySerialize(u8 *out, int out_len) {
     if (out_len < (int)sizeof(perm_policy_blob_t))
         return ERR_NOMEM;
     perm_policy_blob_t *b = (perm_policy_blob_t *)out;
@@ -451,7 +484,7 @@ static int policy_serialize(u8 *out, int out_len) {
  * state.  On success: roles first, then grants restored into their
  * original table slots (byte-identical round trip), then hot-reload
  * the kernel caps: revoke the old atom, re-issue the new one. */
-static int policy_deserialize(const u8 *in, int len) {
+static int PolicyDeserialize(const u8 *in, int len) {
     if (len < (int)sizeof(perm_policy_blob_t))
         return ERR_INVAL;
     const perm_policy_blob_t *b = (const perm_policy_blob_t *)in;
@@ -502,10 +535,10 @@ static int policy_deserialize(const u8 *in, int len) {
         d->access       = g->access;
         d->resource     = g->resource;
 
-        u32 atom = atom_from_access(g->access);
+        u32 atom = AtomFromAccess(g->access);
         if (d->subject_id != 0 && atom != ATOM_NONE && atom <= ATOM_MAX) {
-            (void)cap_revoke_by_atom(d->subject_id, atom, 0);
-            (void)decision_encode(d->subject_id, atom);
+            (void)CapRevokeByAtom(d->subject_id, atom, 0);
+            (void)DecisionEncode(d->subject_id, atom);
         }
     }
     return 0;
@@ -515,7 +548,7 @@ static int policy_deserialize(const u8 *in, int len) {
  * Atom encoding — map a VFS_ACCESS_* mask to the atom it represents
  * ==================================================================== */
 
-static u32 atom_from_access(u32 access) {
+static u32 AtomFromAccess(u32 access) {
     if (access & VFS_ACCESS_WRITE)
         return ATOM_DATA_DOCS_WRITE;
     if (access & VFS_ACCESS_READ)
@@ -528,7 +561,7 @@ static u32 atom_from_access(u32 access) {
  *
  * The perm-engine is the ONLY signer of atom capabilities.  When a
  * decision lands (ANSWER allow / direct GRANT), encode it into the
- * subject's kernel table via cap_grant_to_subject() so the kernel can
+ * subject's kernel table via CapGrantToSubject() so the kernel can
  * enforce it independently of the engine (授予路径异步).
  * ==================================================================== */
 
@@ -536,10 +569,10 @@ static u32 atom_from_access(u32 access) {
  * cap issuance failed (e.g. ERR_NOENT when the target subject's process
  * has already exited).  Callers MUST propagate this to the client so a
  * failed grant is not silently reported as success. */
-static int decision_encode(u64 subject_id, u32 atom) {
+static int DecisionEncode(u64 subject_id, u32 atom) {
     if (subject_id == 0 || atom == ATOM_NONE || atom > ATOM_MAX)
         return 0;
-    int h = cap_grant_to_subject(subject_id, atom, RIGHT_ALL, 0, 0);
+    int h = CapGrantToSubject(subject_id, atom, RIGHT_ALL, 0, 0);
     if (h < 0) {
         printf("perm: encode subject=%u atom=%u failed (%d)\n", (unsigned)subject_id, atom, h);
         return h;
@@ -604,7 +637,7 @@ static perm_query_t *query_alloc(const vfs_resource_t *res, u64 subject_id, u32 
              * died (ERR_NOENT), fall back to "subject <id>" so the UI
              * label is never empty. */
             proc_ident_t ident;
-            if (proc_info_by_subject(subject_id, &ident) == 0) {
+            if (ProcInfoBySubject(subject_id, &ident) == 0) {
                 q->pid = (u32)ident.pid;
                 strncpy(q->name, ident.name, sizeof(q->name) - 1);
                 q->name[sizeof(q->name) - 1] = '\0';
@@ -613,8 +646,8 @@ static perm_query_t *query_alloc(const vfs_resource_t *res, u64 subject_id, u32 
             } else {
                 q->pid  = 0;
                 int pos = 0;
-                fmt_append(q->name, sizeof(q->name), &pos, "subject ");
-                fmt_uint(q->name, sizeof(q->name), &pos, (unsigned)subject_id, 10);
+                FmtAppend(q->name, sizeof(q->name), &pos, "subject ");
+                FmtUint(q->name, sizeof(q->name), &pos, (unsigned)subject_id, 10);
             }
             return q;
         }
@@ -628,12 +661,12 @@ static perm_query_t *query_alloc(const vfs_resource_t *res, u64 subject_id, u32 
  * Enough to build the human-readable UI labels and the DUMP lines.
  * ==================================================================== */
 
-static void fmt_append(char *dst, int dst_len, int *pos, const char *s) {
+static void FmtAppend(char *dst, int dst_len, int *pos, const char *s) {
     while (*s && *pos < dst_len - 1)
         dst[(*pos)++] = *s++;
 }
 
-static void fmt_uint(char *dst, int dst_len, int *pos, unsigned v, int base) {
+static void FmtUint(char *dst, int dst_len, int *pos, unsigned v, int base) {
     char tmp[16];
     int  n = 0;
     if (v == 0) {
@@ -649,7 +682,7 @@ static void fmt_uint(char *dst, int dst_len, int *pos, unsigned v, int base) {
         dst[(*pos)++] = tmp[--n];
 }
 
-static void access_label(char *out, int out_len, u32 access) {
+static void AccessLabel(char *out, int out_len, u32 access) {
     int n = 0;
     (void)out_len; /* max 3 chars + NUL; callers pass >= 4-byte buffers */
     if (access & VFS_ACCESS_READ)
@@ -665,27 +698,27 @@ static void access_label(char *out, int out_len, u32 access) {
 
 /* Label = "perm: <name> (PID n) 请求访问 <url> (R) — 输入 perm_answer
  * q y/n"; the ALLOWED/DENIED update drops the prompt tail. */
-static void build_label(char *dst, int dst_len, const perm_query_t *q) {
+static void BuildLabel(char *dst, int dst_len, const perm_query_t *q) {
     int pos = 0;
     dst[0]  = '\0';
     if (q->state == PERM_QUERY_PENDING) {
-        fmt_append(dst, dst_len, &pos, "perm: ");
-        fmt_append(dst, dst_len, &pos, q->name);
-        fmt_append(dst, dst_len, &pos, " (PID ");
-        fmt_uint(dst, dst_len, &pos, (unsigned)q->pid, 10);
-        fmt_append(dst, dst_len, &pos, ") 请求访问 ");
-        fmt_append(dst, dst_len, &pos, q->url);
-        fmt_append(dst, dst_len, &pos, " (");
+        FmtAppend(dst, dst_len, &pos, "perm: ");
+        FmtAppend(dst, dst_len, &pos, q->name);
+        FmtAppend(dst, dst_len, &pos, " (PID ");
+        FmtUint(dst, dst_len, &pos, (unsigned)q->pid, 10);
+        FmtAppend(dst, dst_len, &pos, ") 请求访问 ");
+        FmtAppend(dst, dst_len, &pos, q->url);
+        FmtAppend(dst, dst_len, &pos, " (");
         char acc[8];
-        access_label(acc, sizeof(acc), q->access);
-        fmt_append(dst, dst_len, &pos, acc);
-        fmt_append(dst, dst_len, &pos, ") — 输入 perm_answer ");
-        fmt_uint(dst, dst_len, &pos, q->query_id, 10);
-        fmt_append(dst, dst_len, &pos, " y/n");
+        AccessLabel(acc, sizeof(acc), q->access);
+        FmtAppend(dst, dst_len, &pos, acc);
+        FmtAppend(dst, dst_len, &pos, ") — 输入 perm_answer ");
+        FmtUint(dst, dst_len, &pos, q->query_id, 10);
+        FmtAppend(dst, dst_len, &pos, " y/n");
     } else {
-        fmt_append(dst, dst_len, &pos, "perm: 查询 ");
-        fmt_uint(dst, dst_len, &pos, q->query_id, 10);
-        fmt_append(dst, dst_len, &pos, q->state == PERM_QUERY_ALLOWED ? " 已允许" : " 已拒绝");
+        FmtAppend(dst, dst_len, &pos, "perm: 查询 ");
+        FmtUint(dst, dst_len, &pos, q->query_id, 10);
+        FmtAppend(dst, dst_len, &pos, q->state == PERM_QUERY_ALLOWED ? " 已允许" : " 已拒绝");
     }
     dst[pos] = '\0';
 }
@@ -699,9 +732,9 @@ static void build_label(char *dst, int dst_len, const perm_query_t *q) {
  * is retried on the next notification.
  * ==================================================================== */
 
-static void notify_ui(const perm_query_t *q) {
+static void NotifyUi(const perm_query_t *q) {
     if (s_ui_port < 0) {
-        s_ui_port = port_get(PERM_UI_PORT_NAME);
+        s_ui_port = PortGet(PERM_UI_PORT_NAME);
         if (s_ui_port < 0)
             return;
     }
@@ -719,11 +752,11 @@ static void notify_ui(const perm_query_t *q) {
     req->state  = q->state;
 
     /* P1: perm 聚合完整提示文本，term 原样展示 */
-    build_label(req->label, sizeof(req->label), q);
+    BuildLabel(req->label, sizeof(req->label), q);
 
     perm_resp_ui_t resp;
     int            resp_len = (int)sizeof(resp);
-    (void)ipc_call(s_ui_port, req, (int)sizeof(*req), &resp, &resp_len);
+    (void)IpcCall(s_ui_port, req, (int)sizeof(*req), &resp, &resp_len);
 }
 
 /* ====================================================================
@@ -734,7 +767,7 @@ static void notify_ui(const perm_query_t *q) {
  * READ allows → VFS_ACCESS_READ, WRITE allows → VFS_ACCESS_WRITE;
  * untyped atoms (EXEC/COW/…) fall back to the requested mask.  This is
  * the capability-side 抹位 for the chain path. */
-static u32 granted_for_atom(u32 atom, u32 access) {
+static u32 GrantedForAtom(u32 atom, u32 access) {
     if (atom == ATOM_DATA_DOCS_READ)
         return VFS_ACCESS_READ;
     if (atom == ATOM_DATA_DOCS_WRITE)
@@ -749,7 +782,7 @@ static u32 granted_for_atom(u32 atom, u32 access) {
  * P2 抹位: the grant beat now fires on PARTIAL intersection
  * ((g->access & req->access) != 0) and resp->granted carries ONLY the
  * covered bits — a READ grant never yields a WRITE-carrying handle. */
-static void do_check(int token, int msg_len, u64 caller_subject) {
+static void DoCheck(int token, int msg_len, u64 caller_subject) {
     perm_resp_check_t *resp = (perm_resp_check_t *)s_resp;
     resp->granted           = 0;
     resp->query_id          = 0;
@@ -761,36 +794,36 @@ static void do_check(int token, int msg_len, u64 caller_subject) {
      * the REQUEST, which only the trusted vfs_server proxy may fill.
      * An ungated CHECK would let any Ring-3 process probe arbitrary
      * subjects' grants/roles (authorization oracle). */
-    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+    if (CapHasAtom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
         resp->ret = ERR_DENIED;
         goto out;
     }
     perm_req_check_t *req     = (perm_req_check_t *)s_req;
     u64               subject = req->subject_id; /* filled by trusted vfs_server */
-    u32               atom    = atom_from_access(req->access);
+    u32               atom    = AtomFromAccess(req->access);
 
     /* 1) Grant beat — an explicit grant (powerbox result) wins. */
     perm_grant_t *g = grant_find(req->subject_id, &req->resource);
     if (g && (g->access & req->access) != 0) {
         resp->ret     = 0;                       /* granted — proceed */
         resp->granted = g->access & req->access; /* 抹位掩码 */
-        freq_bump(subject, atom);
-        audit_append(subject, atom, PERM_VERDICT_ALLOW, &req->resource);
+        FreqBump(subject, atom);
+        AuditAppend(subject, atom, PERM_VERDICT_ALLOW, &req->resource);
         goto out;
     }
 
     /* 2) Role chain — override-first on (role, atom). */
-    i32 verdict = rule_lookup(role_of(subject), atom);
+    i32 verdict = RuleLookup(RoleOf(subject), atom);
     if (verdict == PERM_VERDICT_ALLOW) {
         resp->ret     = 0;
-        resp->granted = granted_for_atom(atom, req->access);
-        audit_append(subject, atom, PERM_VERDICT_ALLOW, &req->resource);
+        resp->granted = GrantedForAtom(atom, req->access);
+        AuditAppend(subject, atom, PERM_VERDICT_ALLOW, &req->resource);
         goto out;
     }
     if (verdict == PERM_VERDICT_DENY) {
         /* Chain deny: policy says no — no Powerbox prompt. */
         resp->ret = VFS_ERR_ACCESS;
-        audit_append(subject, atom, PERM_VERDICT_DENY, &req->resource);
+        AuditAppend(subject, atom, PERM_VERDICT_DENY, &req->resource);
         goto out;
     }
 
@@ -808,13 +841,13 @@ static void do_check(int token, int msg_len, u64 caller_subject) {
 
     resp->ret      = VFS_ERR_ACCESS;
     resp->query_id = q->query_id;
-    audit_append(subject, atom, PERM_VERDICT_DENY, &req->resource);
+    AuditAppend(subject, atom, PERM_VERDICT_DENY, &req->resource);
 
     if (!s_quiet)
-        notify_ui(q);
+        NotifyUi(q);
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* ANSWER: user verdict → grant upsert + decision encode (allow) or
@@ -827,7 +860,7 @@ out:
  * even after ROLE_SET hot-reloads it to GUEST).  Sandbox apps never
  * hold the atom, so they cannot auto-approve their own pending
  * Powerbox queries (privilege escalation). */
-static void do_answer(int token, int msg_len, u64 caller_subject) {
+static void DoAnswer(int token, int msg_len, u64 caller_subject) {
     perm_resp_answer_t *resp = (perm_resp_answer_t *)s_resp;
     if (msg_len < (int)sizeof(perm_req_answer_t)) {
         resp->ret = ERR_INVAL;
@@ -835,7 +868,7 @@ static void do_answer(int token, int msg_len, u64 caller_subject) {
     }
     perm_req_answer_t *req = (perm_req_answer_t *)s_req;
 
-    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+    if (CapHasAtom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
         resp->ret = ERR_DENIED; /* apps cannot answer queries */
         goto out;
     }
@@ -856,7 +889,7 @@ static void do_answer(int token, int msg_len, u64 caller_subject) {
              * table entry still stands for a future re-spawn, but we
              * report the failure so the caller knows the kernel cap
              * was not issued. */
-            int enc   = decision_encode(q->subject_id, q->atom);
+            int enc   = DecisionEncode(q->subject_id, q->atom);
             resp->ret = (enc < 0) ? enc : 0;
         }
     } else {
@@ -865,23 +898,23 @@ static void do_answer(int token, int msg_len, u64 caller_subject) {
     }
 
     if (!s_quiet)
-        notify_ui(q);
+        NotifyUi(q);
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* QUERY: UI agent fetches a pending query (decision 2).
  * GATED: the response carries the query's subject/name/url — only the
  * trusted UI agent (term) and the management plane may enumerate
  * pending authorizations. */
-static void do_query(int token, int msg_len, u64 caller_subject) {
+static void DoQuery(int token, int msg_len, u64 caller_subject) {
     perm_resp_query_t *resp = (perm_resp_query_t *)s_resp;
     if (msg_len < (int)sizeof(perm_req_query_t)) {
         resp->ret = ERR_INVAL;
         goto out;
     }
-    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+    if (CapHasAtom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
         resp->ret = ERR_DENIED; /* apps cannot enumerate queries */
         goto out;
     }
@@ -906,21 +939,21 @@ static void do_query(int token, int msg_len, u64 caller_subject) {
     resp->label[0]                   = '\0';
     {
         int pos = 0;
-        fmt_append(resp->label, sizeof(resp->label), &pos, q->name);
-        fmt_append(resp->label, sizeof(resp->label), &pos, " (PID ");
-        fmt_uint(resp->label, sizeof(resp->label), &pos, (unsigned)q->pid, 10);
-        fmt_append(resp->label, sizeof(resp->label), &pos, ") → ");
-        fmt_append(resp->label, sizeof(resp->label), &pos, q->url);
-        fmt_append(resp->label, sizeof(resp->label), &pos, ", subject ");
-        fmt_uint(resp->label, sizeof(resp->label), &pos, (unsigned)q->subject_id, 10);
-        fmt_append(resp->label,
+        FmtAppend(resp->label, sizeof(resp->label), &pos, q->name);
+        FmtAppend(resp->label, sizeof(resp->label), &pos, " (PID ");
+        FmtUint(resp->label, sizeof(resp->label), &pos, (unsigned)q->pid, 10);
+        FmtAppend(resp->label, sizeof(resp->label), &pos, ") → ");
+        FmtAppend(resp->label, sizeof(resp->label), &pos, q->url);
+        FmtAppend(resp->label, sizeof(resp->label), &pos, ", subject ");
+        FmtUint(resp->label, sizeof(resp->label), &pos, (unsigned)q->subject_id, 10);
+        FmtAppend(resp->label,
                    sizeof(resp->label),
                    &pos,
                    q->state == PERM_QUERY_PENDING ? " (待决定)" : " (已决定)");
     }
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* REVOKE: drop grants (default deny).
@@ -929,7 +962,7 @@ out:
  * subject's grants requires ATOM_SERVICE_MANAGE.  Without the
  * cross-subject gate any Ring-3 process could revoke other subjects'
  * grants (DoS / privilege-removal). */
-static void do_revoke(int token, int msg_len, u64 caller_subject) {
+static void DoRevoke(int token, int msg_len, u64 caller_subject) {
     perm_resp_revoke_t *resp = (perm_resp_revoke_t *)s_resp;
     if (msg_len < (int)sizeof(perm_req_revoke_t)) {
         resp->ret = ERR_INVAL;
@@ -938,27 +971,27 @@ static void do_revoke(int token, int msg_len, u64 caller_subject) {
     perm_req_revoke_t *req = (perm_req_revoke_t *)s_req;
 
     if (req->subject_id != caller_subject &&
-        cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+        CapHasAtom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
         resp->ret = ERR_DENIED;
         goto out;
     }
 
-    resp->revoked = grant_revoke(req->subject_id, &req->resource);
+    resp->revoked = GrantRevoke(req->subject_id, &req->resource);
     resp->ret     = 0;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* GRANT: direct grant, bypasses the Powerbox (tests/management).
  * P1: carries the target subject + atom; the decision is encoded into
- * the subject's kernel table via cap_grant_to_subject().
+ * the subject's kernel table via CapGrantToSubject().
  * GATED (docs/ops_format.md §6): the CALLER must hold the
  * ATOM_SERVICE_MANAGE atom — grants beat role defaults (§四), so a
  * management-CAPABLE caller may grant even when its ROLE is not
  * management (e.g. init hot-reloaded to GUEST).  Apps can never hold
  * the management atom, so they cannot grant. */
-static void do_grant(int token, int msg_len, u64 caller_subject) {
+static void DoGrant(int token, int msg_len, u64 caller_subject) {
     perm_resp_grant_t *resp = (perm_resp_grant_t *)s_resp;
     if (msg_len < (int)sizeof(perm_req_grant_t)) {
         resp->ret = ERR_INVAL;
@@ -966,7 +999,7 @@ static void do_grant(int token, int msg_len, u64 caller_subject) {
     }
     perm_req_grant_t *req = (perm_req_grant_t *)s_req;
 
-    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+    if (CapHasAtom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
         resp->ret = ERR_DENIED; /* apps cannot grant */
         goto out;
     }
@@ -977,17 +1010,17 @@ static void do_grant(int token, int msg_len, u64 caller_subject) {
          * A failure here (e.g. ERR_NOENT — target process already exited)
          * must be propagated: otherwise the client believes the grant
          * succeeded but no kernel-enforceable cap was issued. */
-        int enc = decision_encode(req->subject_id, req->atom);
+        int enc = DecisionEncode(req->subject_id, req->atom);
         if (enc < 0)
             resp->ret = enc;
     }
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* ROLE_SET: management-plane hot reload (§二.2).  The caller's subject
- * comes from ipc_recv_from (the kernel — unforgeable); callers may
+ * comes from IpcRecvFrom(the kernel — unforgeable); callers may
  * change roles when they are OWNER/ADMIN by role (the classic
  * management plane: init is seeded OWNER), or when they are the user
  * account service itself (SERVICE_MANAGE atom + kernel-issued process
@@ -995,16 +1028,16 @@ out:
  * so a demoted init cannot self-repromote, P1 test 8).  Applied
  * immediately; grants are NOT rewritten (grants beat role defaults —
  * §四). */
-static int caller_is_user_service(u64 subject) {
-    if (cap_has_atom(subject, ATOM_SERVICE_MANAGE) != 1)
+static int CallerIsUserService(u64 subject) {
+    if (CapHasAtom(subject, ATOM_SERVICE_MANAGE) != 1)
         return 0;
     proc_ident_t ident;
-    if (proc_info_by_subject(subject, &ident) != 0)
+    if (ProcInfoBySubject(subject, &ident) != 0)
         return 0;
     return strcmp(ident.name, "user") == 0;
 }
 
-static void do_role_set(int token, int msg_len, u64 caller_subject) {
+static void DoRoleSet(int token, int msg_len, u64 caller_subject) {
     perm_resp_role_set_t *resp = (perm_resp_role_set_t *)s_resp;
     if (msg_len < (int)sizeof(perm_req_role_set_t)) {
         resp->ret = ERR_INVAL;
@@ -1012,26 +1045,26 @@ static void do_role_set(int token, int msg_len, u64 caller_subject) {
     }
     perm_req_role_set_t *req = (perm_req_role_set_t *)s_req;
 
-    if (!role_is_management(caller_subject) && !caller_is_user_service(caller_subject)) {
+    if (!RoleIsManagement(caller_subject) && !CallerIsUserService(caller_subject)) {
         resp->ret = ERR_DENIED; /* apps cannot change policy */
         goto out;
     }
-    resp->ret = role_set(req->subject_id, req->role);
+    resp->ret = RoleSet(req->subject_id, req->role);
     if (resp->ret == 0)
-        resp->role = role_of(req->subject_id);
+        resp->role = RoleOf(req->subject_id);
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* DUMP: export policy state (roles + rules + grants) for tests and
  * management.  GATED (docs/ops_format.md §6, capability-based): the
  * snapshot reveals the whole policy — management plane only. */
-static void do_dump(int token, int msg_len, u64 caller_subject) {
+static void DoDump(int token, int msg_len, u64 caller_subject) {
     (void)msg_len; /* fixed-size response; length already validated by caller */
     perm_resp_dump_t *resp = (perm_resp_dump_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
-    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+    if (CapHasAtom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
         resp->ret = ERR_DENIED; /* apps cannot export policy */
         goto out;
     }
@@ -1046,10 +1079,10 @@ static void do_dump(int token, int msg_len, u64 caller_subject) {
         resp->lines[n][0] = '\0';
         {
             int pos = 0;
-            fmt_append(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, "role: subject=");
-            fmt_uint(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, (unsigned)r->subject_id, 10);
-            fmt_append(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, " role=");
-            fmt_uint(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, r->role, 10);
+            FmtAppend(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, "role: subject=");
+            FmtUint(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, (unsigned)r->subject_id, 10);
+            FmtAppend(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, " role=");
+            FmtUint(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, r->role, 10);
         }
         n++;
     }
@@ -1062,18 +1095,18 @@ static void do_dump(int token, int msg_len, u64 caller_subject) {
     if (n < 8) {
         for (u32 role = 0; role < PERM_ROLE_MAX && n < 8; role++) {
             for (u32 atom = 0; atom <= ATOM_MAX && n < 8; atom++) {
-                i32 v = rule_lookup(role, atom);
+                i32 v = RuleLookup(role, atom);
                 if (v < 0)
                     continue;
                 resp->lines[n][0] = '\0';
                 {
                     int pos = 0;
-                    fmt_append(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, "rule: role=");
-                    fmt_uint(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, role, 10);
-                    fmt_append(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, " atom=");
-                    fmt_uint(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, atom, 10);
-                    fmt_append(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, " ");
-                    fmt_append(resp->lines[n],
+                    FmtAppend(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, "rule: role=");
+                    FmtUint(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, role, 10);
+                    FmtAppend(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, " atom=");
+                    FmtUint(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, atom, 10);
+                    FmtAppend(resp->lines[n], PERM_DUMP_LINE_MAX, &pos, " ");
+                    FmtAppend(resp->lines[n],
                                PERM_DUMP_LINE_MAX,
                                &pos,
                                v == PERM_VERDICT_ALLOW ? "ALLOW" : "DENY");
@@ -1085,7 +1118,7 @@ static void do_dump(int token, int msg_len, u64 caller_subject) {
     resp->ret = 0;
 
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* ====================================================================
@@ -1098,31 +1131,31 @@ out:
  * ==================================================================== */
 
 /* CONTEXT (P3 预留): 前台/后台切换通知。 */
-static void do_context(int token, int msg_len, u64 caller_subject) {
+static void DoContext(int token, int msg_len, u64 caller_subject) {
     perm_resp_context_t *resp = (perm_resp_context_t *)s_resp;
     resp->ret                 = ERR_INVAL;
     if (msg_len < (int)sizeof(perm_req_context_t))
         goto out;
-    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+    if (CapHasAtom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
         resp->ret = ERR_DENIED; /* apps cannot manipulate context */
         goto out;
     }
     perm_req_context_t *req = (perm_req_context_t *)s_req;
-    resp->ret               = ctx_upsert(req->subject_id, req->foreground);
+    resp->ret               = CtxUpsert(req->subject_id, req->foreground);
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* FREQ (P3 预留): 查询/清零授权命中频率计数器。
  * GATED: frequency counters are per-subject telemetry — management
  * plane only. */
-static void do_freq(int token, int msg_len, u64 caller_subject) {
+static void DoFreq(int token, int msg_len, u64 caller_subject) {
     perm_resp_freq_t *resp = (perm_resp_freq_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
     if (msg_len < (int)sizeof(perm_req_freq_t))
         goto out;
-    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+    if (CapHasAtom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
         resp->ret = ERR_DENIED; /* apps cannot read frequency telemetry */
         goto out;
     }
@@ -1146,24 +1179,24 @@ static void do_freq(int token, int msg_len, u64 caller_subject) {
     resp->slots = slots;
     resp->ret   = 0;
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* POLICY_SAVE (P4 预留): 导出策略二进制快照。
  * 只要求 op 字段即可（size/data 是 LOAD 方向用的）。
  * GATED (docs/ops_format.md §6): the snapshot reveals the whole policy
  * (roles, rules, grants) — management plane only. */
-static void do_policy_save(int token, int msg_len, u64 caller_subject) {
+static void DoPolicySave(int token, int msg_len, u64 caller_subject) {
     perm_resp_policy_t *resp = (perm_resp_policy_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
     if (msg_len < (int)sizeof(u32))
         goto out;
-    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+    if (CapHasAtom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
         resp->ret = ERR_DENIED; /* apps cannot export policy */
         goto out;
     }
-    int n = policy_serialize(resp->data, (int)sizeof(resp->data));
+    int n = PolicySerialize(resp->data, (int)sizeof(resp->data));
     if (n < 0) {
         resp->ret = n;
         goto out;
@@ -1171,7 +1204,7 @@ static void do_policy_save(int token, int msg_len, u64 caller_subject) {
     resp->size = (u32)n;
     resp->ret  = 0;
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* POLICY_LOAD (P4 预留): 导入策略二进制快照（全有或全无 + 热更新）。
@@ -1179,13 +1212,13 @@ out:
  * engine's whole state (roles/rules/grants).  An ungated load would
  * let any Ring-3 process inject a policy that promotes itself to
  * OWNER with full-allow rules — complete permission takeover. */
-static void do_policy_load(int token, int msg_len, u64 caller_subject) {
+static void DoPolicyLoad(int token, int msg_len, u64 caller_subject) {
     perm_resp_policy_t *resp = (perm_resp_policy_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
     if (msg_len < (int)sizeof(perm_req_policy_t))
         goto out;
-    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+    if (CapHasAtom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
         resp->ret = ERR_DENIED; /* apps cannot import policy */
         goto out;
     }
@@ -1194,9 +1227,9 @@ static void do_policy_load(int token, int msg_len, u64 caller_subject) {
         resp->ret = ERR_INVAL;
         goto out;
     }
-    resp->ret = policy_deserialize(req->data, (int)req->size);
+    resp->ret = PolicyDeserialize(req->data, (int)req->size);
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
 /* AUDIT (P3 预留): 导出审计环形缓冲区（最旧在前）。
@@ -1205,7 +1238,7 @@ out:
 /* SET_QUIET: management-only switch that suppresses UI_SHOW pushes
  * (init's P1 permission tests).  GATED like do_grant/do_role_set:
  * the caller must hold ATOM_SERVICE_MANAGE. */
-static void do_set_quiet(int token, int msg_len, u64 caller_subject) {
+static void DoSetQuiet(int token, int msg_len, u64 caller_subject) {
     perm_resp_set_quiet_t *resp = (perm_resp_set_quiet_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
@@ -1213,7 +1246,7 @@ static void do_set_quiet(int token, int msg_len, u64 caller_subject) {
         goto out;
     perm_req_set_quiet_t *req = (perm_req_set_quiet_t *)s_req;
 
-    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+    if (CapHasAtom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
         resp->ret = ERR_DENIED; /* management plane only */
         goto out;
     }
@@ -1222,16 +1255,16 @@ static void do_set_quiet(int token, int msg_len, u64 caller_subject) {
     resp->ret = 0;
     printf("perm: UI_SHOW %s\n", s_quiet ? "suppressed (quiet)" : "enabled");
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void do_audit(int token, int msg_len, u64 caller_subject) {
+static void DoAudit(int token, int msg_len, u64 caller_subject) {
     perm_resp_audit_t *resp = (perm_resp_audit_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
     resp->ret = ERR_INVAL;
     if (msg_len < (int)sizeof(perm_req_audit_t))
         goto out;
-    if (cap_has_atom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
+    if (CapHasAtom(caller_subject, ATOM_SERVICE_MANAGE) != 1) {
         resp->ret = ERR_DENIED; /* apps cannot read the audit log */
         goto out;
     }
@@ -1242,54 +1275,54 @@ static void do_audit(int token, int msg_len, u64 caller_subject) {
     resp->count = n;
     resp->ret   = 0;
 out:
-    (void)ipc_reply(token, resp, (int)sizeof(*resp));
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
-static void perm_handle_request(int token, u32 op, int msg_len, u64 caller_subject) {
+static void PermHandleRequest(int token, u32 op, int msg_len, u64 caller_subject) {
     switch (op) {
     case PERM_OP_CHECK:
-        do_check(token, msg_len, caller_subject);
+        DoCheck(token, msg_len, caller_subject);
         break;
     case PERM_OP_ANSWER:
-        do_answer(token, msg_len, caller_subject);
+        DoAnswer(token, msg_len, caller_subject);
         break;
     case PERM_OP_QUERY:
-        do_query(token, msg_len, caller_subject);
+        DoQuery(token, msg_len, caller_subject);
         break;
     case PERM_OP_REVOKE:
-        do_revoke(token, msg_len, caller_subject);
+        DoRevoke(token, msg_len, caller_subject);
         break;
     case PERM_OP_GRANT:
-        do_grant(token, msg_len, caller_subject);
+        DoGrant(token, msg_len, caller_subject);
         break;
     case PERM_OP_ROLE_SET:
-        do_role_set(token, msg_len, caller_subject);
+        DoRoleSet(token, msg_len, caller_subject);
         break;
     case PERM_OP_DUMP:
-        do_dump(token, msg_len, caller_subject);
+        DoDump(token, msg_len, caller_subject);
         break;
     case PERM_OP_CONTEXT:
-        do_context(token, msg_len, caller_subject);
+        DoContext(token, msg_len, caller_subject);
         break;
     case PERM_OP_FREQ:
-        do_freq(token, msg_len, caller_subject);
+        DoFreq(token, msg_len, caller_subject);
         break;
     case PERM_OP_POLICY_SAVE:
-        do_policy_save(token, msg_len, caller_subject);
+        DoPolicySave(token, msg_len, caller_subject);
         break;
     case PERM_OP_POLICY_LOAD:
-        do_policy_load(token, msg_len, caller_subject);
+        DoPolicyLoad(token, msg_len, caller_subject);
         break;
     case PERM_OP_AUDIT:
-        do_audit(token, msg_len, caller_subject);
+        DoAudit(token, msg_len, caller_subject);
         break;
     case PERM_OP_SET_QUIET:
-        do_set_quiet(token, msg_len, caller_subject);
+        DoSetQuiet(token, msg_len, caller_subject);
         break;
     default: {
         i32 *resp = (i32 *)s_resp;
         *resp     = ERR_INVAL;
-        (void)ipc_reply(token, resp, (int)sizeof(i32));
+        (void)IpcReply(token, resp, (int)sizeof(i32));
         break;
     }
     }
@@ -1309,7 +1342,7 @@ static void perm_handle_request(int token, u32 op, int msg_len, u64 caller_subje
  *   CHILD    — restricted: read allowed, write/exec denied.
  *   GUEST    — minimal: everything denied.
  *   AUDITOR  — read-only + audit: read allowed, write denied. */
-static void seed_rules(void) {
+static void SeedRules(void) {
     static const struct {
         u32 role;
         u32 atom;
@@ -1348,7 +1381,7 @@ static void seed_rules(void) {
         {PERM_ROLE_AUDITOR, ATOM_DATA_SYS_LOGS_READ, PERM_VERDICT_ALLOW},
     };
     for (u32 i = 0; i < sizeof(seeds) / sizeof(seeds[0]); i++)
-        rule_seed(seeds[i].role, seeds[i].atom, seeds[i].verdict);
+        RuleSeed(seeds[i].role, seeds[i].atom, seeds[i].verdict);
 }
 
 /* ====================================================================
@@ -1370,25 +1403,25 @@ int main(void) {
     for (u32 role = 0; role < PERM_ROLE_MAX; role++)
         for (u32 atom = 0; atom <= ATOM_MAX; atom++)
             s_rule_head[role][atom] = PERM_CHAIN_NONE;
-    s_query_seq = (u32)get_time() & 0x7FFFFFFFu;
+    s_query_seq = (u32)GetTime() & 0x7FFFFFFFu;
 
     /* Bootstrap roles (§二.2): the policy engine itself is the top
      * authority (OWNER); init (kernel subject 1, the device owner) is
      * seeded OWNER too.  Both come from unforgeable kernel sources:
-     * get_subject() and the documented kernel subject numbering. */
-    role_set(get_subject(), PERM_ROLE_OWNER);
-    role_set(PERM_BOOTSTRAP_SUBJECT, PERM_BOOTSTRAP_ROLE);
-    seed_rules();
+     * GetSubject() and the documented kernel subject numbering. */
+    RoleSet(GetSubject(), PERM_ROLE_OWNER);
+    RoleSet(PERM_BOOTSTRAP_SUBJECT, PERM_BOOTSTRAP_ROLE);
+    SeedRules();
 
-    int port = ipc_port_create();
+    int port = IpcPortCreate();
     if (port < 0) {
         printf("perm: ipc_port_create failed (%d)\n", port);
-        thread_exit(1);
+        ThreadExit(1);
     }
-    int ret = port_register(PERM_PORT_NAME, port);
+    int ret = PortRegister(PERM_PORT_NAME, port);
     if (ret < 0) {
-        printf("perm: port_register('%s') failed (%d)\n", PERM_PORT_NAME, ret);
-        thread_exit(1);
+        printf("perm: PortRegister('%s') failed (%d)\n", PERM_PORT_NAME, ret);
+        ThreadExit(1);
     }
     printf("perm: port %d registered as '%s'\n", port, PERM_PORT_NAME);
 
@@ -1402,18 +1435,18 @@ int main(void) {
         int msg_len        = (int)sizeof(s_req);
         int token          = 0;
         u64 caller_subject = 0;
-        ret                = ipc_recv_from(port, s_req, &msg_len, &token, &caller_subject);
+        ret                = IpcRecvFrom(port, s_req, &msg_len, &token, &caller_subject);
         if (ret < 0) {
             printf("perm: ipc_recv failed (%d)\n", ret);
-            thread_exit(1);
+            ThreadExit(1);
         }
         if (msg_len < (int)sizeof(u32)) { /* no op code */
             i32 *resp = (i32 *)s_resp;
             *resp     = ERR_INVAL;
-            (void)ipc_reply(token, resp, (int)sizeof(i32));
+            (void)IpcReply(token, resp, (int)sizeof(i32));
             continue;
         }
         u32 op = *(u32 *)s_req;
-        perm_handle_request(token, op, msg_len, caller_subject);
+        PermHandleRequest(token, op, msg_len, caller_subject);
     }
 }

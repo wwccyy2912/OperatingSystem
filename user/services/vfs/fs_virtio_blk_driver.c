@@ -1,4 +1,17 @@
 /*
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details: <https://www.gnu.org/licenses/>.
+ *
  * fs_virtio_blk_driver.c - Virtio-blk disk filesystem driver (ring-3)
  * Copyright (c) 2026 OpSys Project
  *
@@ -46,6 +59,28 @@
  * obj_id == the PCI table index of the 0x1AF4/0x1001 device and
  * RIGHT_READ|RIGHT_WRITE (cap_create_obj).  The disk index is found
  * dynamically by scanning the userspace PCI enumeration.
+ *
+ * ------------------------------------------------------------------
+ * Structure (disk volume): one persistent RW "Disk" volume over the
+ *   kernel virtio-blk adapter (SYS_BLK_READ/WRITE/INFO); on-disk
+ *   layout = superblock (sector 0) + inode table (sectors 1-256,
+ *   mirrored to a 32 KB RAM array) + data extents (sector 257+);
+ *   driver port "vfs.fs.virtio_blk".
+ * How it works:
+ *   The manager-spawned process scans userspace PCI for the
+ *   0x1AF4/0x1001 device, opens CAP_TYPE_PCI_DEV caps, runs
+ *   VbdkFormat() when the superblock magic is absent, then VbdkMount()
+ *   (MOUNT handshake, registers "Disk").  Every inode-table mutation
+ *   is a synchronous RMW; the free bitmap is derived from the inode
+ *   table on every mount.
+ * Purpose:
+ *   The only persistence surface in the system: an 8 MiB QEMU disk.img
+ *   (cache=writethrough) backing the Disk volume.
+ * Caveats:
+ *   No caching and no background flush; RMW must never clobber the
+ *   sibling inodes in a sector, and partial-sector data writes RMW
+ *   the touched sectors.  The UUID is generated once at format time.
+ * ------------------------------------------------------------------
  */
 
 #include <stdint.h>
@@ -67,7 +102,7 @@
                                                                        * (255 usable + NUL),
                                                                        * matching the mem
                                                                        * volume so a CJK
-                                                                       * name (up to 85
+                                                                       * name(up to 85
                                                                        * chars) behaves the
                                                                        * same on Disk        */
 #define VBDK_INODES_PER_SECTOR   (VBDK_SECTOR_SIZE / VBDK_INODE_SIZE) /* 1 */
@@ -154,7 +189,7 @@ static u8 s_resp[DRV_RESP_MAX];
  * Block device I/O
  * ==================================================================== */
 
-static i32 vbdk_sector_read(u64 lba, void *buf) {
+static i32 VbdkSectorRead(u64 lba, void *buf) {
     if (lba >= (u64)s_vol.nsectors)
         return ERR_INVAL;
     int64_t r = sys_blk_read((u64)s_vol.disk, lba, 1, buf);
@@ -165,7 +200,7 @@ static i32 vbdk_sector_read(u64 lba, void *buf) {
     return 0;
 }
 
-static i32 vbdk_sector_write(u64 lba, const void *buf) {
+static i32 VbdkSectorWrite(u64 lba, const void *buf) {
     if (lba >= (u64)s_vol.nsectors)
         return ERR_INVAL;
     int64_t r = sys_blk_write((u64)s_vol.disk, lba, 1, buf);
@@ -180,25 +215,25 @@ static i32 vbdk_sector_write(u64 lba, const void *buf) {
  * Derived free-block bitmap
  * ==================================================================== */
 
-static int bm_test(u32 blk) {
+static int BmTest(u32 blk) {
     return (s_blkmap[blk >> 3] >> (blk & 7)) & 1;
 }
 
-static void bm_set(u32 blk) {
+static void BmSet(u32 blk) {
     s_blkmap[blk >> 3] |= (u8)(1u << (blk & 7));
 }
 
-static void bm_clear(u32 blk) {
+static void BmClear(u32 blk) {
     s_blkmap[blk >> 3] &= (u8) ~(1u << (blk & 7));
 }
 
 /* Rebuild the derived bitmap from the inode table: sectors 0..64
  * (superblock + inode table) are reserved; every in-use inode's extent
  * is marked; everything else is free.  Also recomputes used_bytes. */
-static void vbdk_rebuild_bitmap(void) {
+static void VbdkRebuildBitmap(void) {
     memset(s_blkmap, 0, sizeof(s_blkmap));
     for (u32 b = 0; b < VBDK_DATA_START; b++)
-        bm_set(b); /* superblock + inode table */
+        BmSet(b); /* superblock + inode table */
 
     s_vol.used_bytes = 0;
     for (u32 i = 1; i <= VBDK_MAX_INODES; i++) {
@@ -208,31 +243,31 @@ static void vbdk_rebuild_bitmap(void) {
         s_vol.used_bytes += it->size;
         if (it->extent_blocks > 0)
             for (u32 j = 0; j < it->extent_blocks; j++)
-                bm_set(it->extent_start + j);
+                BmSet(it->extent_start + j);
     }
 }
 
 /* Release an extent back to the free map. */
-static void vbdk_extent_release(u32 start, u32 blocks) {
+static void VbdkExtentRelease(u32 start, u32 blocks) {
     for (u32 i = 0; i < blocks; i++)
-        bm_clear(start + i);
+        BmClear(start + i);
 }
 
 /* First-fit allocation of `blocks` contiguous data blocks.
  * Returns the start block, or -1 when the volume is full. */
-static i32 vbdk_extent_alloc(u32 blocks) {
+static i32 VbdkExtentAlloc(u32 blocks) {
     if (blocks == 0)
         return 0;
     u32 run = 0;
     for (u32 blk = VBDK_DATA_START; blk < s_vol.nsectors; blk++) {
-        if (bm_test(blk)) {
+        if (BmTest(blk)) {
             run = 0;
             continue;
         }
         if (++run == blocks) {
             u32 start = blk - blocks + 1;
             for (u32 i = 0; i < blocks; i++)
-                bm_set(start + i);
+                BmSet(start + i);
             return (i32)start;
         }
     }
@@ -252,19 +287,19 @@ static vbdk_inode_t *vbdk_find(vfs_item_id_t id) {
 
 /* RMW store of one inode: read its sector, splice the 128-byte record
  * in, write the sector back — the 3 sibling inodes are never touched. */
-static i32 vbdk_inode_store(const vbdk_inode_t *in, u64 num) {
+static i32 VbdkInodeStore(const vbdk_inode_t *in, u64 num) {
     static u8 sbuf[VBDK_SECTOR_SIZE];
     u64       sec = VBDK_INODE_TABLE_START + (num - 1) / VBDK_INODES_PER_SECTOR;
     size_t    off = (size_t)((num - 1) % VBDK_INODES_PER_SECTOR) * VBDK_INODE_SIZE;
 
-    i32 r = vbdk_sector_read(sec, sbuf);
+    i32 r = VbdkSectorRead(sec, sbuf);
     if (r < 0)
         return r;
     memcpy(sbuf + off, in, VBDK_INODE_SIZE);
-    return vbdk_sector_write(sec, sbuf);
+    return VbdkSectorWrite(sec, sbuf);
 }
 
-static i32 vbdk_lookup(vfs_item_id_t parent, const char *name, vfs_item_id_t *out) {
+static i32 VbdkLookup(vfs_item_id_t parent, const char *name, vfs_item_id_t *out) {
     if (!name)
         return ERR_INVAL;
     size_t nlen = strlen(name);
@@ -283,7 +318,7 @@ static i32 vbdk_lookup(vfs_item_id_t parent, const char *name, vfs_item_id_t *ou
 /* Internal create primitive — no read-only check (the Disk volume is
  * RW; the check lives in vbdk_create for protocol parity). */
 static i32
-vbdk_create_item(vfs_item_id_t parent, const char *name, u32 type, vfs_item_id_t *out_id) {
+VbdkCreateItem(vfs_item_id_t parent, const char *name, u32 type, vfs_item_id_t *out_id) {
     if (!name || !name[0])
         return ERR_INVAL;
     if (strlen(name) >= VBDK_NAME_MAX)
@@ -294,7 +329,7 @@ vbdk_create_item(vfs_item_id_t parent, const char *name, u32 type, vfs_item_id_t
         return ERR_NOENT;
 
     vfs_item_id_t dup = 0;
-    if (vbdk_lookup(parent, name, &dup) == 0)
+    if (VbdkLookup(parent, name, &dup) == 0)
         return VFS_ERR_EXISTS;
 
     if (s_vol.inode_count >= VBDK_MAX_INODES)
@@ -310,25 +345,25 @@ vbdk_create_item(vfs_item_id_t parent, const char *name, u32 type, vfs_item_id_t
     it->item_id   = (u64)(idx + 1);
     strncpy(it->name, name, sizeof(it->name) - 1);
     it->name[sizeof(it->name) - 1] = '\0';
-    it->created                    = (u64)get_time();
+    it->created                    = (u64)GetTime();
     it->modified                   = it->created;
     *out_id                        = (vfs_item_id_t)(idx + 1);
 
-    if (vbdk_inode_store(it, (u64)(idx + 1)) < 0)
+    if (VbdkInodeStore(it, (u64)(idx + 1)) < 0)
         return ERR_FAULT;
     return 0;
 }
 
-static i32 vbdk_create(vfs_item_id_t parent, const char *name, u32 type, vfs_item_id_t *out_id) {
+static i32 VbdkCreate(vfs_item_id_t parent, const char *name, u32 type, vfs_item_id_t *out_id) {
     if (s_vol.read_only)
         return VFS_ERR_READONLY;
-    return vbdk_create_item(parent, name, type, out_id);
+    return VbdkCreateItem(parent, name, type, out_id);
 }
 
 /* Recursive delete of inode id (dir children first).  Frees the data
  * extent, subtracts the size, zeroes the record (write-through).  The
  * inode NUMBER is never reused. */
-static i32 vbdk_delete(vfs_item_id_t id, u32 recursive) {
+static i32 VbdkDelete(vfs_item_id_t id, u32 recursive) {
     if (s_vol.read_only)
         return VFS_ERR_READONLY;
     vbdk_inode_t *it = vbdk_find(id);
@@ -342,7 +377,7 @@ static i32 vbdk_delete(vfs_item_id_t id, u32 recursive) {
                 continue;
             if (!recursive)
                 return ERR_BUSY; /* dir not empty */
-            i32 r = vbdk_delete((vfs_item_id_t)i, 1);
+            i32 r = VbdkDelete((vfs_item_id_t)i, 1);
             if (r < 0)
                 return r;
             i = 0; /* table changed; rescan */
@@ -350,10 +385,10 @@ static i32 vbdk_delete(vfs_item_id_t id, u32 recursive) {
     }
 
     if (it->extent_blocks > 0)
-        vbdk_extent_release(it->extent_start, it->extent_blocks);
+        VbdkExtentRelease(it->extent_start, it->extent_blocks);
     s_vol.used_bytes -= it->size;
     memset(it, 0, sizeof(*it)); /* free; number never reused */
-    if (vbdk_inode_store(it, id) < 0)
+    if (VbdkInodeStore(it, id) < 0)
         return ERR_FAULT;
     return 0;
 }
@@ -365,7 +400,7 @@ static i32 vbdk_delete(vfs_item_id_t id, u32 recursive) {
  * payload.name renames; an empty name keeps it.  Rejects moving a dir
  * into its own subtree.
  */
-static i32 vbdk_move(vfs_item_id_t id, vfs_item_id_t new_parent, const char *name) {
+static i32 VbdkMove(vfs_item_id_t id, vfs_item_id_t new_parent, const char *name) {
     if (s_vol.read_only)
         return VFS_ERR_READONLY;
     vbdk_inode_t *it = vbdk_find(id);
@@ -384,7 +419,7 @@ static i32 vbdk_move(vfs_item_id_t id, vfs_item_id_t new_parent, const char *nam
     /* Destination collision (same parent + same name = no-op). */
     if (it->parent_id != new_parent || (name && name[0] && strcmp(name, it->name) != 0)) {
         vfs_item_id_t dup = 0;
-        if (vbdk_lookup(new_parent, final_name, &dup) == 0)
+        if (VbdkLookup(new_parent, final_name, &dup) == 0)
             return VFS_ERR_EXISTS;
     }
 
@@ -406,8 +441,8 @@ static i32 vbdk_move(vfs_item_id_t id, vfs_item_id_t new_parent, const char *nam
         strncpy(it->name, name, sizeof(it->name) - 1);
         it->name[sizeof(it->name) - 1] = '\0';
     }
-    it->modified = (u64)get_time();
-    if (vbdk_inode_store(it, id) < 0)
+    it->modified = (u64)GetTime();
+    if (VbdkInodeStore(it, id) < 0)
         return ERR_FAULT;
     return 0; /* inode number stays stable */
 }
@@ -420,20 +455,20 @@ static i32 vbdk_move(vfs_item_id_t id, vfs_item_id_t new_parent, const char *nam
 
 /* Write `len` bytes at byte-offset `off` inside the inode's extent.
  * off+len must be <= extent_blocks * 512. */
-static i32 vbdk_rw_write(u64 off, u32 len, const u8 *data, const vbdk_inode_t *it) {
+static i32 VbdkRwWrite(u64 off, u32 len, const u8 *data, const vbdk_inode_t *it) {
     static u8 sbuf[VBDK_SECTOR_SIZE];
     u64       end = off + len;
     for (u64 s = off / VBDK_SECTOR_SIZE; s <= (end - 1) / VBDK_SECTOR_SIZE; s++) {
         u64 sect_off = s * VBDK_SECTOR_SIZE;
         u64 cstart   = (off > sect_off) ? off : sect_off;
         u64 cend     = (end < sect_off + VBDK_SECTOR_SIZE) ? end : sect_off + VBDK_SECTOR_SIZE;
-        i32 r        = vbdk_sector_read((u64)it->extent_start + s, sbuf);
+        i32 r        = VbdkSectorRead((u64)it->extent_start + s, sbuf);
         if (r < 0)
             return r;
         memcpy(sbuf + (size_t)(cstart - sect_off),
                data + (size_t)(cstart - off),
                (size_t)(cend - cstart));
-        r = vbdk_sector_write((u64)it->extent_start + s, sbuf);
+        r = VbdkSectorWrite((u64)it->extent_start + s, sbuf);
         if (r < 0)
             return r;
     }
@@ -442,14 +477,14 @@ static i32 vbdk_rw_write(u64 off, u32 len, const u8 *data, const vbdk_inode_t *i
 
 /* Read `len` bytes at byte-offset `off`; caller guarantees the range
  * fits the extent. */
-static i32 vbdk_rw_read(u64 off, u32 len, u8 *out, const vbdk_inode_t *it) {
+static i32 VbdkRwRead(u64 off, u32 len, u8 *out, const vbdk_inode_t *it) {
     static u8 sbuf[VBDK_SECTOR_SIZE];
     u64       end = off + len;
     for (u64 s = off / VBDK_SECTOR_SIZE; s <= (end - 1) / VBDK_SECTOR_SIZE; s++) {
         u64 sect_off = s * VBDK_SECTOR_SIZE;
         u64 cstart   = (off > sect_off) ? off : sect_off;
         u64 cend     = (end < sect_off + VBDK_SECTOR_SIZE) ? end : sect_off + VBDK_SECTOR_SIZE;
-        i32 r        = vbdk_sector_read((u64)it->extent_start + s, sbuf);
+        i32 r        = VbdkSectorRead((u64)it->extent_start + s, sbuf);
         if (r < 0)
             return r;
         memcpy(out + (size_t)(cstart - off),
@@ -461,7 +496,7 @@ static i32 vbdk_rw_read(u64 off, u32 len, u8 *out, const vbdk_inode_t *it) {
 
 /* Zero the byte range [from, to) inside the extent (hole fill — new
  * blocks read as NUL, matching fs_mem_driver hole semantics). */
-static i32 vbdk_zero_range(u64 from, u64 to, const vbdk_inode_t *it) {
+static i32 VbdkZeroRange(u64 from, u64 to, const vbdk_inode_t *it) {
     static u8 sbuf[VBDK_SECTOR_SIZE];
     if (to <= from)
         return 0;
@@ -470,11 +505,11 @@ static i32 vbdk_zero_range(u64 from, u64 to, const vbdk_inode_t *it) {
         u64 sect_off = s * VBDK_SECTOR_SIZE;
         u64 cstart   = (from > sect_off) ? from : sect_off;
         u64 cend     = (end < sect_off + VBDK_SECTOR_SIZE) ? end : sect_off + VBDK_SECTOR_SIZE;
-        i32 r        = vbdk_sector_read((u64)it->extent_start + s, sbuf);
+        i32 r        = VbdkSectorRead((u64)it->extent_start + s, sbuf);
         if (r < 0)
             return r;
         memset(sbuf + (size_t)(cstart - sect_off), 0, (size_t)(cend - cstart));
-        r = vbdk_sector_write((u64)it->extent_start + s, sbuf);
+        r = VbdkSectorWrite((u64)it->extent_start + s, sbuf);
         if (r < 0)
             return r;
     }
@@ -487,7 +522,7 @@ static i32 vbdk_zero_range(u64 from, u64 to, const vbdk_inode_t *it) {
  * file to a fresh contiguous extent (copy old data, free the old
  * extent).  Mutates RAM state only — the caller persists the inode.
  */
-static i32 vbdk_extent_ensure(vbdk_inode_t *it, u32 need) {
+static i32 VbdkExtentEnsure(vbdk_inode_t *it, u32 need) {
     static u8 cbuf[VBDK_SECTOR_SIZE];
 
     if (it->extent_blocks >= need)
@@ -498,17 +533,17 @@ static i32 vbdk_extent_ensure(vbdk_inode_t *it, u32 need) {
         u32 extra = need - it->extent_blocks;
         int ok    = (end + extra <= s_vol.nsectors);
         for (u32 i = 0; ok && i < extra; i++)
-            ok = !bm_test(end + i);
+            ok = !BmTest(end + i);
         if (ok) { /* extend in place */
             for (u32 i = 0; i < extra; i++)
-                bm_set(end + i);
+                BmSet(end + i);
             it->extent_blocks = need;
             return 0;
         }
     }
 
     /* Migrate: fresh contiguous extent, copy old data, free the old. */
-    i32 ns = vbdk_extent_alloc(need);
+    i32 ns = VbdkExtentAlloc(need);
     if (ns < 0)
         return VFS_ERR_NOSPC;
 
@@ -516,29 +551,29 @@ static i32 vbdk_extent_ensure(vbdk_inode_t *it, u32 need) {
     if (old_blocks > need)
         old_blocks = need;
     for (u32 i = 0; i < old_blocks; i++) {
-        i32 r = vbdk_sector_read((u64)it->extent_start + i, cbuf);
+        i32 r = VbdkSectorRead((u64)it->extent_start + i, cbuf);
         if (r < 0) {
             /* Roll back the fresh extent: it was bm_set by
              * vbdk_extent_alloc but is not yet referenced by the
              * inode — without this the blocks leak from the derived
              * bitmap until the next rebuild (volume appears full). */
-            vbdk_extent_release((u32)ns, need);
+            VbdkExtentRelease((u32)ns, need);
             return r;
         }
-        r = vbdk_sector_write((u64)ns + i, cbuf);
+        r = VbdkSectorWrite((u64)ns + i, cbuf);
         if (r < 0) {
-            vbdk_extent_release((u32)ns, need);
+            VbdkExtentRelease((u32)ns, need);
             return r;
         }
     }
     if (it->extent_blocks > 0)
-        vbdk_extent_release(it->extent_start, it->extent_blocks);
+        VbdkExtentRelease(it->extent_start, it->extent_blocks);
     it->extent_start  = (u32)ns;
     it->extent_blocks = need;
     return 0;
 }
 
-static i32 vbdk_read(vfs_item_id_t id, u64 offset, u32 len, u8 *out) {
+static i32 VbdkRead(vfs_item_id_t id, u64 offset, u32 len, u8 *out) {
     vbdk_inode_t *it = vbdk_find(id);
     if (!it)
         return ERR_NOENT;
@@ -551,11 +586,11 @@ static i32 vbdk_read(vfs_item_id_t id, u64 offset, u32 len, u8 *out) {
         len = (u32)avail;
     if (len > DRV_MAX_PAYLOAD)
         len = DRV_MAX_PAYLOAD;
-    i32 r = vbdk_rw_read(offset, len, out, it);
+    i32 r = VbdkRwRead(offset, len, out, it);
     return (r < 0) ? r : (i32)len;
 }
 
-static i32 vbdk_write(vfs_item_id_t id, u64 offset, u32 len, const u8 *in) {
+static i32 VbdkWrite(vfs_item_id_t id, u64 offset, u32 len, const u8 *in) {
     if (s_vol.read_only)
         return VFS_ERR_READONLY;
     vbdk_inode_t *it = vbdk_find(id);
@@ -568,13 +603,13 @@ static i32 vbdk_write(vfs_item_id_t id, u64 offset, u32 len, const u8 *in) {
     if (len == 0) {
         if (offset == 0 && it->size > 0) {
             if (it->extent_blocks > 0)
-                vbdk_extent_release(it->extent_start, it->extent_blocks);
+                VbdkExtentRelease(it->extent_start, it->extent_blocks);
             s_vol.used_bytes -= it->size;
             it->extent_start  = 0;
             it->extent_blocks = 0;
             it->size          = 0;
-            it->modified      = (u64)get_time();
-            if (vbdk_inode_store(it, id) < 0)
+            it->modified      = (u64)GetTime();
+            if (VbdkInodeStore(it, id) < 0)
                 return ERR_FAULT;
         }
         return 0;
@@ -585,15 +620,15 @@ static i32 vbdk_write(vfs_item_id_t id, u64 offset, u32 len, const u8 *in) {
         return VFS_ERR_NOSPC;
 
     u32 need_blk = (u32)((need + VBDK_SECTOR_SIZE - 1) / VBDK_SECTOR_SIZE);
-    i32 r        = vbdk_extent_ensure(it, need_blk);
+    i32 r        = VbdkExtentEnsure(it, need_blk);
     if (r < 0)
         return r;
 
     /* Hole: zero-fill old_size..offset so gaps read as NUL. */
     if (offset > it->size)
-        vbdk_zero_range(it->size, offset, it);
+        VbdkZeroRange(it->size, offset, it);
 
-    r = vbdk_rw_write(offset, len, in, it);
+    r = VbdkRwWrite(offset, len, in, it);
     if (r < 0)
         return r;
 
@@ -601,14 +636,14 @@ static i32 vbdk_write(vfs_item_id_t id, u64 offset, u32 len, const u8 *in) {
         s_vol.used_bytes += need - it->size;
         it->size = need;
     }
-    it->modified = (u64)get_time();
-    if (vbdk_inode_store(it, id) < 0)
+    it->modified = (u64)GetTime();
+    if (VbdkInodeStore(it, id) < 0)
         return ERR_FAULT;
     return (i32)len;
 }
 
 /* Collect up to VFS_ENUM_BATCH child names starting at index `from`. */
-static i32 vbdk_enum(vfs_item_id_t parent, u32 from, drv_resp_t *resp) {
+static i32 VbdkEnum(vfs_item_id_t parent, u32 from, drv_resp_t *resp) {
     u32 n = 0;
     for (u32 i = 1; i <= s_vol.inode_count && n < VFS_ENUM_BATCH; i++) {
         vbdk_inode_t *it = &s_vol.inodes[i - 1];
@@ -628,7 +663,7 @@ static i32 vbdk_enum(vfs_item_id_t parent, u32 from, drv_resp_t *resp) {
     return (i32)n;
 }
 
-static i32 vbdk_getattr(vfs_item_id_t id, vfs_item_info_t *out) {
+static i32 VbdkGetattr(vfs_item_id_t id, vfs_item_info_t *out) {
     vbdk_inode_t *it = vbdk_find(id);
     if (!it)
         return ERR_NOENT;
@@ -655,7 +690,7 @@ static i32 vbdk_getattr(vfs_item_id_t id, vfs_item_info_t *out) {
 /* Write a fresh volume: superblock + zeroed inode table with root
  * inode 1, and a NEW time-derived UUID (persisted — Phase-2 bookmarks
  * key on it). */
-static i32 vbdk_format(void) {
+static i32 VbdkFormat(void) {
     static u8 zbuf[VBDK_SECTOR_SIZE];
 
     /* Superblock. */
@@ -667,15 +702,15 @@ static i32 vbdk_format(void) {
     sb.inode_table_sectors = VBDK_INODE_TABLE_SECTORS;
     sb.data_start          = VBDK_DATA_START;
     sb.uuid_hi             = VBDK_UUID_HI_MAGIC;
-    int t0                 = get_time();
-    int t1                 = get_time();
+    int t0                 = GetTime();
+    int t1                 = GetTime();
     sb.uuid_lo             = ((u64)(u32)t0 << 32) | (u32)(t1 ^ 0x5642444Bu);
     sb.root_inode          = 1;
 
     /* Zero the inode table. */
     memset(zbuf, 0, sizeof(zbuf));
     for (u64 s = 0; s < VBDK_INODE_TABLE_SECTORS; s++)
-        if (vbdk_sector_write(VBDK_INODE_TABLE_START + s, zbuf) < 0)
+        if (VbdkSectorWrite(VBDK_INODE_TABLE_START + s, zbuf) < 0)
             return ERR_FAULT;
 
     /* Root inode 1 (a directory).  Preserve the device state (disk
@@ -692,19 +727,19 @@ static i32 vbdk_format(void) {
     root->type         = VFS_ITEM_DIR;
     root->parent_id    = 0;
     root->item_id      = 1;
-    root->created      = (u64)get_time();
+    root->created      = (u64)GetTime();
     root->modified     = root->created;
     s_vol.inode_count  = 1;
-    if (vbdk_inode_store(root, 1) < 0)
+    if (VbdkInodeStore(root, 1) < 0)
         return ERR_FAULT;
 
     /* Superblock sector last (commit point). */
-    if (vbdk_sector_write(0, (u8 *)&sb) < 0)
+    if (VbdkSectorWrite(0, (u8 *)&sb) < 0)
         return ERR_FAULT;
 
     s_vol.uuid_hi = sb.uuid_hi;
     s_vol.uuid_lo = sb.uuid_lo;
-    vbdk_rebuild_bitmap();
+    VbdkRebuildBitmap();
 
     printf("fs_virtio_blk: formatted Disk (uuid=%x-%x-%x-%x)\n",
            (unsigned)(u32)(s_vol.uuid_hi >> 32),
@@ -715,9 +750,9 @@ static i32 vbdk_format(void) {
 }
 
 /* Load an existing format into RAM (magic must match, else ERR_NOENT). */
-static i32 vbdk_load(void) {
+static i32 VbdkLoad(void) {
     vbdk_sb_t sb;
-    i32       r = vbdk_sector_read(0, (u8 *)&sb);
+    i32       r = VbdkSectorRead(0, (u8 *)&sb);
     if (r < 0)
         return r;
     if (sb.magic != VBDK_MAGIC)
@@ -738,7 +773,7 @@ static i32 vbdk_load(void) {
     /* Load the full inode table into the 32 KB RAM array. */
     for (u64 s = 0; s < VBDK_INODE_TABLE_SECTORS; s++) {
         u8 *dst = (u8 *)s_vol.inodes + (size_t)(s * VBDK_SECTOR_SIZE);
-        r       = vbdk_sector_read(VBDK_INODE_TABLE_START + s, dst);
+        r       = VbdkSectorRead(VBDK_INODE_TABLE_START + s, dst);
         if (r < 0)
             return r;
     }
@@ -751,7 +786,7 @@ static i32 vbdk_load(void) {
         if (s_vol.inodes[i - 1].flags & VBDK_IN_FLAG)
             s_vol.inode_count = i;
 
-    vbdk_rebuild_bitmap();
+    VbdkRebuildBitmap();
 
     printf("fs_virtio_blk: mounting Disk (uuid=%x-%x-%x-%x)\n",
            (unsigned)(u32)(s_vol.uuid_hi >> 32),
@@ -765,7 +800,7 @@ static i32 vbdk_load(void) {
  * MOUNT handshake (A1: driver-initiated, design §7.2)
  * ==================================================================== */
 
-static int vbdk_mount(int vfs_port) {
+static int VbdkMount(int vfs_port) {
     vfs_req_mount_t  req;
     vfs_resp_mount_t resp;
     memset(&req, 0, sizeof(req));
@@ -778,7 +813,7 @@ static int vbdk_mount(int vfs_port) {
     req.read_only    = s_vol.read_only;
 
     int resp_len = (int)sizeof(resp);
-    int ret      = ipc_call(vfs_port, &req, (int)sizeof(req), &resp, &resp_len);
+    int ret      = IpcCall(vfs_port, &req, (int)sizeof(req), &resp, &resp_len);
     if (ret < 0)
         return ret;
     return resp.ret;
@@ -798,7 +833,7 @@ static int vbdk_mount(int vfs_port) {
 static int s_vfs_port = -1; /* vfs_server port (resolved at boot) */
 
 /* Deregister the volume from the vfs_server (VFS_OP_UNMOUNT). */
-static i32 vbdk_ctrl_unmount(void) {
+static i32 VbdkCtrlUnmount(void) {
     if (!s_vol.mounted)
         return ERR_NOENT;
     vfs_req_unmount_t req;
@@ -808,7 +843,7 @@ static i32 vbdk_ctrl_unmount(void) {
     strncpy(req.mount_name, "Disk", sizeof(req.mount_name) - 1);
     vfs_resp_unmount_t resp;
     int                rlen = (int)sizeof(resp);
-    int                r    = ipc_call(s_vfs_port, &req, (int)sizeof(req), &resp, &rlen);
+    int                r    = IpcCall(s_vfs_port, &req, (int)sizeof(req), &resp, &rlen);
     if (r < 0)
         return r;
     if (resp.ret < 0)
@@ -819,10 +854,10 @@ static i32 vbdk_ctrl_unmount(void) {
 }
 
 /* Re-register the volume (VFS_OP_MOUNT). */
-static i32 vbdk_ctrl_mount(void) {
+static i32 VbdkCtrlMount(void) {
     if (s_vol.mounted)
         return ERR_BUSY;
-    i32 r = vbdk_mount(s_vfs_port);
+    i32 r = VbdkMount(s_vfs_port);
     if (r < 0)
         return r;
     s_vol.mounted = 1;
@@ -832,16 +867,16 @@ static i32 vbdk_ctrl_mount(void) {
 
 /* Wipe + re-format + re-mount.  The UUID changes, so the old volume
  * entry must be dropped first (a stale UUID would break bookmarks). */
-static i32 vbdk_ctrl_format(void) {
+static i32 VbdkCtrlFormat(void) {
     if (s_vol.mounted) {
-        i32 r = vbdk_ctrl_unmount();
+        i32 r = VbdkCtrlUnmount();
         if (r < 0)
             return r;
     }
-    i32 r = vbdk_format();
+    i32 r = VbdkFormat();
     if (r < 0)
         return r;
-    r = vbdk_mount(s_vfs_port);
+    r = VbdkMount(s_vfs_port);
     if (r < 0)
         return r;
     s_vol.mounted = 1;
@@ -852,19 +887,19 @@ static i32 vbdk_ctrl_format(void) {
 /* Fill: create/replace "fill.bin" and write pattern bytes until the
  * requested budget or the volume is full (exercises the ENOSPC path).
  * budget==0 → fill until NOSPC.  Reports bytes written via *out_bytes. */
-static i32 vbdk_ctrl_fill(u32 budget, u64 *out_bytes) {
+static i32 VbdkCtrlFill(u32 budget, u64 *out_bytes) {
     static u8 pattern[DRV_MAX_PAYLOAD]; /* not s_req/s_resp */
     for (u32 i = 0; i < sizeof(pattern); i++)
         pattern[i] = (u8)(i * 31u + 7u);
 
     vfs_item_id_t old = 0;
-    if (vbdk_lookup(1, "fill.bin", &old) == 0) {
-        i32 r = vbdk_delete(old, 1);
+    if (VbdkLookup(1, "fill.bin", &old) == 0) {
+        i32 r = VbdkDelete(old, 1);
         if (r < 0)
             return r;
     }
     vfs_item_id_t id;
-    i32 r = vbdk_create(1, "fill.bin", VFS_ITEM_FILE, &id);
+    i32 r = VbdkCreate(1, "fill.bin", VFS_ITEM_FILE, &id);
     if (r < 0)
         return r;
 
@@ -875,7 +910,7 @@ static i32 vbdk_ctrl_fill(u32 budget, u64 *out_bytes) {
             chunk = (u32)((u64)budget - off);
         if (chunk == 0)
             break;
-        r = vbdk_write(id, off, chunk, pattern);
+        r = VbdkWrite(id, off, chunk, pattern);
         if (r == VFS_ERR_NOSPC || r == ERR_NOMEM)
             break; /* volume full: this is the fill point */
         if (r < 0)
@@ -892,29 +927,29 @@ static i32 vbdk_ctrl_fill(u32 budget, u64 *out_bytes) {
  * Driver protocol handlers
  * ==================================================================== */
 
-static void drv_handle(int token, drv_req_t *req, u64 caller) {
+static void DrvHandle(int token, drv_req_t *req, u64 caller) {
     drv_resp_t *resp = (drv_resp_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
 
     /* Management control plane: gated on ATOM_SERVICE_MANAGE (the user
      * service proxies admin commands).  Runs even while unmounted. */
     if (req->op >= DRV_OP_CTRL_MOUNT && req->op <= DRV_OP_CTRL_FILL) {
-        if (cap_has_atom(caller, ATOM_SERVICE_MANAGE) != 1) {
+        if (CapHasAtom(caller, ATOM_SERVICE_MANAGE) != 1) {
             resp->ret = ERR_DENIED;
             goto out;
         }
         switch (req->op) {
         case DRV_OP_CTRL_MOUNT:
-            resp->ret = vbdk_ctrl_mount();
+            resp->ret = VbdkCtrlMount();
             break;
         case DRV_OP_CTRL_UNMOUNT:
-            resp->ret = vbdk_ctrl_unmount();
+            resp->ret = VbdkCtrlUnmount();
             break;
         case DRV_OP_CTRL_FORMAT:
-            resp->ret = vbdk_ctrl_format();
+            resp->ret = VbdkCtrlFormat();
             break;
         case DRV_OP_CTRL_FILL:
-            resp->ret = vbdk_ctrl_fill(req->len, &resp->u.ctrl.bytes);
+            resp->ret = VbdkCtrlFill(req->len, &resp->u.ctrl.bytes);
             break;
         default:
             resp->ret = ERR_INVAL;
@@ -932,31 +967,31 @@ static void drv_handle(int token, drv_req_t *req, u64 caller) {
 
     switch (req->op) {
     case DRV_OP_GETATTR:
-        resp->ret = vbdk_getattr(req->item_id, &resp->u.item);
+        resp->ret = VbdkGetattr(req->item_id, &resp->u.item);
         break;
     case DRV_OP_LOOKUP:
-        resp->ret = vbdk_lookup(req->parent_id, req->payload.name, &resp->u.item_id);
+        resp->ret = VbdkLookup(req->parent_id, req->payload.name, &resp->u.item_id);
         break;
     case DRV_OP_READ:
-        resp->ret = vbdk_read(req->item_id, req->offset, req->len, resp->u.data);
+        resp->ret = VbdkRead(req->item_id, req->offset, req->len, resp->u.data);
         break;
     case DRV_OP_WRITE:
-        resp->ret = vbdk_write(req->item_id, req->offset, req->len, req->payload.data);
+        resp->ret = VbdkWrite(req->item_id, req->offset, req->len, req->payload.data);
         break;
     case DRV_OP_CREATE_DIR:
-        resp->ret = vbdk_create(req->parent_id, req->payload.name, VFS_ITEM_DIR, &resp->u.item_id);
+        resp->ret = VbdkCreate(req->parent_id, req->payload.name, VFS_ITEM_DIR, &resp->u.item_id);
         break;
     case DRV_OP_MKFILE:
-        resp->ret = vbdk_create(req->parent_id, req->payload.name, VFS_ITEM_FILE, &resp->u.item_id);
+        resp->ret = VbdkCreate(req->parent_id, req->payload.name, VFS_ITEM_FILE, &resp->u.item_id);
         break;
     case DRV_OP_DELETE:
-        resp->ret = vbdk_delete(req->item_id, req->recursive);
+        resp->ret = VbdkDelete(req->item_id, req->recursive);
         break;
     case DRV_OP_ENUM:
-        resp->ret = vbdk_enum(req->parent_id, req->from, resp);
+        resp->ret = VbdkEnum(req->parent_id, req->from, resp);
         break;
     case DRV_OP_MOVE:
-        resp->ret = vbdk_move(req->item_id, req->parent_id, req->payload.name);
+        resp->ret = VbdkMove(req->item_id, req->parent_id, req->payload.name);
         break;
     case DRV_OP_STAT:
         resp->u.stat.total_bytes = s_vol.total_bytes;
@@ -970,7 +1005,7 @@ static void drv_handle(int token, drv_req_t *req, u64 caller) {
     }
 
 out:
-    int r = ipc_reply(token, resp, (int)sizeof(*resp));
+    int r = IpcReply(token, resp, (int)sizeof(*resp));
     if (r < 0)
         printf("fs_virtio_blk: ipc_reply failed (%d)\n", r);
 }
@@ -981,10 +1016,10 @@ out:
 
 /* Degraded-alive idle: something below the driver protocol failed
  * (no device / no cap / device error) — stay up, do not crash the boot. */
-static void vbdk_degrade(const char *why) {
+static void VbdkDegrade(const char *why) {
     printf("fs_virtio_blk: %s — degraded, staying alive\n", why);
     for (;;)
-        sleep(10);
+        Sleep(10);
 }
 
 int main(void) {
@@ -992,15 +1027,15 @@ int main(void) {
 
     /* ---- 1. Find the virtio-blk adapter (vendor 0x1AF4, device
      * 0x1001) in the userspace PCI enumeration.  Index = disk arg. */
-    int count = pci_get_count();
+    int count = PciGetCount();
     if (count <= 0) {
         printf("fs_virtio_blk: pci_get_count failed (%d)\n", count);
-        vbdk_degrade("no PCI enumeration");
+        VbdkDegrade("no PCI enumeration");
     }
     s_vol.disk = -1;
     for (int i = 0; i < count; i++) {
         pci_device_info_t dev;
-        if (pci_get_device(i, &dev) < 0)
+        if (PciGetDevice(i, &dev) < 0)
             continue;
         if (dev.vendor_id == VBDK_VIRTIO_VENDOR && dev.device_id == VBDK_VIRTIO_DEVICE) {
             s_vol.disk = i;
@@ -1009,14 +1044,14 @@ int main(void) {
         }
     }
     if (s_vol.disk < 0)
-        vbdk_degrade("no virtio-blk device found");
+        VbdkDegrade("no virtio-blk device found");
 
     /* ---- 2. Cap gate: CAP_TYPE_PCI_DEV naming this disk index with
      * both rights (every SYS_BLK_* requires it). */
-    int cap = cap_create_obj(CAP_TYPE_PCI_DEV, RIGHT_READ | RIGHT_WRITE, (unsigned long)s_vol.disk);
+    int cap = CapCreateObj(CAP_TYPE_PCI_DEV, RIGHT_READ | RIGHT_WRITE, (unsigned long)s_vol.disk);
     if (cap < 0) {
-        printf("fs_virtio_blk: cap_create_obj(PCI_DEV %d) failed (%d)\n", s_vol.disk, cap);
-        vbdk_degrade("no device capability");
+        printf("fs_virtio_blk: CapCreateObj(PCI_DEV %d) failed (%d)\n", s_vol.disk, cap);
+        VbdkDegrade("no device capability");
     }
     printf("fs_virtio_blk: device cap %d minted\n", cap);
 
@@ -1026,7 +1061,7 @@ int main(void) {
     int64_t    r = sys_blk_info((u64)s_vol.disk, &info);
     if (r < 0 || info.sector_size != VBDK_SECTOR_SIZE || info.sectors == 0) {
         printf("fs_virtio_blk: sys_blk_info failed (%d)\n", (int)r);
-        vbdk_degrade("bad device geometry");
+        VbdkDegrade("bad device geometry");
     }
     s_vol.nsectors    = (info.sectors > VBDK_MAX_SECTORS) ? VBDK_MAX_SECTORS : (u32)info.sectors;
     s_vol.total_bytes = (u64)(s_vol.nsectors - VBDK_DATA_START) * VBDK_SECTOR_SIZE;
@@ -1035,27 +1070,27 @@ int main(void) {
            (unsigned)info.sector_size);
 
     /* ---- 4. Format on first boot, else mount the existing format. */
-    r = vbdk_load();
+    r = VbdkLoad();
     if (r == ERR_NOENT)
-        r = vbdk_format();
+        r = VbdkFormat();
     if (r < 0) {
         printf("fs_virtio_blk: Disk volume init FAILED (%d)\n", (int)r);
-        vbdk_degrade("volume init failed");
+        VbdkDegrade("volume init failed");
     }
     printf("fs_virtio_blk: Disk volume ready - %u KiB RW\n", (unsigned)(s_vol.total_bytes / 1024u));
 
     /* ---- 5. Driver port ---- */
-    int port = ipc_port_create();
+    int port = IpcPortCreate();
     if (port < 0) {
         printf("fs_virtio_blk: ipc_port_create failed (%d)\n", port);
-        thread_exit(1);
+        ThreadExit(1);
     }
-    int ret = port_register("vfs.fs.virtio_blk", port);
+    int ret = PortRegister("vfs.fs.virtio_blk", port);
     if (ret < 0) {
-        printf("fs_virtio_blk: port_register('vfs.fs.virtio_blk') failed "
+        printf("fs_virtio_blk: PortRegister('vfs.fs.virtio_blk') failed "
                "(%d)\n",
                ret);
-        thread_exit(1);
+        ThreadExit(1);
     }
     printf("fs_virtio_blk: port %d registered as 'vfs.fs.virtio_blk'\n", port);
 
@@ -1065,18 +1100,18 @@ int main(void) {
      * mounted) leaves the driver alive in the degraded serve loop. */
     int vfs_port = -1;
     for (int i = 0; i < VBDK_MOUNT_WAIT && vfs_port < 0; i++) {
-        vfs_port = port_get("vfs");
+        vfs_port = PortGet("vfs");
         if (vfs_port < 0)
-            sleep(1);
+            Sleep(1);
     }
     if (vfs_port < 0) {
         printf("fs_virtio_blk: 'vfs' port never resolved\n");
-        thread_exit(1);
+        ThreadExit(1);
     }
     printf("fs_virtio_blk: vfs_server port %d resolved\n", vfs_port);
     s_vfs_port = vfs_port;
 
-    ret = vbdk_mount(s_vfs_port);
+    ret = VbdkMount(s_vfs_port);
     if (ret < 0) {
         printf("fs_virtio_blk: MOUNT Disk failed (%d) - degraded, "
                "serving ERR_INVAL\n",
@@ -1091,17 +1126,17 @@ int main(void) {
         int msg_len = (int)sizeof(s_req);
         int token   = 0;
         u64 sender  = 0;
-        ret         = ipc_recv_from(port, s_req, &msg_len, &token, &sender);
+        ret         = IpcRecvFrom(port, s_req, &msg_len, &token, &sender);
         if (ret < 0) {
             printf("fs_virtio_blk: ipc_recv failed (%d)\n", ret);
-            thread_exit(1);
+            ThreadExit(1);
         }
         if (msg_len < (int)sizeof(u32)) { /* no op code: reject */
             drv_resp_t *resp = (drv_resp_t *)s_resp;
             resp->ret        = ERR_INVAL;
-            (void)ipc_reply(token, resp, (int)sizeof(*resp));
+            (void)IpcReply(token, resp, (int)sizeof(*resp));
             continue;
         }
-        drv_handle(token, (drv_req_t *)s_req, sender);
+        DrvHandle(token, (drv_req_t *)s_req, sender);
     }
 }

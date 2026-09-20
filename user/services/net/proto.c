@@ -12,7 +12,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * General Public License for more details: <https://www.gnu.org/licenses/>.
  *
- * proto.c - Minimal L3/L4 protocol stack (ARP + IPv4 + ICMP + UDP)
+ * proto.c - Minimal L3/L4 protocol stack (ARP + IPv4 + ICMP + UDP + TCP)
  * Copyright (c) 2026 OpSys Project
  *
  * The net service owns the NIC, so the whole stack lives here and runs
@@ -20,6 +20,10 @@
  * queue; ProtoIpSend() resolves the next hop via the ARP cache and
  * hands the finished frame to the driver.  UDP datagrams destined for
  * a bound local port are queued and drained with ProtoUdpRecv().
+ * The single TCP connection is opened passively (ProtoTcpListen +
+ * ProtoTcpAccept) or actively (ProtoTcpConnect); both handshakes pump
+ * the driver queue while they wait, so no client-side polling is
+ * needed.
  */
 
 #include "proto.h"
@@ -300,6 +304,13 @@ void ProtoInit(const u8 ip[4], const u8 gw[4]) {
     memset(s_udp, 0, sizeof(s_udp));
     s_udp_rx_head = 0;
     s_udp_rx_count = 0;
+}
+
+void ProtoGetIp(u8 ip[4], u8 gw[4]) {
+    if (ip)
+        memcpy(ip, s_ip, 4);
+    if (gw)
+        memcpy(gw, s_gw, 4);
 }
 
 void ProtoRx(const u8 *frame, u32 len) {
@@ -619,6 +630,96 @@ int ProtoTcpAccept(u8 peer[4], u16 *peer_port) {
     s_tcp_state = TCP_STATE_LISTEN;
     return -7; /* timeout */
 }
+
+/* ---- active open (client side) ---- */
+
+/* Local port for an active open: 49152..65535 (RFC 6335 dynamic
+ * range).  Consecutive connects get distinct ports so a delayed
+ * segment of a closed connection cannot land in the new one. */
+static u16 TcpEphemeralPort(void) {
+    static u16 s_next = 49152;
+    u16 p = s_next++;
+    if (s_next < 49152)
+        s_next = 49152; /* wrapped past 65535 */
+    return p;
+}
+
+/* True when the frame is a RST from the peer we are dialling, aimed at
+ * the half-open connection.  A refusal must be reported as an error:
+ * ProtoTcpRxTcp()'s SYN_SENT branch would otherwise read the RST's ACK
+ * bit as the handshake completing. */
+static int TcpRefused(const u8 *f, u32 fl) {
+    if (fl < 14 + IP_HDR_LEN + TCP_HDR_LEN || f[12] != 0x08 || f[13] != 0x00)
+        return 0;
+    const u8 *ip = f + 14;
+    if ((ip[0] >> 4) != 4 || ip[9] != IP_PROTO_TCP)
+        return 0;
+    const u8 *t = ip + IP_HDR_LEN;
+    u16 sport = (u16)((t[0] << 8) | t[1]);
+    u16 dport = (u16)((t[2] << 8) | t[3]);
+    if (dport != s_tcp_lport || sport != s_tcp_peer_port)
+        return 0;
+    if (!IpEqual(ip + 12, s_tcp_peer))
+        return 0;
+    return (t[13] & TCP_RST) != 0;
+}
+
+/* Active open: SYN -> SYN|ACK -> ESTAB (the client half of the RFC 793
+ * handshake; ProtoTcpRxTcp() completes it and sends our ACK).  The
+ * driver queue is pumped inside the wait loop, exactly like
+ * ProtoTcpAccept(), so the SYN|ACK is collected while we block. */
+int ProtoTcpConnect(const u8 dst_ip[4], u16 dst_port) {
+    if (!dst_ip || dst_port == 0)
+        return -2; /* ERR_INVAL */
+    /* Single-connection model: an active open replaces whatever the
+     * previous connection was (as ProtoTcpListen() does), so a stale
+     * ESTAB can never wedge the service. */
+    s_tcp_lport     = TcpEphemeralPort();
+    memcpy(s_tcp_peer, dst_ip, 4);
+    s_tcp_peer_port = dst_port;
+    s_tcp_rx_head   = 0;
+    s_tcp_rx_count  = 0;
+    /* ISS spread by tick + port: two opens in the same 10 ms tick must
+     * not share a sequence space. */
+    s_tcp_iss = (u32)GetTime() * 4096u + (u32)s_tcp_lport;
+    if (s_tcp_iss == 0)
+        s_tcp_iss = 0x2468;
+    s_tcp_snd_nxt = s_tcp_iss + 1; /* the SYN consumes one sequence */
+    s_tcp_rcv_nxt = 0;
+    s_tcp_state   = TCP_STATE_SYN_SENT;
+
+    int r = TcpSendSeg(TCP_SYN, s_tcp_iss, 0, NULL, 0);
+    if (r != 0) {
+        /* ARP resolution failed: the peer is not reachable. */
+        s_tcp_state = TCP_STATE_CLOSED;
+        return r;
+    }
+    for (int i = 0; i < 600; i++) { /* ~6 s (600 x 10 ms tick) */
+        NetRxPumpNow();
+        u8 f[1600];
+        u32 fl;
+        while (NetRxPump(f, &fl)) {
+            if (TcpRefused(f, fl)) {
+                s_tcp_state    = TCP_STATE_CLOSED;
+                s_tcp_rx_head  = 0;
+                s_tcp_rx_count = 0;
+                return -9; /* ERR_DENIED: peer refused (RST) */
+            }
+            ProtoRx(f, fl); /* SYN|ACK -> ESTAB (ProtoTcpRxTcp) */
+        }
+        if (s_tcp_state == TCP_STATE_ESTAB)
+            return 0;
+        NetYield(); /* one 10 ms scheduling tick, then pump again */
+    }
+    /* No SYN|ACK: reset so the half-open state cannot pollute the next
+     * connection (ports / sequence space are re-picked on the next
+     * ProtoTcpConnect()). */
+    s_tcp_state    = TCP_STATE_CLOSED;
+    s_tcp_rx_head  = 0;
+    s_tcp_rx_count = 0;
+    return -6; /* ERR_AGAIN: connect timeout */
+}
+
 /* Handle an incoming TCP segment (called from proto_rx). */
 static void ProtoTcpRxTcp(const u8 *f, u32 fl); /* fwd */
 

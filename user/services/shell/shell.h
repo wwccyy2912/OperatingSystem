@@ -44,4 +44,36 @@ typedef int (*cmd_func_t)(int argc, char *argv[]);
  */
 int ShellRegisterCommand(const char *name, const char *help, cmd_func_t func);
 
+/* ====================================================================
+ * Helpers exported for the shell's command modules (v0.9)
+ *
+ * The shell is a single process: its terminal/keyboard ports, current
+ * working directory and line editor live in shell.c.  The command
+ * modules (cmd_fs.c / cmd_disk.c / cmd_power.c / cmd_net.c) use these
+ * accessors instead of duplicating that state.  All output goes to the
+ * "term" port — never to the serial debug channel.
+ * ==================================================================== */
+
+#include <stddef.h>
+
+void ShellWrite(const char *s);         /* raw string                       */
+void ShellPutc(char c);                 /* single character                 */
+void ShellPrintf(const char *fmt, ...); /* formatted (same subset as printf) */
+
+/* Read one line from the console with the shell's line editor (history,
+ * UTF-8, IME).  Echo is on for ShellReadLine and masked for
+ * ShellReadLineMasked (passwords).  CR/LF is stripped.  Returns the
+ * line length, or a negative error (ERR_INTERRUPTED on Ctrl-C,
+ * ERR_NOENT on Ctrl-D at an empty line). */
+int ShellReadLine(char *buf, int maxlen);
+int ShellReadLineMasked(char *buf, int maxlen);
+
+/* Resolve a user-supplied path against the shell's cwd into a VFS URL
+ * (handles "", ".", "..", absolute paths and the optional /Volumes
+ * prefix).  Returns 0 on success, negative on error. */
+int ShellResolvePath(const char *path, char *out, size_t outsz);
+
+/* The shell's current working directory (always an absolute VFS URL). */
+const char *ShellCwd(void);
+
 #endif /* SHELL_H */

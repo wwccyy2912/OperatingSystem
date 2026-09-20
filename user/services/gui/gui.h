@@ -112,6 +112,8 @@ typedef struct {
                             * win  = window under the pointer (0 = none) */
 #define GUI_EV_WHEEL     4 /* code = wheel delta (signed); x,y;
                             * win  = window under the pointer */
+#define GUI_EV_CLOSE     5 /* code = 0;
+		            * win  = window closed by compositor */
 
 typedef struct {
     u32 type;

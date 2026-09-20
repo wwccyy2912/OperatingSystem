@@ -261,10 +261,18 @@ static void DoLogin(int token, int msg_len, uint64_t caller) {
      * caller's subject so `shutdown` / `reboot` actually work.  The
      * user service holds ATOM_SERVICE_MANAGE (blob-seeded), so the
      * kernel accepts its grant.  Revoked on logout. */
+    /* v1.0: the network atoms travel with the same decision.  The net
+     * service refuses CONNECT/BIND-class operations without them, so an
+     * account that is not logged in (or is not OWNER/ADMIN) simply has
+     * no network access — the sandbox default. */
     if (a->role == PERM_ROLE_OWNER || a->role == PERM_ROLE_ADMIN) {
         (void)CapGrantToSubject(caller, ATOM_SYS_SHUTDOWN, RIGHT_ALL, 0, 0);
+        (void)CapGrantToSubject(caller, ATOM_NET_CONNECT, RIGHT_ALL, 0, 0);
+        (void)CapGrantToSubject(caller, ATOM_NET_BIND, RIGHT_ALL, 0, 0);
     } else {
         (void)CapRevokeByAtom(caller, ATOM_SYS_SHUTDOWN, 0);
+        (void)CapRevokeByAtom(caller, ATOM_NET_CONNECT, 0);
+        (void)CapRevokeByAtom(caller, ATOM_NET_BIND, 0);
     }
     resp->role = a->role;
     strncpy(resp->name, a->name, sizeof(resp->name) - 1);
@@ -813,14 +821,88 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
-/*  Disk management proxy (v0.7.1)                                     */
+/*  Disk management proxy (v0.7.1 control plane, v0.9 maintenance)     */
 /*                                                                     */
-/*  USER_OP_DISK_*: mount/unmount/format/fill the "Disk" block volume. */
-/*  The shell cannot hold ATOM_SERVICE_MANAGE, and the driver's         */
-/*  management control plane requires it, so the user service (which    */
-/*  holds the atom via blob seeding) forwards the request after         */
-/*  re-checking the caller is OWNER/ADMIN — same pattern as KILL.       */
+/*  USER_OP_DISK_MOUNT/UNMOUNT/FORMAT/FILL and the v0.9 maintenance     */
+/*  ops USER_OP_DISK_SYNC/CHECK/INFO/RAW_READ all address the           */
+/*  persistent "Disk" block volume.  The shell cannot hold              */
+/*  ATOM_SERVICE_MANAGE, and the driver gates its management plane on   */
+/*  it, so the user service (which holds the atom via blob seeding)     */
+/*  forwards the request after re-checking the caller is OWNER/ADMIN    */
+/*  — same pattern as KILL.  (SYNC is additionally sent straight to a   */
+/*  driver by the vfs_server for VFS_OP_SYNC; this proxy is the shell's */
+/*  path to it.)                                                        */
+/*                                                                     */
+/*  Scope: only "Disk" (fs_virtio_blk_driver) has a management channel  */
+/*  reachable from here.  The memory volumes ("System"/"Users") are     */
+/*  mounted on the vfs_server but fs_mem_driver exposes no proxy to     */
+/*  this service, so a request naming another volume is refused with a  */
+/*  detail that says so rather than answered with fabricated data.      */
 /* ------------------------------------------------------------------ */
+
+/*  USER_OP_SVC_*: admin proxy to the service manager's control port.
+ *
+ * The shell holds no ATOM_SERVICE_MANAGE, so it cannot command the
+ * manager directly; it asks this service instead.  This service
+ * re-checks that the human behind the request is OWNER/ADMIN (exactly
+ * like KILL / POLICY_SET / DISK_*), then forwards the request verbatim:
+ * the wire request is a svc_req_t and the reply a svc_resp_t, so the
+ * proxy adds no protocol of its own.  The second gate lives in the
+ * manager, which verifies that *this* process is management-plane.
+ */
+static void DoSvc(int token, int msg_len, uint64_t caller) {
+    svc_resp_t *resp = (svc_resp_t *)s_resp;
+    memset(resp, 0, sizeof(*resp));
+    resp->ret = ERR_INVAL;
+    if (msg_len < (int)sizeof(user_req_svc_t))
+        goto out;
+    user_req_svc_t *req = (user_req_svc_t *)s_req;
+    req->name[SVC_NAME_MAX - 1] = '\0';
+
+    user_acct_t *me = acct_of_subject(caller);
+    if (!AcctIsAdmin(me)) {
+        resp->ret = ERR_DENIED; /* OWNER/ADMIN only */
+        snprintf(resp->detail, sizeof(resp->detail), "requires OWNER/ADMIN");
+        goto out;
+    }
+
+    int mp = PortGet(MANAGER_PORT_NAME);
+    if (mp < 0) {
+        resp->ret = ERR_NOENT;
+        snprintf(resp->detail, sizeof(resp->detail), "manager control port unavailable");
+        goto out;
+    }
+
+    /* Translate the proxy opcode into the manager's own SVC_OP_*.  The
+     * two enum spaces overlap numerically (USER_OP_LOGIN is 1, and so is
+     * SVC_OP_LIST), so forwarding req->op verbatim would land on the
+     * wrong operation — the manager would answer "unknown SVC op". */
+    svc_req_t fwd;
+    memset(&fwd, 0, sizeof(fwd));
+    switch (req->op) {
+    case USER_OP_SVC_LIST: fwd.op = SVC_OP_LIST; break;
+    case USER_OP_SVC_STATUS: fwd.op = SVC_OP_STATUS; break;
+    case USER_OP_SVC_START: fwd.op = SVC_OP_START; break;
+    case USER_OP_SVC_STOP: fwd.op = SVC_OP_STOP; break;
+    case USER_OP_SVC_RESTART: fwd.op = SVC_OP_RESTART; break;
+    default:
+        resp->ret = ERR_INVAL;
+        snprintf(resp->detail, sizeof(resp->detail), "bad SVC op %u", (unsigned)req->op);
+        goto out;
+    }
+    strncpy(fwd.name, req->name, SVC_NAME_MAX - 1);
+
+    int rl = (int)sizeof(*resp);
+    int r  = IpcCall(mp, &fwd, (int)sizeof(fwd), resp, &rl);
+    if (r < 0) {
+        resp->ret = r;
+        memset(resp->detail, 0, sizeof(resp->detail));
+        snprintf(resp->detail, sizeof(resp->detail), "manager ipc failed (%d)", r);
+    }
+
+out:
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
+}
 
 static void DoDisk(int token, int msg_len, uint64_t caller) {
     user_resp_disk_t *resp = (user_resp_disk_t *)s_resp;
@@ -837,10 +919,12 @@ static void DoDisk(int token, int msg_len, uint64_t caller) {
         snprintf(resp->detail, sizeof(resp->detail), "requires OWNER/ADMIN");
         goto out;
     }
-    /* Only the known block volume is manageable. */
+    /* Only the known block volume is manageable: it is the only volume
+     * whose driver this proxy can reach (see the scope note above). */
     if (strcmp(req->volume, "Disk") != 0) {
         resp->ret = ERR_NOENT;
-        snprintf(resp->detail, sizeof(resp->detail), "unknown volume '%s'", req->volume);
+        snprintf(resp->detail, sizeof(resp->detail),
+                 "'%s' is not the Disk volume: no driver proxy", req->volume);
         goto out;
     }
 
@@ -868,6 +952,20 @@ static void DoDisk(int token, int msg_len, uint64_t caller) {
         dr.op  = DRV_OP_CTRL_FILL;
         dr.len = req->size;
         break;
+    case USER_OP_DISK_SYNC:
+        dr.op = DRV_OP_SYNC;
+        break;
+    case USER_OP_DISK_CHECK:
+        dr.op = DRV_OP_CTRL_CHECK;
+        break;
+    case USER_OP_DISK_INFO:
+        dr.op = DRV_OP_CTRL_INFO;
+        break;
+    case USER_OP_DISK_RAW_READ:
+        dr.op     = DRV_OP_CTRL_RAW_READ;
+        dr.offset = req->lba;    /* RAW_READ: offset carries the first LBA   */
+        dr.len    = req->length; /* RAW_READ: len carries the byte count     */
+        break;
     default:
         goto out;
     }
@@ -879,10 +977,65 @@ static void DoDisk(int token, int msg_len, uint64_t caller) {
         resp->ret = r;
         goto out;
     }
-    resp->ret   = drr.ret;
-    resp->bytes = drr.u.ctrl.bytes;
-    if (drr.ret < 0)
+    if (drr.ret < 0) {
+        resp->ret = drr.ret;
         snprintf(resp->detail, sizeof(resp->detail), "driver error %d", drr.ret);
+        goto out;
+    }
+    resp->ret = 0;
+
+    /* Success: copy the op-specific payload out of the driver reply.
+     * drv_resp_t.u is a UNION, so exactly one branch below may read it. */
+    switch (req->op) {
+    case USER_OP_DISK_FILL:
+        resp->bytes = drr.u.ctrl.bytes; /* bytes written to fill.bin */
+        break;
+    case USER_OP_DISK_CHECK:
+        resp->check_magic_ok     = drr.u.check.magic_ok;
+        resp->check_inodes_total = drr.u.check.inodes_total;
+        resp->check_inodes_used  = drr.u.check.inodes_used;
+        resp->check_files        = drr.u.check.files;
+        resp->check_dirs         = drr.u.check.dirs;
+        resp->check_used_blocks  = drr.u.check.used_blocks;
+        resp->check_free_blocks  = drr.u.check.free_blocks;
+        resp->check_errors       = drr.u.check.errors;
+        resp->check_first_error  = drr.u.check.first_error;
+        strncpy(resp->check_note, drr.u.check.note, sizeof(resp->check_note) - 1);
+        resp->check_note[sizeof(resp->check_note) - 1] = '\0';
+        break;
+    case USER_OP_DISK_INFO:
+        strncpy(resp->info_driver, drr.u.info.driver, sizeof(resp->info_driver) - 1);
+        resp->info_driver[sizeof(resp->info_driver) - 1] = '\0';
+        strncpy(resp->info_mount, drr.u.info.mount, sizeof(resp->info_mount) - 1);
+        resp->info_mount[sizeof(resp->info_mount) - 1] = '\0';
+        resp->info_read_only    = drr.u.info.read_only;
+        resp->info_block_size   = drr.u.info.block_size;
+        resp->info_total_blocks = drr.u.info.total_blocks;
+        resp->info_used_blocks  = drr.u.info.used_blocks;
+        resp->info_inode_total  = drr.u.info.inode_total;
+        resp->info_inode_used   = drr.u.info.inode_used;
+        resp->info_persistent   = drr.u.info.persistent;
+        resp->info_uuid_hi      = drr.u.info.uuid_hi;
+        resp->info_uuid_lo      = drr.u.info.uuid_lo;
+        break;
+    case USER_OP_DISK_RAW_READ: {
+        /* The driver reports the payload length in ret, the bytes in
+         * u.data: in drv_resp_t.u, u.ctrl.bytes aliases u.data[0..7], so
+         * the count cannot travel there without clobbering the payload
+         * (see VbdkCtrlRawRead in fs_virtio_blk_driver.c). */
+        uint64_t n = (uint64_t)drr.ret;
+        if (n > USER_DISK_RAW_MAX)
+            n = USER_DISK_RAW_MAX;
+        memcpy(resp->raw, drr.u.data, (size_t)n);
+        resp->bytes = n;
+        break;
+    }
+    case USER_OP_DISK_SYNC:
+        snprintf(resp->detail, sizeof(resp->detail), "Disk flushed to the medium");
+        break;
+    default:
+        break; /* MOUNT/UNMOUNT/FORMAT: ret says it all */
+    }
 out:
     (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
@@ -939,7 +1092,22 @@ static void UserHandle(int token, u32 op, int msg_len, uint64_t caller) {
     case USER_OP_DISK_UNMOUNT:
     case USER_OP_DISK_FORMAT:
     case USER_OP_DISK_FILL:
+    case USER_OP_DISK_SYNC:
+    case USER_OP_DISK_CHECK:
+    case USER_OP_DISK_INFO:
+    case USER_OP_DISK_RAW_READ:
+        /* All DISK_* ops are management operations: DoDisk enforces the
+         * OWNER/ADMIN account role before it forwards anything. */
         DoDisk(token, msg_len, caller);
+        break;
+    case USER_OP_SVC_LIST:
+    case USER_OP_SVC_STATUS:
+    case USER_OP_SVC_START:
+    case USER_OP_SVC_STOP:
+    case USER_OP_SVC_RESTART:
+        /* Service supervision is management too: DoSvc checks the
+         * account role, then forwards to the manager's control port. */
+        DoSvc(token, msg_len, caller);
         break;
     default: {
         i32 *resp = (i32 *)s_resp;

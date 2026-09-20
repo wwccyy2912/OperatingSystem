@@ -31,11 +31,11 @@
  * implemented slots, which stay NULL in the table and are rejected
  * with ERR_INVAL).  Must equal last defined SYS_ + 1.
  */
-#define SYS_COUNT (SYS_PCI_CFG_WRITE + 1)
+#define SYS_COUNT (SYS_HALT + 1)
 
-/* Compile-time guard: SYS_PCI_CFG_WRITE (72) is the highest syscall
- * number; if a higher one is ever added, update SYS_COUNT to match. */
-_Static_assert(SYS_PCI_CFG_WRITE + 1 == SYS_COUNT, "SYS_COUNT drift");
+/* Compile-time guard: SYS_HALT (73) is the highest syscall number; if a
+ * higher one is ever added, update SYS_COUNT to match. */
+_Static_assert(SYS_HALT + 1 == SYS_COUNT, "SYS_COUNT drift");
 
 /* System call result passed in RAX */
 typedef struct {

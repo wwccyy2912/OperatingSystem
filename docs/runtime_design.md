@@ -1,5 +1,10 @@
 # OpSys Runtime (C Runtime) 设计文档
 
+> **阅读提示**：本文是**设计基线文档**，记录做出决策时的思考与当时的现状快照。
+> 其中标注为"规划/未实现"的条目可能已在后续版本落地。判断某项功能的**当前状态**，
+> 请以代码、[../README.md](../README.md) 与 [architecture.md](architecture.md) 为准；
+> 逐提交的实际进展见 [CHANGELOG.md](CHANGELOG.md)，文档地图见 [README.md](README.md)。
+
 > 版本：v1.0  
 > 日期：2026-08-14  
 > 状态：核心运行库（init/exit/errno/malloc/crt0/sigrestore）已实现并编入构建；runtime_demo 未接入 Makefile，§12 测试计划未执行  

@@ -188,4 +188,12 @@
 #define SYS_PCI_CFG_READ  71 /* (idx, offset) -> u32 dword */
 #define SYS_PCI_CFG_WRITE 72 /* (idx, offset, val) -> OK */
 
+/* ---- Power: halt (v0.9) ----
+ * Park the CPU with interrupts disabled and without touching the reset
+ * line: the "off" half of `power halt`.  SYS_REBOOT resets the machine
+ * and SYS_SHUTDOWN asks ACPI for S5; neither stops the guest without
+ * leaving a restart path armed, which is what a halt must do.
+ * Gated on ATOM_SYS_SHUTDOWN, exactly like reboot/shutdown. */
+#define SYS_HALT 73 /* () -> does not return */
+
 #endif /* KERNEL_SYSCALL_NUMBERS_H */

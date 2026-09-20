@@ -1421,6 +1421,29 @@ static i64 sys_shutdown(void) {
 }
 
 /*
+ * Halt: park the CPU forever.  Same capability gate as reboot/shutdown
+ * (ATOM_SYS_SHUTDOWN); unlike those two it leaves the reset line alone,
+ * so the machine simply stops — the kernel side of `power halt`.
+ * Interrupts are disabled first: with IF=0 the hlt loop can never be
+ * interrupted, so no device can wake the machine again.
+ * Does not return.
+ */
+static i64 sys_halt(void) {
+    process_t *proc = process_current();
+    if (!proc || !proc->cap_table)
+        return (i64)ERR_FAULT;
+
+    if (CapLookupByAtom(proc->cap_table, proc->subject_id, ATOM_SYS_SHUTDOWN, 0) == CAP_NULL)
+        return (i64)ERR_NOCAP;
+
+    SerialPuts("OpSys: halt requested, parking the CPU\n");
+    __asm__ volatile("cli");
+    for (;;)
+        __asm__ volatile("hlt");
+    __builtin_unreachable();
+}
+
+/*
  * Panic hook (SYS_PANIC): panic the kernel on demand.
  * Lets the shell 'panic' command exercise the unified panic path
  * (kernel/panic.c) end-to-end.
@@ -1659,6 +1682,7 @@ SYSCALL1(sys_mutex_unlock)
 SYSCALL1(sys_mutex_destroy)
 SYSCALL0(sys_reboot)
 SYSCALL0(sys_shutdown)
+SYSCALL0(sys_halt)
 SYSCALL1(sys_set_time)
 SYSCALL1(sys_fb_get_info)
 SYSCALL2(sys_fb_map)
@@ -1736,6 +1760,7 @@ static const syscall_fn_t s_syscall_table[SYS_COUNT] = {
     [SYS_BLK_INFO]             = sc_sys_blk_info,
     [SYS_SHM_CREATE]           = sc_sys_shm_create,
     [SYS_SHM_MAP]              = sc_sys_shm_map,
+    [SYS_HALT]                 = sc_sys_halt,
 };
 
 /**

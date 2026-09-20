@@ -29,13 +29,12 @@
  *
  *   sector 0      superblock  {magic 'VBDK', block_size, inode-table
  *                              geometry, volume UUID, root_inode=1}
- *   sectors 1-64  inode table — 256 inodes × 128 B (4/sector); the
- *                              FULL table is loaded into a 32 KB RAM
- *                              array at mount and every mutation is
- *                              written through synchronously (RMW —
- *                              never clobber the 3 sibling inodes in
- *                              a sector).
- *   sectors 65+   file data.  Each inode owns ONE contiguous extent
+ *   sectors 1-256 inode table — 256 inodes × 512 B (one per sector);
+ *                              the FULL table is loaded into a 128 KB
+ *                              RAM array at mount and every mutation
+ *                              is written through synchronously (RMW
+ *                              over the inode's own sector).
+ *   sectors 257+  file data.  Each inode owns ONE contiguous extent
  *                              (extent_start block + extent_blocks);
  *                              first-fit allocation from a DERIVED
  *                              free bitmap (never persisted).
@@ -64,7 +63,7 @@
  * Structure (disk volume): one persistent RW "Disk" volume over the
  *   kernel virtio-blk adapter (SYS_BLK_READ/WRITE/INFO); on-disk
  *   layout = superblock (sector 0) + inode table (sectors 1-256,
- *   mirrored to a 32 KB RAM array) + data extents (sector 257+);
+ *   mirrored to a 128 KB RAM array) + data extents (sector 257+);
  *   driver port "vfs.fs.virtio_blk".
  * How it works:
  *   The manager-spawned process scans userspace PCI for the
@@ -72,7 +71,14 @@
  *   VbdkFormat() when the superblock magic is absent, then VbdkMount()
  *   (MOUNT handshake, registers "Disk").  Every inode-table mutation
  *   is a synchronous RMW; the free bitmap is derived from the inode
- *   table on every mount.
+ *   table on every mount.  DRV_OP_WRITE with len == 0 is the truncate
+ *   form (VbdkTruncate): the offset field carries the target length,
+ *   growing zero-fills, shrinking releases the tail blocks, and a length
+ *   the volume cannot hold answers VFS_ERR_NOSPC.  The v0.9 maintenance
+ *   plane adds SYNC (re-land
+ *   superblock + inode table, any mount state, not cap-gated) and the
+ *   read-only diagnostics CHECK / INFO / RAW_READ (ATOM_SERVICE_MANAGE
+ *   gated, like CTRL_*).
  * Purpose:
  *   The only persistence surface in the system: an 8 MiB QEMU disk.img
  *   (cache=writethrough) backing the Disk volume.
@@ -285,8 +291,10 @@ static vbdk_inode_t *vbdk_find(vfs_item_id_t id) {
     return (it->flags & VBDK_IN_FLAG) ? it : NULL;
 }
 
-/* RMW store of one inode: read its sector, splice the 128-byte record
- * in, write the sector back — the 3 sibling inodes are never touched. */
+/* RMW store of one inode: read its sector, splice the 512-byte record
+ * in, write the sector back — nothing else on that sector is touched
+ * (VBDK_INODES_PER_SECTOR is 1 today, and the RMW stays correct if the
+ * geometry ever packs several inodes into one sector). */
 static i32 VbdkInodeStore(const vbdk_inode_t *in, u64 num) {
     static u8 sbuf[VBDK_SECTOR_SIZE];
     u64       sec = VBDK_INODE_TABLE_START + (num - 1) / VBDK_INODES_PER_SECTOR;
@@ -349,8 +357,18 @@ VbdkCreateItem(vfs_item_id_t parent, const char *name, u32 type, vfs_item_id_t *
     it->modified                   = it->created;
     *out_id                        = (vfs_item_id_t)(idx + 1);
 
-    if (VbdkInodeStore(it, (u64)(idx + 1)) < 0)
+    if (VbdkInodeStore(it, (u64)(idx + 1)) < 0) {
+        /* Rollback: inode_count published the slot but the on-disk table
+         * never received the record (a write-through failure), so drop
+         * the half-created item instead of leaving a nameless inode that
+         * would reappear after a reboot.  The number is only given back
+         * when it is still the highest one (it always is here: the bump
+         * above happened with no other allocation in between). */
+        memset(it, 0, sizeof(*it));
+        if (s_vol.inode_count == idx + 1)
+            s_vol.inode_count = idx;
         return ERR_FAULT;
+    }
     return 0;
 }
 
@@ -590,6 +608,72 @@ static i32 VbdkRead(vfs_item_id_t id, u64 offset, u32 len, u8 *out) {
     return (r < 0) ? r : (i32)len;
 }
 
+/*
+ * Truncate / length change (DRV_OP_WRITE with len == 0).
+ *
+ * vfs.h:570 documents "len==0 && offset==0 = truncate (OPEN+TRUNCATE)".
+ * The same form with offset = N is the general truncate the vfs_server
+ * uses for VFS_OP_TRUNCATE (op 22): the target length rides in the
+ * existing offset field, so no new DRV_* opcode (and no vfs.h change) is
+ * needed, and offset == 0 keeps exactly its old meaning.  A zero-length
+ * VFS_OP_WRITE is answered by the server itself, so the two meanings can
+ * never collide.
+ *
+ * Shrinking gives the tail blocks back to the derived bitmap and resizes
+ * the inode's single extent (a file truncated to 0 owns no extent at
+ * all); growing extends or migrates the extent through VbdkExtentEnsure
+ * and zero-fills the added range, so the hole reads as NUL like every
+ * other hole this driver creates.  The inode is written through before
+ * the call returns, so the on-disk table and the RAM mirror never
+ * disagree — a length change that cannot be satisfied (no free extent,
+ * past the end of the volume) is reported as VFS_ERR_NOSPC with the
+ * inode record untouched.  The one case that leaves RAM ahead of the
+ * medium is a failed zero-fill after a successful extension: the inode
+ * is not stored, and the derived bitmap is rebuilt from the inode table
+ * at the next mount / SYNC, so nothing inconsistent can be published.
+ *
+ * Bytes past the new length inside the last retained sector are not
+ * zeroed: they are unreachable while size says so, and every grow path
+ * zero-fills [size, newsize) before it can expose them again.
+ */
+static i32 VbdkTruncate(vfs_item_id_t id, vbdk_inode_t *it, u64 newsize) {
+    if (newsize == it->size)
+        return 0; /* already that length */
+
+    if (newsize < it->size) {
+        u64 old  = it->size;
+        u32 keep = (u32)((newsize + VBDK_SECTOR_SIZE - 1) / VBDK_SECTOR_SIZE);
+        if (keep < it->extent_blocks) {
+            VbdkExtentRelease(it->extent_start + keep, it->extent_blocks - keep);
+            it->extent_blocks = keep;
+            if (keep == 0)
+                it->extent_start = 0; /* no data blocks at all */
+        }
+        it->size = newsize;
+        s_vol.used_bytes -= old - newsize;
+        it->modified = (u64)GetTime();
+        return (VbdkInodeStore(it, id) < 0) ? ERR_FAULT : 0;
+    }
+
+    /* Grow: the added range must read as zeros. */
+    if (newsize > s_vol.total_bytes)
+        return VFS_ERR_NOSPC;
+
+    u32 need_blk = (u32)((newsize + VBDK_SECTOR_SIZE - 1) / VBDK_SECTOR_SIZE);
+    i32 r        = VbdkExtentEnsure(it, need_blk);
+    if (r < 0)
+        return r; /* VFS_ERR_NOSPC when the volume cannot hold it */
+
+    r = VbdkZeroRange(it->size, newsize, it);
+    if (r < 0)
+        return r; /* inode not stored yet: the old length still stands */
+
+    s_vol.used_bytes += newsize - it->size;
+    it->size = newsize;
+    it->modified = (u64)GetTime();
+    return (VbdkInodeStore(it, id) < 0) ? ERR_FAULT : 0;
+}
+
 static i32 VbdkWrite(vfs_item_id_t id, u64 offset, u32 len, const u8 *in) {
     if (s_vol.read_only)
         return VFS_ERR_READONLY;
@@ -599,21 +683,11 @@ static i32 VbdkWrite(vfs_item_id_t id, u64 offset, u32 len, const u8 *in) {
     if (it->type != VFS_ITEM_FILE)
         return ERR_INVAL;
 
-    /* Truncate (OPEN+TRUNCATE): len==0 && offset==0 clears the file. */
-    if (len == 0) {
-        if (offset == 0 && it->size > 0) {
-            if (it->extent_blocks > 0)
-                VbdkExtentRelease(it->extent_start, it->extent_blocks);
-            s_vol.used_bytes -= it->size;
-            it->extent_start  = 0;
-            it->extent_blocks = 0;
-            it->size          = 0;
-            it->modified      = (u64)GetTime();
-            if (VbdkInodeStore(it, id) < 0)
-                return ERR_FAULT;
-        }
-        return 0;
-    }
+    /* len == 0 is the truncate form (see VbdkTruncate): the offset field
+     * carries the target length, offset 0 being the documented
+     * OPEN+TRUNCATE clear. */
+    if (len == 0)
+        return VbdkTruncate(id, it, offset);
 
     u64 need = offset + len;
     if (need > s_vol.total_bytes)
@@ -770,7 +844,7 @@ static i32 VbdkLoad(void) {
     s_vol.uuid_hi = sb.uuid_hi;
     s_vol.uuid_lo = sb.uuid_lo;
 
-    /* Load the full inode table into the 32 KB RAM array. */
+    /* Load the full inode table into the 128 KB RAM array. */
     for (u64 s = 0; s < VBDK_INODE_TABLE_SECTORS; s++) {
         u8 *dst = (u8 *)s_vol.inodes + (size_t)(s * VBDK_SECTOR_SIZE);
         r       = VbdkSectorRead(VBDK_INODE_TABLE_START + s, dst);
@@ -924,6 +998,323 @@ static i32 VbdkCtrlFill(u32 budget, u64 *out_bytes) {
 }
 
 /* ====================================================================
+ * Maintenance plane (v0.9): SYNC / CHECK / INFO / RAW_READ
+ *
+ * Reached through the same admin proxy as CTRL_* (the user service
+ * forwards USER_OP_DISK_*), except SYNC, which the vfs_server also sends
+ * on behalf of the "sync" / "power off" commands.  CHECK / INFO /
+ * RAW_READ are read-only diagnostics and are gated on
+ * ATOM_SERVICE_MANAGE exactly like CTRL_* (vfs.h:531); SYNC is not
+ * gated, see VbdkCtrlSync.
+ * ==================================================================== */
+
+/* Check-report error classes (drv_check_report_t.first_error). */
+enum {
+    VBDK_CHK_OK      = 0,
+    VBDK_CHK_SUPER   = 1, /* superblock missing / magic or geometry bad */
+    VBDK_CHK_TABLE   = 2, /* the inode table cannot be read back        */
+    VBDK_CHK_TYPE    = 3, /* type is neither a file nor a directory     */
+    VBDK_CHK_EXTENT  = 4, /* extent leaves the data area / the device   */
+    VBDK_CHK_OVERLAP = 5, /* two live inodes claim the same block       */
+    VBDK_CHK_NAME    = 6, /* name not NUL-terminated, or empty          */
+    VBDK_CHK_PARENT  = 7, /* parent_id is not a live directory          */
+    VBDK_CHK_CYCLE   = 8, /* the parent chain loops or never ends       */
+};
+
+/* In-use inode count.  Read-only. */
+static u32 VbdkInodesUsed(void) {
+    u32 n = 0;
+    for (u32 i = 1; i <= VBDK_MAX_INODES; i++)
+        if (s_vol.inodes[i - 1].flags & VBDK_IN_FLAG)
+            n++;
+    return n;
+}
+
+/* Blocks in use: the reserved metadata (superblock + inode table =
+ * VBDK_DATA_START sectors) plus every live extent.  This mirrors the
+ * derived free bitmap (VbdkRebuildBitmap marks exactly those), so
+ * used_blocks + free_blocks == nsectors.  Read-only. */
+static u32 VbdkUsedBlocks(void) {
+    u64 used = VBDK_DATA_START;
+    for (u32 i = 1; i <= VBDK_MAX_INODES; i++) {
+        const vbdk_inode_t *it = &s_vol.inodes[i - 1];
+        if (it->flags & VBDK_IN_FLAG)
+            used += it->extent_blocks;
+    }
+    if (used > (u64)s_vol.nsectors)
+        used = (u64)s_vol.nsectors; /* never report more than the device */
+    return (u32)used;
+}
+
+/*
+ * DRV_OP_SYNC — re-land the volume metadata on the medium.
+ *
+ * This driver is write-through and keeps NO cache (see the file header:
+ * "There is no caching, no background flush thread"), so every accepted
+ * write is already on the device.  What SYNC adds is the two guarantees
+ * "sync" / "power off" actually need:
+ *   1. the medium is still writable — every write below fails loudly
+ *      otherwise, and
+ *   2. the on-device metadata matches the authoritative RAM inode table
+ *      (the two can drift if disk.img is touched out of band).
+ * It therefore re-writes the whole inode table from RAM, then the
+ * superblock, and recomputes the derived free bitmap.
+ *
+ * UNMOUNTED volume: returns 0 and does NOTHING (chosen over ERR_INVAL).
+ * An unmounted volume has nothing buffered, so there is nothing to lose;
+ * "power off" must not report a spurious failure for a volume an admin
+ * deliberately detached, and writing to a device the admin unmounted
+ * would be a surprise.  vfs.h:534 makes SYNC legal in ANY mount state.
+ * This is also why SYNC is not capability-gated: the vfs_server (which
+ * does not hold ATOM_SERVICE_MANAGE) is one of its callers, and the op
+ * can only push already-accepted writes towards the medium.
+ */
+static i32 VbdkCtrlSync(void) {
+    if (!s_vol.mounted)
+        return 0; /* documented no-op — see the comment above */
+
+    vbdk_sb_t sb;
+    memset(&sb, 0, sizeof(sb));
+    sb.magic               = VBDK_MAGIC;
+    sb.block_size          = VBDK_SECTOR_SIZE;
+    sb.inode_table_start   = VBDK_INODE_TABLE_START;
+    sb.inode_table_sectors = VBDK_INODE_TABLE_SECTORS;
+    sb.data_start          = VBDK_DATA_START;
+    sb.uuid_hi             = s_vol.uuid_hi;
+    sb.uuid_lo             = s_vol.uuid_lo;
+    sb.root_inode          = 1;
+
+    /* Inode table first, superblock last: sector 0 stays the commit
+     * point of the format (VbdkFormat writes it last for exactly this
+     * reason), so a crash in the middle of a sync can never publish a
+     * half-written table under a valid signature. */
+    for (u64 s = 0; s < VBDK_INODE_TABLE_SECTORS; s++) {
+        const u8 *src = (const u8 *)s_vol.inodes + (size_t)(s * VBDK_SECTOR_SIZE);
+        if (VbdkSectorWrite(VBDK_INODE_TABLE_START + s, src) < 0)
+            return ERR_FAULT;
+    }
+    if (VbdkSectorWrite(0, &sb) < 0)
+        return ERR_FAULT;
+
+    VbdkRebuildBitmap(); /* derived state follows the table */
+
+    printf("fs_virtio_blk: Disk synced (%u inode-table sectors + superblock)\n",
+           (unsigned)VBDK_INODE_TABLE_SECTORS);
+    return 0;
+}
+
+/* Append one problem to the report: bump the error count and keep the
+ * FIRST one (class + human-readable phrase).  Read-only. */
+static void VbdkChkError(drv_check_report_t *rep, u32 cls, const char *what, u32 inode) {
+    rep->errors++;
+    if (rep->first_error != 0)
+        return;
+    rep->first_error = cls;
+    if (inode)
+        snprintf(rep->note, sizeof(rep->note), "%s (inode %u)", what, (unsigned)inode);
+    else
+        snprintf(rep->note, sizeof(rep->note), "%s", what);
+}
+
+/*
+ * Walk the parent chain of inode "id", bounded by the table size.
+ *   0 = the chain reaches the volume root,
+ *   1 = it loops or never terminates,
+ *   2 = it leaves the table (a parent that is not a live inode).
+ * Read-only.
+ */
+static int VbdkParentChain(u32 id) {
+    u64 cur = (u64)id;
+    for (u32 hops = 0; hops <= VBDK_MAX_INODES; hops++) {
+        if (cur == 0)
+            return 0; /* reached the root */
+        if (cur > (u64)VBDK_MAX_INODES)
+            return 2;
+        const vbdk_inode_t *it = &s_vol.inodes[cur - 1];
+        if (!(it->flags & VBDK_IN_FLAG))
+            return 2;
+        u64 parent = it->parent_id;
+        if (parent == cur)
+            return 1; /* self-parent: a 1-cycle */
+        cur = parent;
+    }
+    return 1; /* longer than the table: it must contain a cycle */
+}
+
+/*
+ * DRV_OP_CTRL_CHECK — read-only consistency scan.  Nothing here writes
+ * to the device (or to the RAM table): the report is the only output, so
+ * a check is always safe to run on a live volume.
+ *
+ * Scanned: the superblock read back from the device (magic + geometry),
+ * inode-table readability (first and last table sector), and for every
+ * in-use inode its type, name termination, parent link, parent chain and
+ * extent range; live extents are additionally cross-checked against each
+ * other for overlap.  files / dirs / used_blocks / free_blocks are
+ * counted on the way.
+ */
+static i32 VbdkCtrlCheck(drv_check_report_t *rep) {
+    /* Scan-local overlap map (VBDK_MAX_SECTORS bits = 2 KB).  Deliberately
+     * NOT s_blkmap: a diagnostic must not touch the live allocation
+     * bitmap, and this buffer is cleared before every scan. */
+    static u8 seen[VBDK_MAX_SECTORS / 8];
+    u8        probe[VBDK_SECTOR_SIZE];
+    vbdk_sb_t sb;
+
+    memset(rep, 0, sizeof(*rep));
+    memset(seen, 0, sizeof(seen));
+    rep->inodes_total = VBDK_MAX_INODES;
+
+    /* --- the medium is still readable: superblock + inode table --- */
+    memset(&sb, 0, sizeof(sb));
+    if (VbdkSectorRead(0, &sb) < 0) {
+        VbdkChkError(rep, VBDK_CHK_SUPER, "superblock unreadable", 0);
+    } else if (sb.magic != VBDK_MAGIC || sb.block_size != VBDK_SECTOR_SIZE ||
+               sb.inode_table_start != VBDK_INODE_TABLE_START ||
+               sb.inode_table_sectors != VBDK_INODE_TABLE_SECTORS ||
+               sb.data_start != VBDK_DATA_START || sb.root_inode != 1) {
+        VbdkChkError(rep, VBDK_CHK_SUPER, "bad superblock magic/geometry", 0);
+    } else {
+        rep->magic_ok = 1;
+    }
+    for (u32 k = 0; k < 2; k++) {
+        u64 sec = VBDK_INODE_TABLE_START + (k ? (u64)VBDK_INODE_TABLE_SECTORS - 1 : 0);
+        if (VbdkSectorRead(sec, probe) < 0)
+            VbdkChkError(rep, VBDK_CHK_TABLE, "inode table unreadable", 0);
+    }
+
+    /* --- per-inode scan (the RAM table is the authoritative mirror) --- */
+    u32 used = VBDK_DATA_START; /* superblock + inode table are reserved */
+    for (u32 i = 1; i <= VBDK_MAX_INODES; i++) {
+        const vbdk_inode_t *it = &s_vol.inodes[i - 1];
+        if (!(it->flags & VBDK_IN_FLAG))
+            continue;
+        rep->inodes_used++;
+        if (it->type == VFS_ITEM_FILE)
+            rep->files++;
+        else if (it->type == VFS_ITEM_DIR)
+            rep->dirs++;
+        else
+            VbdkChkError(rep, VBDK_CHK_TYPE, "unknown inode type", i);
+
+        /* the name field must be terminated inside itself; only the root
+         * may be nameless */
+        if (!memchr(it->name, '\0', sizeof(it->name)))
+            VbdkChkError(rep, VBDK_CHK_NAME, "name is not NUL-terminated", i);
+        else if (i != 1 && it->name[0] == '\0')
+            VbdkChkError(rep, VBDK_CHK_NAME, "empty name", i);
+
+        /* parent link: only the root (inode 1) hangs off 0, every other
+         * parent must be a live directory */
+        int parent_ok = 1;
+        if (i == 1) {
+            if (it->parent_id != 0) {
+                parent_ok = 0;
+                VbdkChkError(rep, VBDK_CHK_PARENT, "root inode has a parent", i);
+            }
+        } else {
+            const vbdk_inode_t *p = NULL;
+            if (it->parent_id >= 1 && it->parent_id <= (u64)VBDK_MAX_INODES)
+                p = &s_vol.inodes[it->parent_id - 1];
+            if (!p || !(p->flags & VBDK_IN_FLAG) || p->type != VFS_ITEM_DIR) {
+                parent_ok = 0;
+                VbdkChkError(rep, VBDK_CHK_PARENT, "parent is not a live directory", i);
+            }
+        }
+
+        /* no directory may sit on a looping parent chain */
+        if (parent_ok && it->type == VFS_ITEM_DIR) {
+            int chain = VbdkParentChain(i);
+            if (chain == 1)
+                VbdkChkError(rep, VBDK_CHK_CYCLE, "directory cycle", i);
+            else if (chain == 2)
+                VbdkChkError(rep, VBDK_CHK_PARENT, "parent chain leaves the table", i);
+        }
+
+        /* the extent must sit inside the data area, and no two live
+         * inodes may own the same block */
+        if (it->extent_blocks > 0) {
+            u64 end = (u64)it->extent_start + (u64)it->extent_blocks;
+            if (it->extent_start < VBDK_DATA_START || end > (u64)s_vol.nsectors) {
+                VbdkChkError(rep, VBDK_CHK_EXTENT, "extent outside the data area", i);
+            } else {
+                for (u32 b = it->extent_start; b < (u32)end; b++) {
+                    if (seen[b >> 3] & (u8)(1u << (b & 7)))
+                        VbdkChkError(rep, VBDK_CHK_OVERLAP, "extent overlaps another inode", i);
+                    seen[b >> 3] |= (u8)(1u << (b & 7));
+                }
+                used += it->extent_blocks;
+            }
+        }
+    }
+
+    if (used > s_vol.nsectors)
+        used = s_vol.nsectors;
+    rep->used_blocks = used;
+    rep->free_blocks = s_vol.nsectors - used;
+
+    if (rep->errors == 0)
+        snprintf(rep->note, sizeof(rep->note), "clean: %u files, %u dirs, %u free blocks",
+                 (unsigned)rep->files, (unsigned)rep->dirs, (unsigned)rep->free_blocks);
+    return 0;
+}
+
+/* DRV_OP_CTRL_INFO — volume detail for the shell's "disk info".  Pure
+ * RAM state, no device I/O; every field the driver cannot supply stays
+ * zero (vfs.h:562). */
+static i32 VbdkCtrlInfo(drv_info_t *info) {
+    memset(info, 0, sizeof(*info));
+    strncpy(info->driver, "virtio_blk", sizeof(info->driver) - 1);
+    strncpy(info->mount, "Disk", sizeof(info->mount) - 1);
+    info->read_only    = s_vol.read_only;  /* 0 — Disk is RW            */
+    info->block_size   = VBDK_SECTOR_SIZE; /* allocation unit = sector  */
+    info->total_blocks = s_vol.nsectors;
+    info->used_blocks  = VbdkUsedBlocks();
+    info->inode_total  = VBDK_MAX_INODES;
+    info->inode_used   = VbdkInodesUsed();
+    info->persistent   = 1; /* disk.img survives a reboot */
+    info->uuid_hi      = s_vol.uuid_hi;
+    info->uuid_lo      = s_vol.uuid_lo;
+    return 0;
+}
+
+/*
+ * DRV_OP_CTRL_RAW_READ — read raw sectors straight off the device (the
+ * debug plane).  req.offset is the first LBA, req.len the byte count:
+ * rounded DOWN to whole 512-byte sectors, capped at DRV_RAW_MAX (one
+ * reply must stay inside the IPC limit, vfs.h:544); len == 0 means one
+ * sector, and a sub-sector len is served as one sector too — the device
+ * cannot read less.
+ *
+ * Returns the number of bytes actually read (>= 0), like DRV_OP_READ,
+ * or a negative error.  The payload lands in the caller's out[] buffer
+ * (= drv_resp_t.u.data).  NOTE: drv_resp_t.u is a UNION — u.ctrl.bytes
+ * aliases u.data[0..7], so the byte count CANNOT ride in u.ctrl.bytes
+ * without clobbering the first 8 payload bytes.  It travels in the
+ * response's ret field instead (the DRV_OP_READ convention); the user
+ * service proxy maps it onto user_resp_disk_t.bytes.
+ */
+static i32 VbdkCtrlRawRead(u64 lba, u32 len, u8 *out) {
+    u32 bytes = len;
+    if (bytes == 0)
+        bytes = VBDK_SECTOR_SIZE; /* default: one sector */
+    if (bytes > DRV_RAW_MAX)
+        bytes = DRV_RAW_MAX;
+    bytes &= ~(u32)(VBDK_SECTOR_SIZE - 1U); /* whole sectors only */
+    if (bytes < VBDK_SECTOR_SIZE)
+        bytes = VBDK_SECTOR_SIZE; /* never read zero bytes */
+
+    u32 sectors = bytes / VBDK_SECTOR_SIZE;
+    if (lba >= (u64)s_vol.nsectors || (u64)sectors > (u64)s_vol.nsectors - lba)
+        return ERR_INVAL; /* outside the device: no partial read */
+
+    int64_t r = sys_blk_read((u64)s_vol.disk, lba, (u64)sectors, out);
+    if (r < 0)
+        return (i32)r;
+    return (i32)(sectors * VBDK_SECTOR_SIZE);
+}
+
+/* ====================================================================
  * Driver protocol handlers
  * ==================================================================== */
 
@@ -931,9 +1322,25 @@ static void DrvHandle(int token, drv_req_t *req, u64 caller) {
     drv_resp_t *resp = (drv_resp_t *)s_resp;
     memset(resp, 0, sizeof(*resp));
 
+    /* v0.9 SYNC is dispatched here, BEFORE both the management gate and
+     * the mounted/volume check: it is legal in ANY mount state and is
+     * deliberately NOT gated on ATOM_SERVICE_MANAGE — one of its senders
+     * is the vfs_server, which does not hold that atom (vfs.h:531-534).
+     * It can only push writes the volume already accepted towards the
+     * medium. */
+    switch (req->op) {
+    case DRV_OP_SYNC:
+        resp->ret = VbdkCtrlSync();
+        goto out;
+    default:
+        break;
+    }
+
     /* Management control plane: gated on ATOM_SERVICE_MANAGE (the user
-     * service proxies admin commands).  Runs even while unmounted. */
-    if (req->op >= DRV_OP_CTRL_MOUNT && req->op <= DRV_OP_CTRL_FILL) {
+     * service proxies admin commands).  Runs even while unmounted — the
+     * v0.9 diagnostics are read-only and the CTRL_* ops do their own
+     * mount bookkeeping. */
+    if (req->op >= DRV_OP_CTRL_MOUNT && req->op <= DRV_OP_CTRL_RAW_READ) {
         if (CapHasAtom(caller, ATOM_SERVICE_MANAGE) != 1) {
             resp->ret = ERR_DENIED;
             goto out;
@@ -950,6 +1357,18 @@ static void DrvHandle(int token, drv_req_t *req, u64 caller) {
             break;
         case DRV_OP_CTRL_FILL:
             resp->ret = VbdkCtrlFill(req->len, &resp->u.ctrl.bytes);
+            break;
+        case DRV_OP_CTRL_CHECK:
+            resp->ret = VbdkCtrlCheck(&resp->u.check);
+            break;
+        case DRV_OP_CTRL_INFO:
+            resp->ret = VbdkCtrlInfo(&resp->u.info);
+            break;
+        case DRV_OP_CTRL_RAW_READ:
+            /* offset = first LBA, len = byte count; the byte count comes
+             * back in ret (see VbdkCtrlRawRead: u.ctrl.bytes aliases
+             * u.data[0..7] in the response union). */
+            resp->ret = VbdkCtrlRawRead(req->offset, req->len, resp->u.data);
             break;
         default:
             resp->ret = ERR_INVAL;

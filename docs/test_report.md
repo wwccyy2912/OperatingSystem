@@ -1,5 +1,10 @@
 # OpSys 全面测试报告（三轮高强度）
 
+> **阅读提示**：本文是**设计基线文档**，记录做出决策时的思考与当时的现状快照。
+> 其中标注为"规划/未实现"的条目可能已在后续版本落地。判断某项功能的**当前状态**，
+> 请以代码、[../README.md](../README.md) 与 [architecture.md](architecture.md) 为准；
+> 逐提交的实际进展见 [CHANGELOG.md](CHANGELOG.md)，文档地图见 [README.md](README.md)。
+
 > 日期：2026-08-16
 > 依据：`.omo/plans/full-test-plan.md`（R1 基线回归 + R2 盲区补测 + R3 压力/边界）
 > 驱动：`scripts/smoke_test.py`（QEMU 双通道自动化：serial 服务日志 + VGA screendump 解码，

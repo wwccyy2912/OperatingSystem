@@ -58,6 +58,7 @@
 
 #include "net.h"
 #include "proto.h"
+#include <kernel/atom.h> /* ATOM_NET_* — the service-side gate (v1.0) */
 
 #include <libc/stdio.h>
 #include <libc/stdlib.h> /* getenv */
@@ -454,6 +455,60 @@ static void NetServiceRx(void) {
 
 /* ---- IPC server ---- */
 
+/* ====================================================================
+ * v1.0: atom gate
+ *
+ * Until now every Ring-3 process could drive the whole network stack:
+ * the service checked nothing about its caller.  The permission model
+ * already defines ATOM_NET_CONNECT (outbound traffic) and ATOM_NET_BIND
+ * (listening / binding a local port); this is where they finally take
+ * effect.
+ *
+ * The service itself holds ATOM_SERVICE_MANAGE (blob-seeded by the
+ * kernel, see kernel/syscall/process_desc.c), which is what CapHasAtom()
+ * requires from the CALLER — so the gate can inspect other subjects.
+ *
+ * Diagnostics stay open (GET_MAC / GET_IP / STATS): they leak nothing an
+ * attacker could not learn from the wire, and keeping them ungated means
+ * a monitoring tool needs no capability at all.
+ * ==================================================================== */
+
+static int NetOpNeedsAtom(u32 op, u32 *atom_out) {
+    switch (op) {
+    /* --- outbound: anything that puts bytes on the wire --- */
+    case NET_OP_SEND:
+    case NET_OP_IP_SEND:
+    case NET_OP_PING:
+    case NET_OP_UDP_SENDTO:
+    case NET_OP_TCP_CONNECT:
+    case NET_OP_TCP_SEND:
+    case NET_OP_TCP_RECV:
+    case NET_OP_TCP_CLOSE:
+    case NET_OP_SET_IP:
+        *atom_out = ATOM_NET_CONNECT;
+        return 1;
+    /* --- local endpoints: binding/receiving needs the stronger atom --- */
+    case NET_OP_RECV:
+    case NET_OP_UDP_BIND:
+    case NET_OP_UDP_UNBIND:
+    case NET_OP_UDP_RECV:
+    case NET_OP_TCP_LISTEN:
+    case NET_OP_TCP_ACCEPT:
+        *atom_out = ATOM_NET_BIND;
+        return 1;
+    default:
+        return 0; /* GET_MAC / GET_IP / STATS */
+    }
+}
+
+/* 1 = allowed, 0 = denied (ERR_NOCAP is reported to the caller). */
+static int NetAuthorize(u32 op, u64 caller_subject) {
+    u32 atom = 0;
+    if (!NetOpNeedsAtom(op, &atom))
+        return 1;
+    return CapHasAtom(caller_subject, atom) == 1;
+}
+
 static void NetServerLoop(int port) {
     for (;;) {
         /* Poll the Rx ring first (the QEMU 10.2 pcnet INTx path is
@@ -469,9 +524,10 @@ static void NetServerLoop(int port) {
                 ProtoRx(frame, flen);
         }
 
-        int msg_len = (int)sizeof(s_req);
-        int token   = 0;
-        int ret     = IpcRecv(port, s_req, &msg_len, &token);
+        int      msg_len = (int)sizeof(s_req);
+        int      token   = 0;
+        uint64_t caller  = 0; /* kernel-filled sender subject (unforgeable) */
+        int ret = IpcRecvFrom(port, s_req, &msg_len, &token, &caller);
         if (ret < 0) {
             printf("net: ipc_recv failed (%d)\n", ret);
             ThreadExit(1);
@@ -480,6 +536,14 @@ static void NetServerLoop(int port) {
         net_resp_t *resp = (net_resp_t *)s_resp;
         memset(resp, 0, sizeof(*resp));
         resp->ret = -2; /* ERR_INVAL */
+
+        /* v1.0 atom gate: refuse before any stack state is touched. */
+        if (!NetAuthorize(req->op, caller)) {
+            resp->ret = -3; /* ERR_NOCAP */
+            resp->len = 0;
+            (void)IpcReply(token, resp, (int)sizeof(*resp));
+            continue;
+        }
 
         switch (req->op) {
         case NET_OP_GET_MAC:
@@ -533,7 +597,12 @@ static void NetServerLoop(int port) {
 
         /* ---- L3/L4 protocol ops ---- */
         case NET_OP_SET_IP: {
-            /* { ip[4]; gw[4] } — reconfigure the static address. */
+            /* { ip[4]; gw[4] } — reconfigure the static address.
+             * The value is stored (s_ip / s_gw) and reported back by
+             * NET_OP_GET_IP, but it does not steer routing yet: the
+             * stack has no routing table and always ARPs the
+             * destination directly (see the ProtoInit() note in
+             * main()). */
             if (req->len >= 8) {
                 ProtoInit(req->data, req->data + 4);
                 resp->ret = 0;
@@ -650,6 +719,36 @@ static void NetServerLoop(int port) {
         case NET_OP_TCP_CLOSE:
             resp->ret = ProtoTcpClose();
             break;
+        case NET_OP_TCP_CONNECT: {
+            /* { ip[4]; port } — active open (SYN -> ESTAB).  The stack
+             * picks the local port itself; the reply reports the
+             * endpoint the connection is bound to:
+             * { peer[4]; peerport }.  The call blocks until the
+             * SYN|ACK arrives (~6 s worst case), pumping the Rx ring
+             * itself, so the service loop stays in one thread. */
+            if (req->len >= 6) {
+                u8 dst[4];
+                memcpy(dst, req->data, 4);
+                u16 dport = (u16)((req->data[4] << 8) | req->data[5]);
+                resp->ret = ProtoTcpConnect(dst, dport);
+                if (resp->ret == 0) {
+                    /* Connected: the reply mirrors TCP_ACCEPT and names
+                     * the peer this single connection is bound to. */
+                    memcpy(resp->data, dst, 4);
+                    resp->data[4] = (u8)(dport >> 8);
+                    resp->data[5] = (u8)(dport & 0xFF);
+                    resp->len = 6;
+                }
+            }
+            break;
+        }
+        case NET_OP_GET_IP: {
+            /* -> { ip[4]; gw[4] } — the stack's current static config. */
+            ProtoGetIp(resp->data, resp->data + 4);
+            resp->len = 8;
+            resp->ret = 0;
+            break;
+        }
         default:
             break;
         }
@@ -753,7 +852,13 @@ int main(void) {
     }
     printf("net: NIC started (Rx/Tx live)\n");
 
-    /* 7c. Protocol stack: static slirp-typical address. */
+    /* 7c. Protocol stack: static slirp-typical address.
+     * NET_OP_SET_IP (op dispatch above) re-runs ProtoInit() with the
+     * caller's address, so s_ip / s_gw do follow it — but neither
+     * takes part in routing today: IpSendRaw() has no routing table
+     * and always ARPs the destination itself (slirp answers for the
+     * gateway MAC).  s_gw is therefore stored and reported
+     * (NET_OP_GET_IP) but never consulted when choosing a next hop. */
     {
         static const u8 ip[4] = {10, 0, 2, 15};
         static const u8 gw[4] = {10, 0, 2, 2};

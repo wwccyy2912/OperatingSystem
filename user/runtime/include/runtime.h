@@ -41,6 +41,15 @@ void _fini(void);
 typedef void (*atexit_func_t)(void);
 int Atexit(atexit_func_t func);
 
+/* --- C++ static destructors (Itanium C++ ABI, see exit.c) --- */
+/* __cxa_atexit() is called by the compiler-generated destructor
+ * thunks; both signatures are fixed by the ABI, so no OpSys-specific
+ * variant is allowed.  __cxa_finalize(NULL) runs every registered
+ * destructor in LIFO order; exit() calls it after the Atexit() table
+ * and before _fini(). */
+int  __cxa_atexit(void (*func)(void *), void *arg, void *dso);
+void __cxa_finalize(void *dso);
+
 /* --- exit --- */
 void exit(int code) __attribute__((noreturn));
 void _exit(int code) __attribute__((noreturn));

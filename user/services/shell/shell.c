@@ -212,13 +212,31 @@ static int UserCall(const void *req, int req_len, void *resp, int resp_len);
 static int CmdCd(int argc, char *argv[]);
 static int CmdPwd(int argc, char *argv[]);
 static int CmdScroll(int argc, char *argv[]);
-static int CmdDisk(int argc, char *argv[]);
 static int CmdShutdown(int argc, char *argv[]);
 static int CmdBm(int argc, char *argv[]);
 static int CmdPerm(int argc, char *argv[]);
 static int CmdPolicy(int argc, char *argv[]);
 static int CmdFm(int argc, char *argv[]);
-static int ShellResolvePath(const char *path, char *out, size_t outsz);
+int ShellResolvePath(const char *path, char *out, size_t outsz); /* shell.h */
+
+/* Tool families implemented in their own translation units
+ * (cmd_fs.c / cmd_disk.c / cmd_power.c / cmd_net.c).  Each one calls
+ * ShellRegisterCommand() for its own commands. */
+void ShellRegisterFsCommands(void);
+void ShellRegisterDiskCommands(void);
+void ShellRegisterPowerCommands(void);
+void ShellRegisterNetCommands(void);
+
+/* Permission-policy helpers implemented in cmd_perm.c (v1.0): the
+ * audit trail, the foreground/background table, the frequency /
+ * quarantine counters and the policy snapshot file.  They are reached
+ * through the existing `perm` command so the family keeps one name. */
+int  PermCmdAudit(int argc, char *argv[]);
+int  PermCmdCtx(int argc, char *argv[]);
+int  PermCmdFreq(int argc, char *argv[]);
+int  PermCmdSave(int argc, char *argv[]);
+int  PermCmdLoad(int argc, char *argv[]);
+void ShellRegisterPermCommands(void);
 
 /* ====================================================================
  * Runtime command registry
@@ -444,7 +462,7 @@ static int s_term_port = -1; /* resolved once in ShellMain()  */
 static int s_kbd_port  = -1; /* resolved once in ShellMain()  */
 
 /* Send one byte to the terminal service (WRITE op). */
-static void ShellPutc(char c) {
+void ShellPutc(char c) {
     if (s_term_port < 0)
         return;
 
@@ -459,7 +477,7 @@ static void ShellPutc(char c) {
 
 /* Send a NUL-terminated string to the terminal service (WRITE op),
  * chunked so the request buffer stays small and bounded. */
-static void ShellWrite(const char *s) {
+void ShellWrite(const char *s) {
     if (s_term_port < 0)
         return;
 
@@ -518,7 +536,7 @@ static void ShellUtoaHex(u32 v, char *buf) {
 
 /* Minimal formatted output through the serial service.
  * Supports %d, %x, %s, %c, %% — everything the shell commands need. */
-static void ShellPrintf(const char *fmt, ...) {
+void ShellPrintf(const char *fmt, ...) {
     va_list ap;
     char    num[12];
 
@@ -985,6 +1003,24 @@ static int ReadLine(char *buf, int maxlen) {
 /* Password entry: echo '*' instead of the typed characters. */
 static int ReadLineMasked(char *buf, int maxlen) {
     return ReadLineImpl(buf, maxlen, 1);
+}
+
+/* ---- Public wrappers for the command modules (shell.h) ----
+ * The internal call sites keep using the short names; the modules get
+ * the same editor through the exported ShellReadLine*() API. */
+
+int ShellReadLine(char *buf, int maxlen) {
+    return ReadLine(buf, maxlen);
+}
+
+int ShellReadLineMasked(char *buf, int maxlen) {
+    return ReadLineMasked(buf, maxlen);
+}
+
+/* The shell's current working directory, for command modules that need
+ * to display or resolve it (cmd_fs.c / cmd_disk.c). */
+const char *ShellCwd(void) {
+    return s_cwd;
 }
 
 /* Shared line reader: mask=1 echoes '*' (password entry). */
@@ -1693,7 +1729,7 @@ static void PathNormalize(const char *in, char *out, size_t outsz) {
  * Every result is normalized (".", "..", "//" resolved) — so "cd ..",
  * "cd .", "ls ../x", "cd /Disk/d1/.." all behave like a real shell.
  * Writes into out (LINE_BUF_SIZE).  Returns 0 on success. */
-static int ShellResolvePath(const char *path, char *out, size_t outsz) {
+int ShellResolvePath(const char *path, char *out, size_t outsz) {
     char raw[LINE_BUF_SIZE];
     if (!path || path[0] == '\0') {
         strncpy(raw, s_cwd, sizeof(raw) - 1);
@@ -1839,127 +1875,6 @@ static int CmdScroll(int argc, char *argv[]) {
     return 0;
 }
 
-/* ====================================================================
- * disk — block-device management (v0.7.1)
- *
- *   disk list                     volumes + capacity/used (df-like)
- *   disk mount <vol>              mount the volume
- *   disk unmount <vol>            unmount it
- *   disk format <vol>             wipe + re-format (DESTRUCTIVE, asks)
- *   disk fill <vol> [bytes]       write fill.bin until NOSPC or budget
- *
- * mount/unmount/format/fill go through the user service (admin proxy):
- * it holds ATOM_SERVICE_MANAGE (the driver's control plane requires
- * it) and re-checks the caller is OWNER/ADMIN — the shell never talks
- * to the driver directly.
- * ==================================================================== */
-static int CmdDisk(int argc, char *argv[]) {
-    if (argc < 2) {
-        ShellWrite("Usage: disk list | mount <vol> | unmount <vol> | "
-                    "format <vol> | fill <vol> [bytes]\n");
-        return -1;
-    }
-
-    if (strcmp(argv[1], "list") == 0) {
-        static vfs_vol_info_t vols[VFS_MAX_VOLS];
-        u32                   count = 0;
-        int                   r     = FsListVolumes(vols, &count);
-        if (r < 0) {
-            ShellPrintf("disk: list FAILED (%d)\n", r);
-            return -1;
-        }
-        if (count == 0) {
-            ShellWrite("disk: no volumes mounted\n");
-            return 0;
-        }
-        for (u32 i = 0; i < count; i++) {
-            char url[80];
-            snprintf(url, sizeof(url), "/%s", vols[i].mount_name);
-            u64 total = 0, used = 0;
-            u32 ro   = 0;
-            int  sr  = FsStatVolume(url, &total, &used, &ro);
-            ShellWrite(vols[i].mount_name);
-            ShellWrite("  ");
-            if (sr == 0)
-                ShellPrintf("%d KiB used / %d KiB total%s\n", (int)(used / 1024u),
-                             (int)(total / 1024u), ro ? " (ro)" : "");
-            else
-                ShellWrite("(stat unavailable)\n");
-        }
-        ShellPrintf("disk: %d volume(s)\n", (int)count);
-        return 0;
-    }
-
-    if (argc < 3) {
-        ShellWrite("Usage: disk list | mount <vol> | unmount <vol> | "
-                    "format <vol> | fill <vol> [bytes]\n");
-        return -1;
-    }
-    if (strlen(argv[2]) >= 64) {
-        ShellPrintf("disk: volume name too long\n");
-        return -1;
-    }
-
-    user_req_disk_t req;
-    memset(&req, 0, sizeof(req));
-    strncpy(req.volume, argv[2], sizeof(req.volume) - 1);
-    req.volume[sizeof(req.volume) - 1] = '\0';
-
-    if (strcmp(argv[1], "mount") == 0) {
-        req.op = USER_OP_DISK_MOUNT;
-    } else if (strcmp(argv[1], "unmount") == 0) {
-        req.op = USER_OP_DISK_UNMOUNT;
-    } else if (strcmp(argv[1], "format") == 0) {
-        req.op = USER_OP_DISK_FORMAT;
-    } else if (strcmp(argv[1], "fill") == 0) {
-        req.op = USER_OP_DISK_FILL;
-        if (argc >= 4) {
-            u32 v = 0;
-            for (const char *p = argv[3]; *p >= '0' && *p <= '9'; p++)
-                v = v * 10u + (u32)(*p - '0');
-            req.size = v; /* 0 (explicit) = fill until NOSPC */
-        } else {
-            req.size = 0; /* fill until NOSPC */
-        }
-    } else {
-        ShellPrintf("disk: unknown subcommand '%s'\n", argv[1]);
-        return -1;
-    }
-
-    /* Format is destructive: require an explicit confirmation word. */
-    if (req.op == USER_OP_DISK_FORMAT) {
-        ShellPrintf("disk: formatting '%s' destroys ALL data on it.\n", req.volume);
-        ShellWrite("Type YES to continue: ");
-        char conf[8];
-        if (ReadLine(conf, sizeof(conf)) < 0)
-            return -1;
-        if (strcmp(conf, "YES") != 0) {
-            ShellWrite("disk: format cancelled\n");
-            return 0;
-        }
-    }
-
-    user_resp_disk_t resp;
-    memset(&resp, 0, sizeof(resp));
-    int r = UserCall(&req, (int)sizeof(req), &resp, (int)sizeof(resp));
-    if (r < 0) {
-        ShellPrintf("disk: ipc FAILED (%d)\n", r);
-        return -1;
-    }
-    if (resp.ret < 0) {
-        ShellPrintf("disk: %s '%s' FAILED (%d)", argv[1], req.volume, resp.ret);
-        if (resp.detail[0])
-            ShellPrintf(" - %s", resp.detail);
-        ShellWrite("\n");
-        return -1;
-    }
-    if (req.op == USER_OP_DISK_FILL)
-        ShellPrintf("disk: %d KiB written to %s/fill.bin\n", (int)(resp.bytes / 1024u),
-                     req.volume);
-    else
-        ShellPrintf("disk: %s '%s' ok\n", argv[1], req.volume);
-    return 0;
-}
 
 /* ------------------------------------------------------------------ */
 /*  UNIX-style subcommand dispatchers (v0.5)                          */
@@ -1987,9 +1902,12 @@ static int CmdBm(int argc, char *argv[]) {
     return -1;
 }
 
+/* perm <sub> ... — the Powerbox half (answer/query/revoke) lives in
+ * this file; the v1.0 policy/audit/context half lives in cmd_perm.c and
+ * is dispatched here so the whole family stays under one name. */
 static int CmdPerm(int argc, char *argv[]) {
     if (argc < 2) {
-        ShellWrite("Usage: perm <answer|query|revoke> ...\n");
+        ShellWrite("Usage: perm <answer|query|revoke|audit|ctx|freq|save|load> ...\n");
         return -1;
     }
     if (strcmp(argv[1], "answer") == 0)
@@ -1998,6 +1916,16 @@ static int CmdPerm(int argc, char *argv[]) {
         return CmdPermQuery(argc - 1, argv + 1);
     if (strcmp(argv[1], "revoke") == 0)
         return CmdPermRevoke(argc - 1, argv + 1);
+    if (strcmp(argv[1], "audit") == 0)
+        return PermCmdAudit(argc - 1, argv + 1);
+    if (strcmp(argv[1], "ctx") == 0)
+        return PermCmdCtx(argc - 1, argv + 1);
+    if (strcmp(argv[1], "freq") == 0)
+        return PermCmdFreq(argc - 1, argv + 1);
+    if (strcmp(argv[1], "save") == 0)
+        return PermCmdSave(argc - 1, argv + 1);
+    if (strcmp(argv[1], "load") == 0)
+        return PermCmdLoad(argc - 1, argv + 1);
     ShellPrintf("perm: unknown subcommand '%s'\n", argv[1]);
     return -1;
 }
@@ -3800,7 +3728,9 @@ static void ShellMain(void *arg) {
     ShellRegisterCommand("perm_revoke", "Drop grants: perm_revoke [subject_id]", CmdPermRevoke);
     /* UNIX-style aliases: bm <create|resolve|revoke>, perm <answer|query|revoke>. */
     ShellRegisterCommand("bm", "Bookmarks: bm <create|resolve|revoke> ...", CmdBm);
-    ShellRegisterCommand("perm", "Powerbox: perm <answer|query|revoke> ...", CmdPerm);
+    ShellRegisterCommand("perm",
+                           "Permission: perm <answer|query|revoke|audit|ctx|freq|save|load> ...",
+                           CmdPerm);
     ShellRegisterCommand("mv", "Move/rename: mv <src> <dst-dir> [new-name]", CmdMv);
     ShellRegisterCommand("pkg", "pkg-manager: pkg <install|list|run|remove>", CmdPkg);
 
@@ -3827,9 +3757,22 @@ static void ShellMain(void *arg) {
     ShellRegisterCommand("pwd", "Print working directory", CmdPwd);
     ShellRegisterCommand("scroll",
                            "Page through terminal scrollback: scroll [lines] | scroll end", CmdScroll);
-    ShellRegisterCommand("disk",
-                           "Disk mgmt: disk list|mount|unmount|format|fill <vol> [bytes]", CmdDisk);
     ShellRegisterCommand("fm", "TUI file manager (j/k Enter v d q)", CmdFm);
+
+    /* v0.9 tool families, each in its own translation unit so the
+     * shell core stays readable:
+     *   cmd_fs.c    — df / du / cp / head / hexdump / touch / tree
+     *   cmd_disk.c  — disk info|sync|check|read
+     *   cmd_power.c — power ... / poweroff / halt / restart / svc ...
+     *   cmd_net.c   — ip / udp / dns / http / netstat
+     * Registration happens before the loop reads input (the command
+     * list has a single writer — see the registry comment above), and
+     * after the built-ins so `help` lists the core commands first. */
+    ShellRegisterFsCommands();
+    ShellRegisterDiskCommands();
+    ShellRegisterPowerCommands();
+    ShellRegisterNetCommands();
+    ShellRegisterPermCommands();
 
     /* v0.5: load the command policy filter (rescue list on failure). */
     CmdFilterLoad();

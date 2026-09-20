@@ -1,5 +1,10 @@
 # OpSys Runtime 快速参考指南
 
+> **阅读提示**：本文是**设计基线文档**，记录做出决策时的思考与当时的现状快照。
+> 其中标注为"规划/未实现"的条目可能已在后续版本落地。判断某项功能的**当前状态**，
+> 请以代码、[../README.md](../README.md) 与 [architecture.md](architecture.md) 为准；
+> 逐提交的实际进展见 [CHANGELOG.md](CHANGELOG.md)，文档地图见 [README.md](README.md)。
+
 > 简明版，详见 docs/runtime_design.md
 
 ---
@@ -194,21 +199,86 @@ printf("PID=%d, free_pages=%d, heap_base=0x%lx\n",
        pid, free_pages, heap_base);
 ```
 
-### malloc 调试（v1.0+）
+### 堆诊断（v0.9 已实现）
+
+`user/runtime/include/malloc.h` 提供三个只读诊断接口，无需任何初始化：
 
 ```c
-/* 未实现，计划功能 */
+#include <malloc.h>
 
-/* 1. malloc 钩子 */
-void *(*malloc_hook)(size_t size, const void *caller) = NULL;
+malloc_stats_t st;
+MallocStats(&st);           /* 填充堆的当前形态，不分配内存 */
 
-/* 2. 内存泄漏检测 */
-struct mallinfo info = mallinfo();
-printf("total malloc'd: %d bytes\n", info.uordblks);
+printf("heap  0x%x..0x%x (%d bytes)\n", st.heap_base, st.heap_end, st.heap_bytes);
+printf("live  %d blocks / %d bytes, peak %d\n", st.blocks_live, st.used_bytes, st.peak_used);
+printf("free  %d blocks / %d bytes, largest %d\n",
+       st.blocks_free, st.free_bytes, st.largest_free);
+printf("grow  %d calls / %d bytes, failures %d\n",
+       st.grow_calls, st.grow_bytes, st.fail_count);
 
-/* 3. valgrind 集成 */
-#include <valgrind/memcheck.h>
-VALGRIND_CHECK_MEM_IS_DEFINED(ptr, size);
+int problems = MallocCheck();   /* 0 = 一致；>0 = 问题数；-1 = 堆未初始化 */
+size_t usable = MallocUsableSize(p);  /* 该分配实际可用的负载字节数 */
+```
+
+字段含义：`heap_base`/`heap_end` 是已经映射的堆区间（基址来自内核 ASLR），`used_bytes`/`free_bytes` 是**负载**字节（不含块头），`overhead` 是块头与对齐损耗，`largest_free` 是最大单块空闲（判断"还能不能分配下 N 字节"最有用），`peak_used` 是历史峰值，`fail_count` 是返回过 NULL 的次数。
+
+`MallocCheck()` 真走一遍堆：块链完整性与尺寸合理性、空闲链是否成环、空闲块与活跃块是否重叠（由链精确覆盖证明）、是否越过堆末尾。发现问题时把详情写进串口调试日志并返回问题计数 —— 它是**只读**的，不会修改堆，因此可以在怀疑堆被写坏时随时调用。
+
+### 标准文件 I/O（v0.9 已实现）
+
+OpSys 没有内核文件描述符：文件是 vfs_server 持有的句柄。libc 把 `FILE` 做成一个**带缓冲的不透明记录**，真正的读写交给一个后端 vtable；`libfs` 通过 `.init_array` 构造函数安装 VFS 后端（`user/lib/libfs/stdio_vfs.c`），因此任何链接了共享用户对象的程序都能直接用：
+
+```c
+#include <stdio.h>
+
+FILE *f = fopen("/Volumes/Disk/notes.txt", "w");
+if (!f) { perror("fopen"); return 1; }
+fprintf(f, "hello %d\n", 42);
+fclose(f);
+
+f = fopen("/Volumes/Disk/notes.txt", "r");
+char line[128];
+while (fgets(line, sizeof(line), f))
+    printf("%s", line);   /* printf 仍走串口调试通道 */
+fclose(f);
+```
+
+| 能力 | 说明 |
+| --- | --- |
+| 打开/关闭 | `fopen`（`r` `w` `a` `+` `b`）、`fclose`、`remove`、`rename` |
+| 读写 | `fread`、`fwrite`、`fgetc`、`fputc`、`fgets`、`fputs`、`ungetc`（对待控制台也可用） |
+| 定位 | `fseek`、`fseeko`、`ftell`、`rewind`（控制台流返回 -1 并置 `ESPIPE`） |
+| 状态 | `feof`、`ferror`、`clearerr`、`fileno`（控制台返回 0/1/2，其它流返回 -1） |
+| 格式化 | `fprintf` / `vfprintf` 写 FILE；`printf` / `puts` / `putchar` 仍写串口调试通道 |
+| 解析 | `sscanf` / `vsscanf` / `fscanf`（`%d %i %u %o %x %p %c %s %a %e %f %g %n`、宽度前缀、`%*` 抑制赋值、长度修饰 `hh h l ll z t j L`） |
+| 标准流 | `stdin` / `stdout` / `stderr`（走串口调试通道，`printf` 的既有行为不变） |
+| 错误 | `perror`（输出到 stderr，并保留 errno） |
+
+注意两点：路径是 **VFS URL**（`/Volumes/Disk/x`），libc 没有当前目录的概念；后端返回的负错误码会被映射成真正的 `errno` 值（不是简单取负的内核码）。没有安装后端时（只链 libc 的极端情况）`fopen` 失败并置 `errno = ENOSYS`，三个标准流照常工作。
+
+### 对齐分配（v0.9 已实现）
+
+```c
+void *p = aligned_alloc(64, 4096);   /* C11：64 字节对齐，可 free() */
+void *q = NULL;
+int rc = posix_memalign(&q, 256, 1024);  /* POSIX：0 成功 / EINVAL / ENOMEM，不动 errno */
+```
+
+两个函数由**运行时堆**实现（`user/runtime/malloc.c`），与 `malloc`/`free`/`realloc` 共用同一套块头：对齐块携带反向指针，因此 `free()` 与 `realloc()` 都能正确释放/搬移。libc 的 `<stdlib.h>` 只做声明，不再提供内偏移指针的"弱回退"实现（那会让 `free()` 释放到块中间）。
+
+### 退出与 atexit（v0.9 扩充）
+
+```c
+Atexit(cleanup);            /* 容量 32；满时返回非 0，且不覆盖已有项 */
+__cxa_atexit(dtor, arg, dso);  /* C++ 兼容（独立 8 槽表） */
+```
+
+`exit()` 的顺序固定为：`atexit` 表 **LIFO** → `__cxa_finalize(NULL)` **LIFO** → `.fini_array` **逆序** → `_exit`。`exit()` 自带重入保护，handler 里再调用 `exit()` 不会递归。
+
+### malloc 调试（规划中）
+
+```c
+/* 仍未实现：分配钩子、泄漏检测、valgrind 集成 */
 ```
 
 ---

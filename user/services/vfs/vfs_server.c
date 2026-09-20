@@ -32,10 +32,20 @@
  *     userspace, kernel untouched).  VFS_OP_CLOSE releases either.
  *   - ops implemented: GET_ITEM, CREATE_DIR, DELETE_ITEM, OPEN_ITEM,
  *     READ, WRITE, CLOSE, ENUM_BEGIN, ENUM_NEXT, MOUNT, UNMOUNT (14),
- *     STAT_VOLUME, bookmark ops (10-12), MOVE (16) and WHOAMI (17).
- *     UNMOUNT drops the volume slot and stales its handles/enums/
- *     bookmarks; a dead driver (IPC transport error) is unmounted
- *     lazily the same way.
+ *     STAT_VOLUME, bookmark ops (10-12), MOVE (16), WHOAMI (17),
+ *     LIST_VOLUMES (18), SYNC (20: one DRV_OP_SYNC per mounted volume)
+ *     and the v1.0 object-model ops STAT_HANDLE (21), TRUNCATE (22) and
+ *     REFRESH_BOOKMARK (23).  UNMOUNT drops the volume slot and stales
+ *     its handles/enums/bookmarks; a dead driver (IPC transport error)
+ *     is unmounted lazily the same way.
+ *   - handle lifetime (v1.0): a handle is only as alive as the item it
+ *     names.  DELETE re-validates every handle/enumerator of the volume
+ *     and drops the ones whose item vanished, so the next READ / WRITE /
+ *     STAT_HANDLE / TRUNCATE / CLOSE / ENUM_NEXT answers VFS_ERR_STALE
+ *     instead of a misleading ERR_NOENT; a deleted directory stales the
+ *     enumerator walking it.  Names are validated here as well (empty,
+ *     "."/"..", "/" and over-long names never reach a driver) and MOVE
+ *     refuses to put a directory inside its own subtree.
  *
  * URL grammar (design §6.1): "VolumeName/a/b/c" — the /Volumes view
  * layer is tolerated and stripped ("/Volumes/System/x" == "System/x").
@@ -83,6 +93,19 @@
 #define MAX_BOOKMARKS 32  /* security-scoped bookmarks */
 #define VFS_MAX_DEPTH 8   /* URL path segments */
 #define VFS_SEG_MAX   256 /* per-segment buffer */
+
+/* Longest NAME the server hands to a driver.  vfs.h defines no
+ * VFS_MAX_NAME, so the server enforces the driver limit uniformly: both
+ * drivers keep a name in a 256-byte field (fs_mem_driver item.name,
+ * fs_virtio_blk VBDK_NAME_MAX) and vfs_item_info_t.name is 256 bytes —
+ * 255 characters plus the NUL.  A longer name is refused instead of
+ * being silently truncated by a driver.  An embedded NUL cannot be
+ * detected here: every caller terminates the field it passes in. */
+#define VFS_MAX_NAME 255
+
+/* Parent-chain walk bound for the MOVE cycle guard: a chain longer than
+ * this cannot be proven cycle-free, so the move is refused. */
+#define VFS_CHAIN_MAX 64
 
 /* Request/response buffers (all messages < 4096) */
 static u8 s_req[VFS_IPC_MAX];
@@ -401,6 +424,13 @@ static int VfsParseUrl(const char *url, char mount[64], char segs[][VFS_SEG_MAX]
         int   l   = 0;
         while (*p && *p != '/' && l < VFS_SEG_MAX - 1)
             seg[l++] = *p++;
+        /* A path segment that does not fit the name field is refused
+         * rather than truncated: the driver would otherwise create (or
+         * look up) an item under a name the client never asked for.
+         * VFS_SEG_MAX - 1 == VFS_MAX_NAME, so "hit the copy limit with
+         * more name bytes left" is exactly "longer than a legal name". */
+        if (l == VFS_SEG_MAX - 1 && *p != 0 && *p != '/')
+            return ERR_INVAL;
         /* UTF-8-safe: a segment cut at the 255-byte field edge must not
          * split a multi-byte character (drop the incomplete tail). */
         {
@@ -482,6 +512,109 @@ static int VfsGetattr(u32 vol_index, vfs_item_id_t id, vfs_item_info_t *out) {
 }
 
 /* ====================================================================
+ * Namespace guards (v1.0): name validation, MOVE cycle guard and
+ * post-delete handle invalidation
+ * ==================================================================== */
+
+/*
+ * Is this a legal NAME (never a path)?  The single place that decides
+ * what the drivers may be asked to create or rename:
+ *   - an empty name, "." and ".." are reserved ("." / ".." are already
+ *     rejected per path segment by VfsParseUrl; this is the second line
+ *     of defence for names that arrive outside a path, e.g.
+ *     MOVE.new_name),
+ *   - '/' never appears in a name (a name is never a path),
+ *   - a name longer than VFS_MAX_NAME is refused instead of being
+ *     truncated by a driver.
+ */
+static int VfsNameValid(const char *name) {
+    if (!name || !name[0])
+        return 0;
+    /* Bounded length first: a request field is 256 bytes and a client may
+     * fill every byte, so nothing here may read past it.  A field with no
+     * NUL inside VFS_MAX_NAME + 1 bytes is over-long (or unterminated)
+     * and is refused before the scans below can walk off the field. */
+    if (strnlen(name, VFS_MAX_NAME + 1) > VFS_MAX_NAME)
+        return 0;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+        return 0;
+    if (strchr(name, '/') != NULL)
+        return 0;
+    return 1;
+}
+
+/*
+ * MOVE cycle guard: walk UP from `start` (the destination directory)
+ * along the parent chain and report 1 when `ancestor` (the source item)
+ * is `start` itself or one of its parents — i.e. when the move would put
+ * a directory inside its own subtree and create an unreachable cycle.
+ * The drivers refuse it too (MemMove / VbdkMove), but the server owns
+ * the namespace, so it is decided here first: before any permission
+ * query and before a driver is asked to mutate anything.
+ *
+ * The walk is bounded by VFS_CHAIN_MAX hops.  Running past the bound, or
+ * failing to read a parent, means the chain cannot be PROVEN cycle-free;
+ * an unprovable move is refused (return 1) rather than allowed.
+ * VfsGetattr() reuses the shared s_drv_req/s_drv_resp pair, so callers
+ * must not hold a driver reply across this call.
+ */
+static int VfsChainContains(u32 vol_index, vfs_item_id_t ancestor, vfs_item_id_t start) {
+    vfs_item_id_t cur = start;
+    for (int hops = 0; hops < VFS_CHAIN_MAX; hops++) {
+        if (cur == ancestor)
+            return 1; /* the item itself, or a real ancestor */
+        if (cur == 0)
+            return 0; /* reached the volume root: not in the subtree */
+        vfs_item_info_t info;
+        if (VfsGetattr(vol_index, cur, &info) < 0)
+            return 1; /* unreadable chain: refuse an unprovable move */
+        cur = info.parent_id;
+    }
+    return 1; /* longer than the bound: refuse */
+}
+
+/*
+ * A delete removes items by ID (recursively, for a directory), which
+ * silently invalidates every namespace object that pointed at them.  A
+ * handle or enumerator that keeps pointing at a gone item must stop
+ * working and report VFS_ERR_STALE (vfs.h:464-472: "reports
+ * VFS_ERR_STALE for a handle whose item disappeared ... instead of
+ * failing with a misleading ERR_NOENT"), so the entries are dropped
+ * here rather than lingering as live-looking tokens that resolve to a
+ * freed driver slot.
+ *
+ * The question asked is "does the driver still have this itemID?", which
+ * covers everything a delete can take with it: a whole subtree
+ * (recursive delete), an item the driver itself removed (disk fill
+ * replaces fill.bin, a re-format wipes the volume) and a volume that
+ * went away mid-loop (VfsDrvCall drops it, which already stales every
+ * entry — hence the re-test of "mounted").  Called only AFTER a
+ * successful DRV_OP_DELETE.
+ */
+static void VfsStaleVanished(u32 vol_index) {
+    for (int i = 0; i < MAX_HANDLES; i++) {
+        vfs_handle_ent_t *h = &s_handles[i];
+        if (!h->in_use || h->vol_index != vol_index)
+            continue;
+        if (!s_vols[vol_index].mounted)
+            return; /* driver gone: the volume drop already staled them */
+        vfs_item_info_t info;
+        if (VfsGetattr(vol_index, h->item_id, &info) == ERR_NOENT)
+            memset(h, 0, sizeof(*h));
+    }
+    for (int i = 0; i < MAX_ENUMS; i++) {
+        vfs_enum_ent_t *e = &s_enums[i];
+        if (!e->in_use || e->vol_index != vol_index)
+            continue;
+        if (!s_vols[vol_index].mounted)
+            return;
+        vfs_item_info_t info;
+        if (VfsGetattr(vol_index, e->dir_id, &info) == ERR_NOENT)
+            memset(e, 0, sizeof(*e));
+    }
+}
+
+/* ====================================================================
  * Handle / enumerator allocation
  * ==================================================================== */
 
@@ -520,6 +653,51 @@ static vfs_handle_ent_t *handle_find(vfs_handle_t tok) {
         if (s_handles[i].in_use && s_handles[i].token == tok)
             return &s_handles[i];
     return NULL;
+}
+
+static vfs_enum_ent_t *enum_find(vfs_handle_t tok) {
+    for (int i = 0; i < MAX_ENUMS; i++)
+        if (s_enums[i].in_use && s_enums[i].token == tok)
+            return &s_enums[i];
+    return NULL;
+}
+
+/*
+ * Resolve a token against the TWO handle tables that share one token
+ * space (VFS_OP_CLOSE releases either).  A file-handle op must be able
+ * to tell "this token is an enumerator" (a type error: ERR_INVAL) from
+ * "this token is dead" (VFS_ERR_STALE) — answering STALE for both would
+ * hide a protocol bug behind a lifetime verdict.  *is_enum (optional)
+ * receives 1 when only an enumerator matched.
+ */
+static vfs_handle_ent_t *HandleLookup(vfs_handle_t tok, int *is_enum) {
+    vfs_handle_ent_t *h = handle_find(tok);
+    if (h) {
+        if (is_enum)
+            *is_enum = 0;
+        return h;
+    }
+    if (is_enum)
+        *is_enum = (enum_find(tok) != NULL) ? 1 : 0;
+    return NULL;
+}
+
+/*
+ * The access bit a READ-like operation must re-check with.  A handle
+ * that carries READ is re-checked as a read; a WRITE-only handle is
+ * re-checked as a write.  The 能力化抹位 chain trims a stdio "w" open
+ * (which asks for READ|WRITE) down to WRITE, and such a FILE must still
+ * be able to read itself back and fstat itself — the re-check always
+ * runs with a bit the handle really holds, never with a widened mask.
+ * Returns 0 for a handle that carries neither bit (cannot happen: every
+ * open requests one and the perm-manager grants a subset).
+ */
+static u32 HandleReadAccess(const vfs_handle_ent_t *h) {
+    if (h->access & VFS_ACCESS_READ)
+        return VFS_ACCESS_READ;
+    if (h->access & VFS_ACCESS_WRITE)
+        return VFS_ACCESS_WRITE;
+    return 0;
 }
 
 static vfs_enum_ent_t *enum_alloc(u32                   vol_index,
@@ -604,6 +782,12 @@ static void BookmarkFillBlob(const vfs_bookmark_ent_t *b,
  * subject in DoResolveBookmark(the blob's own subject field is
  * client-held and forgeable).  Returns the record, or NULL (blob
  * invalid).
+ *
+ * Expiry is deliberately NOT part of validation: an expired bookmark
+ * must still be findable, because VFS_OP_REFRESH_BOOKMARK renews it (and
+ * VFS_OP_REVOKE_BOOKMARK must keep working) — the verdict belongs to the
+ * caller, which turns it into VFS_ERR_STALE on resolve (see
+ * BookmarkExpired).
  */
 static vfs_bookmark_ent_t *bookmark_validate(const vfs_bookmark_t *blob) {
     if (blob->magic != VFS_BOOKMARK_MAGIC || blob->version != VFS_BOOKMARK_VERSION)
@@ -622,13 +806,25 @@ static vfs_bookmark_ent_t *bookmark_validate(const vfs_bookmark_t *blob) {
             b->access != blob->access || b->subject_id != blob->subject_id ||
             b->created_ticks != blob->created_ticks || b->expiry_ticks != blob->expiry_ticks)
             continue;
-        if (b->expiry_ticks != 0 && (u64)GetTime() > b->expiry_ticks) {
-            memset(b, 0, sizeof(*b)); /* expired: drop the record */
-            return NULL;
-        }
         return b;
     }
     return NULL;
+}
+
+/*
+ * Bookmark expiry predicate.  expiry_ticks == 0 is the documented
+ * "never expires" value (vfs.h:343); any other deadline is enforced from
+ * the moment it is reached (now >= expiry), so a bookmark cannot be used
+ * in the tick it expires in.
+ *
+ * Enforcement point (vfs.h:499-501): "Resolving an expired bookmark
+ * fails with VFS_ERR_STALE" — DoResolveBookmark refuses to resolve,
+ * while DoRefreshBookmark may renew it when the grant behind it is
+ * still live.  The record survives the deadline precisely so that
+ * renewal (and revoke) stay possible.
+ */
+static int BookmarkExpired(const vfs_bookmark_ent_t *b) {
+    return b->expiry_ticks != 0 && (u64)GetTime() >= b->expiry_ticks;
 }
 
 /* ====================================================================
@@ -826,6 +1022,13 @@ static void DoCreateDir(int token, int msg_len, u64 caller_subject) {
         goto out;
     } /* no root mkdir */
 
+    /* v1.0 namespace guard: what the driver is asked to create must be a
+     * legal NAME (never "."/"..", never a path, never over-long). */
+    if (!VfsNameValid(segs[nsegs - 1])) {
+        resp->ret = ERR_INVAL;
+        goto out;
+    }
+
     vfs_item_id_t id;
     r = VfsLookupPath(vi, segs, nsegs - 1, &id);
     if (r < 0) {
@@ -930,6 +1133,13 @@ static void DoDelete(int token, int msg_len, u64 caller_subject) {
     }
     resp->ret = s_drv_resp.ret;
 
+    /* The items are gone: every handle/enumerator that pointed at one of
+     * them (the item itself, or any descendant a recursive delete took)
+     * is dropped now, so the next use answers VFS_ERR_STALE instead of
+     * resolving a freed driver slot. */
+    if (s_drv_resp.ret == 0)
+        VfsStaleVanished(vi);
+
 out:
     (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
@@ -961,6 +1171,13 @@ static void DoOpen(int token, int msg_len, u64 caller_subject) {
         resp->ret = ERR_INVAL;
         goto out;
     } /* no root open */
+
+    /* v1.0 namespace guard: a create (MKFILE) target must be a legal
+     * NAME before it is resolved or created. */
+    if (!VfsNameValid(segs[nsegs - 1])) {
+        resp->ret = ERR_INVAL;
+        goto out;
+    }
 
     /* Resolve the parent directory. */
     vfs_item_id_t id;
@@ -1107,12 +1324,20 @@ static void DoRead(int token, int msg_len, u64 caller_subject) {
         goto out;
     }
 
-    vfs_handle_ent_t *h = handle_find(req->handle);
+    /* A token can name a file handle or an enumerator (one shared
+     * space): only a file handle has content, an enumerator token is a
+     * type error rather than a handle that went stale. */
+    int               is_enum = 0;
+    vfs_handle_ent_t *h       = HandleLookup(req->handle, &is_enum);
     if (!h) {
-        resp->ret = VFS_ERR_STALE;
+        resp->ret = is_enum ? ERR_INVAL : VFS_ERR_STALE;
         goto out;
     }
-    if (!(h->access & VFS_ACCESS_READ)) {
+    /* Reading requires the READ right: a WRITE-only handle (what 抹位
+     * makes of a stdio "w" open) must not be able to pull content back
+     * out.  The permission the re-check below runs with is therefore
+     * exactly VFS_ACCESS_READ, never a widened mask. */
+    if ((h->access & VFS_ACCESS_READ) == 0) {
         resp->ret = VFS_ERR_PERM;
         goto out;
     }
@@ -1124,12 +1349,16 @@ static void DoRead(int token, int msg_len, u64 caller_subject) {
      * stored in the handle; a denial (VFS_ERR_ACCESS) fails the read
      * immediately so revocation takes effect without reopening.  The
      * caller subject is also checked against the handle's opener to
-     * reject a handle token leaked to another process. */
+     * reject a handle token leaked to another process.
+     *
+     * The bit re-checked is exactly READ (see the early check above),
+     * so revocation is immediate and no mask is ever widened. */
+    u32 need = VFS_ACCESS_READ;
     if (caller_subject != h->subject_id) {
         resp->ret = VFS_ERR_ACCESS;
         goto out;
     }
-    int r = PermCheck(&h->resource, VFS_ACCESS_READ, "", h->subject_id, NULL);
+    int r = PermCheck(&h->resource, need, "", h->subject_id, NULL);
     if (r < 0) {
         resp->ret = r;
         goto out;
@@ -1147,11 +1376,16 @@ static void DoRead(int token, int msg_len, u64 caller_subject) {
         goto out;
     }
     if (s_drv_resp.ret < 0) {
-        resp->ret = s_drv_resp.ret;
+        /* The item is gone behind the handle's back (deleted, or the
+         * volume re-formatted): the handle is dead, which is not the same
+         * answer as "the path you asked for does not exist". */
+        resp->ret = (s_drv_resp.ret == ERR_NOENT) ? VFS_ERR_STALE : s_drv_resp.ret;
         goto out;
     }
 
     i32 n = s_drv_resp.ret;
+    if (n > VFS_MAX_READ)
+        n = (i32)VFS_MAX_READ; /* defensive: never overrun the reply */
     memcpy(resp->data, s_drv_resp.u.data, (size_t)n);
     resp->ret = n;
 
@@ -1175,13 +1409,14 @@ static void DoWrite(int token, int msg_len, u64 caller_subject) {
         goto out;
     }
 
-    vfs_handle_ent_t *h = handle_find(req->handle);
+    int               is_enum = 0;
+    vfs_handle_ent_t *h       = HandleLookup(req->handle, &is_enum);
     if (!h) {
-        resp->ret = VFS_ERR_STALE;
+        resp->ret = is_enum ? ERR_INVAL : VFS_ERR_STALE;
         goto out;
     }
     if (!(h->access & VFS_ACCESS_WRITE)) {
-        resp->ret = VFS_ERR_PERM;
+        resp->ret = VFS_ERR_PERM; /* 能力化抹位: a read-only handle writes nothing */
         goto out;
     }
 
@@ -1198,6 +1433,17 @@ static void DoWrite(int token, int msg_len, u64 caller_subject) {
         goto out;
     }
 
+    /* A zero-length WRITE writes nothing and must never reach a driver:
+     * DRV_OP_WRITE with len == 0 is the TRUNCATE form (vfs.h:570), so
+     * forwarding "write 0 bytes at offset N" would silently truncate the
+     * file to N.  VFS_OP_TRUNCATE is the only op that changes a length.
+     * The handle was already validated above, so a stale or unauthorized
+     * zero-length write still fails exactly like any other. */
+    if (req->len == 0) {
+        resp->ret = 0;
+        goto out;
+    }
+
     memset(&s_drv_req, 0, sizeof(s_drv_req));
     s_drv_req.op      = DRV_OP_WRITE;
     s_drv_req.volume  = s_vols[h->vol_index].drv_vol;
@@ -1211,11 +1457,175 @@ static void DoWrite(int token, int msg_len, u64 caller_subject) {
         goto out;
     }
     if (s_drv_resp.ret < 0) {
-        resp->ret = s_drv_resp.ret;
+        /* A vanished item means a dead handle, not a missing path. */
+        resp->ret = (s_drv_resp.ret == ERR_NOENT) ? VFS_ERR_STALE : s_drv_resp.ret;
         goto out;
     }
 
     resp->ret = s_drv_resp.ret;
+
+out:
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
+}
+
+/*
+ * VFS_OP_STAT_HANDLE — metadata for an OPEN handle (vfs.h:464).
+ *
+ * A client that only holds a handle (a stdio FILE, a resolved bookmark,
+ * a zero-copy reader) can answer "how big is this?" and "what is it
+ * called?" without re-resolving a URL it may not even have.  Like every
+ * other handle op it re-runs the caller's authorization: the handle's
+ * opener must be the caller and the grant is validated live, so a
+ * perm_revoke takes effect here immediately.  A vanished item (deleted,
+ * or a volume re-formatted) answers VFS_ERR_STALE instead of a
+ * misleading ERR_NOENT.
+ *
+ * The authorization bit used is the one the handle carries
+ * (HandleReadAccess): READ when it has READ, otherwise WRITE — a
+ * WRITE-only handle is what 能力化抹位 makes of a stdio "w" open, and
+ * such a FILE must still be able to fstat itself.
+ */
+static void DoStatHandle(int token, int msg_len, u64 caller_subject) {
+    vfs_resp_stat_handle_t *resp = (vfs_resp_stat_handle_t *)s_resp;
+    if (msg_len < (int)sizeof(vfs_req_stat_handle_t)) {
+        resp->ret = ERR_INVAL;
+        goto out;
+    }
+    vfs_req_stat_handle_t *req = (vfs_req_stat_handle_t *)s_req;
+
+    int               is_enum = 0;
+    vfs_handle_ent_t *h       = HandleLookup(req->handle, &is_enum);
+    if (!h) {
+        /* An enumerator has no item metadata of its own: refuse the
+         * object type instead of calling it a stale handle. */
+        resp->ret = is_enum ? ERR_INVAL : VFS_ERR_STALE;
+        goto out;
+    }
+    u32 need = HandleReadAccess(h);
+    if (need == 0) {
+        resp->ret = VFS_ERR_PERM;
+        goto out;
+    }
+    if (caller_subject != h->subject_id) {
+        resp->ret = VFS_ERR_ACCESS;
+        goto out;
+    }
+    int r = PermCheck(&h->resource, need, "", h->subject_id, NULL);
+    if (r < 0) {
+        resp->ret = r;
+        goto out;
+    }
+
+    r = VfsGetattr(h->vol_index, h->item_id, &resp->item);
+    if (r == ERR_NOENT) {
+        resp->ret = VFS_ERR_STALE; /* the item is gone: the handle is dead */
+        goto out;
+    }
+    resp->ret = (r < 0) ? r : 0;
+
+out:
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
+}
+
+/*
+ * VFS_OP_TRUNCATE — set a file's length through its open handle
+ * (vfs.h:483).
+ *
+ * Shrinking releases the tail, growing fills the new range with zeros.
+ * The write side of the authorization is re-checked exactly like
+ * DoWrite: the handle must carry WRITE (a read-only handle is refused
+ * with VFS_ERR_PERM — 能力化抹位), the caller must be the opener, and
+ * the grant is validated live.  A read-only volume answers
+ * VFS_ERR_READONLY before anything is mutated.
+ *
+ * The driver is asked with the EXISTING DRV_OP_WRITE truncate form
+ * (vfs.h:570 "len==0 && offset==0 = truncate (OPEN+TRUNCATE)"), with the
+ * target length riding in the offset field:
+ *   - offset == 0 keeps exactly its documented meaning (clear the file),
+ *   - offset == N is the same operation for an arbitrary length, which
+ *     both drivers implement (fs_mem_driver MemTruncate /
+ *     fs_virtio_blk VbdkTruncate).
+ * So the truncate is composed out of the protocol the drivers already
+ * speak: no new DRV_* opcode and no vfs.h change.  The two meanings can
+ * never collide because DoWrite answers a zero-length WRITE itself.
+ */
+static void DoTruncate(int token, int msg_len, u64 caller_subject) {
+    vfs_resp_truncate_t *resp = (vfs_resp_truncate_t *)s_resp;
+    if (msg_len < (int)sizeof(vfs_req_truncate_t)) {
+        resp->ret = ERR_INVAL;
+        goto out;
+    }
+    vfs_req_truncate_t *req = (vfs_req_truncate_t *)s_req;
+
+    int               is_enum = 0;
+    vfs_handle_ent_t *h       = HandleLookup(req->handle, &is_enum);
+    if (!h) {
+        resp->ret = is_enum ? ERR_INVAL : VFS_ERR_STALE;
+        goto out;
+    }
+    if (!(h->access & VFS_ACCESS_WRITE)) {
+        resp->ret = VFS_ERR_PERM; /* a read-only handle changes no length */
+        goto out;
+    }
+    if (h->vol_index >= MAX_VOLS || !s_vols[h->vol_index].mounted) {
+        resp->ret = VFS_ERR_STALE; /* volume unmounted: no live backing */
+        goto out;
+    }
+    if (s_vols[h->vol_index].read_only) {
+        resp->ret = VFS_ERR_READONLY;
+        goto out;
+    }
+
+    /* P1 authz re-check — same pattern as DoWrite. */
+    if (caller_subject != h->subject_id) {
+        resp->ret = VFS_ERR_ACCESS;
+        goto out;
+    }
+    int r = PermCheck(&h->resource, VFS_ACCESS_WRITE, "", h->subject_id, NULL);
+    if (r < 0) {
+        resp->ret = r;
+        goto out;
+    }
+
+    /* Only a live regular file has a length (a directory is enumerated,
+     * never opened as a file, but a bookmark may resolve to one). */
+    vfs_item_info_t info;
+    r = VfsGetattr(h->vol_index, h->item_id, &info);
+    if (r == ERR_NOENT) {
+        resp->ret = VFS_ERR_STALE;
+        goto out;
+    }
+    if (r < 0) {
+        resp->ret = r;
+        goto out;
+    }
+    if (info.type != VFS_ITEM_FILE) {
+        resp->ret = ERR_INVAL;
+        goto out;
+    }
+
+    memset(&s_drv_req, 0, sizeof(s_drv_req));
+    s_drv_req.op      = DRV_OP_WRITE; /* len == 0 ⇒ truncate (see above) */
+    s_drv_req.volume  = s_vols[h->vol_index].drv_vol;
+    s_drv_req.item_id = h->item_id;
+    s_drv_req.offset  = req->size;
+    s_drv_req.len     = 0;
+    r                 = VfsDrvCall(h->vol_index, &s_drv_req, &s_drv_resp);
+    if (r < 0) {
+        resp->ret = r;
+        goto out;
+    }
+    if (s_drv_resp.ret == ERR_NOENT) {
+        resp->ret = VFS_ERR_STALE;
+        goto out;
+    }
+    if (s_drv_resp.ret < 0) {
+        resp->ret = s_drv_resp.ret; /* VFS_ERR_NOSPC when it cannot grow */
+        goto out;
+    }
+
+    resp->size = req->size; /* on success the length IS the request */
+    resp->ret  = 0;
 
 out:
     (void)IpcReply(token, resp, (int)sizeof(*resp));
@@ -1233,23 +1643,33 @@ static void DoClose(int token, int msg_len, u64 caller_subject) {
      * handle: bind CLOSE to the opener's kernel subject (same rule as
      * do_read/do_write/do_enum_next).  The subject comes from
      * ipc_recv_from, never from the request bytes. */
-    vfs_handle_ent_t *h = handle_find(req->handle);
+    int               is_enum = 0;
+    vfs_handle_ent_t *h       = HandleLookup(req->handle, &is_enum);
     if (h) {
         if (caller_subject != h->subject_id) {
             resp->ret = VFS_ERR_ACCESS;
             goto out;
         }
+        /* Closing always releases the token — a dead handle must never
+         * leak a slot.  When the item behind it is already gone (a delete
+         * or a driver-side wipe took it) the verdict is VFS_ERR_STALE:
+         * the handle was dead before this call, and the caller must not
+         * be told its file ended cleanly.  A retry reports VFS_ERR_STALE
+         * again (the token is gone), so the reason stays visible. */
+        vfs_item_info_t info;
+        int alive = (VfsGetattr(h->vol_index, h->item_id, &info) != ERR_NOENT);
         memset(h, 0, sizeof(*h));
-        resp->ret = 0;
+        resp->ret = alive ? 0 : VFS_ERR_STALE;
         goto out;
     }
-    for (int i = 0; i < MAX_ENUMS; i++) {
-        if (s_enums[i].in_use && s_enums[i].token == req->handle) {
-            if (caller_subject != s_enums[i].subject_id) {
+    if (is_enum) {
+        vfs_enum_ent_t *e = enum_find(req->handle);
+        if (e) {
+            if (caller_subject != e->subject_id) {
                 resp->ret = VFS_ERR_ACCESS;
                 goto out;
             }
-            memset(&s_enums[i], 0, sizeof(s_enums[i]));
+            memset(e, 0, sizeof(*e));
             resp->ret = 0;
             goto out;
         }
@@ -1334,13 +1754,7 @@ static void DoEnumNext(int token, int msg_len, u64 caller_subject) {
     }
     vfs_req_enum_next_t *req = (vfs_req_enum_next_t *)s_req;
 
-    vfs_enum_ent_t *e = NULL;
-    for (int i = 0; i < MAX_ENUMS; i++) {
-        if (s_enums[i].in_use && s_enums[i].token == req->handle) {
-            e = &s_enums[i];
-            break;
-        }
-    }
+    vfs_enum_ent_t *e = enum_find(req->handle);
     if (!e) {
         resp->ret = VFS_ERR_STALE;
         goto out;
@@ -1358,6 +1772,25 @@ static void DoEnumNext(int token, int msg_len, u64 caller_subject) {
     if (r < 0) {
         resp->ret = r;
         goto out;
+    }
+
+    /* The directory being walked must still exist: an enumerator whose
+     * directory was deleted (here, or by the driver itself) is stale, and
+     * the slot is released so it can never hand out entries of a freed
+     * item.  A driver-side delete cannot notify the server, so the check
+     * is repeated on every batch rather than only at delete time. */
+    {
+        vfs_item_info_t dinfo;
+        r = VfsGetattr(e->vol_index, e->dir_id, &dinfo);
+        if (r == ERR_NOENT) {
+            memset(e, 0, sizeof(*e));
+            resp->ret = VFS_ERR_STALE;
+            goto out;
+        }
+        if (r < 0) {
+            resp->ret = r;
+            goto out;
+        }
     }
 
     memset(&s_drv_req, 0, sizeof(s_drv_req));
@@ -1452,6 +1885,67 @@ static void DoListVolumes(int token, int msg_len) {
         resp->vols[resp->count].read_only = s_vols[i].read_only;
         resp->count++;
     }
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
+}
+
+/* VFS_OP_SYNC — push every mounted volume's buffered driver state to its
+ * backing store.  The server owns the mount table, so it is the only
+ * component that can turn one client request into one DRV_OP_SYNC per
+ * volume (callers: the "sync" / "disk sync" / "power off" commands).
+ * No capability is required: SYNC cannot modify data — it only pushes
+ * writes the volume already accepted towards the medium (vfs.h:441).
+ *
+ * Accounting follows the vfs_resp_sync_t contract:
+ *   volumes  — volumes that acknowledged the flush (ret >= 0), plus the
+ *              volumes whose driver has no SYNC at all (ERR_INVAL /
+ *              ERR_NOCAP).  A driver that answers "not implemented"
+ *              has nothing buffered, so vfs.h:446 explicitly counts it
+ *              as unsupported rather than failed.
+ *   failures — real errors only: a driver-reported error, or an IPC
+ *              transport error (the driver is gone).
+ *   ret      — OK unless a hard error happened, in which case it is the
+ *              FIRST one.
+ *
+ * VfsDrvCall drops a dead driver's volume row(s), so the loop re-tests
+ * "mounted" on every iteration and snapshots the driver-side volume
+ * index before the call — nothing may be re-read from the row after it.
+ */
+static void DoSync(int token, int msg_len) {
+    vfs_resp_sync_t *resp = (vfs_resp_sync_t *)s_resp;
+    (void)msg_len;
+
+    resp->ret      = 0;
+    resp->volumes  = 0;
+    resp->failures = 0;
+
+    for (u32 i = 0; i < MAX_VOLS; i++) {
+        if (!s_vols[i].mounted)
+            continue;
+        u32 drv_vol = s_vols[i].drv_vol;
+
+        memset(&s_drv_req, 0, sizeof(s_drv_req));
+        s_drv_req.op     = DRV_OP_SYNC;
+        s_drv_req.volume = drv_vol;
+        int r            = VfsDrvCall(i, &s_drv_req, &s_drv_resp);
+        if (r < 0) {
+            resp->failures++;
+            if (resp->ret == 0)
+                resp->ret = r;
+            continue;
+        }
+        if (s_drv_resp.ret == ERR_INVAL || s_drv_resp.ret == ERR_NOCAP) {
+            resp->volumes++; /* driver has no SYNC: nothing to flush */
+            continue;
+        }
+        if (s_drv_resp.ret < 0) {
+            resp->failures++;
+            if (resp->ret == 0)
+                resp->ret = s_drv_resp.ret;
+            continue;
+        }
+        resp->volumes++;
+    }
+
     (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
@@ -1561,8 +2055,8 @@ static void DoResolveBookmark(int token, int msg_len, u64 subject_id) {
     vfs_bookmark_t blob;
     memcpy(&blob, req->data, sizeof(blob));
 
-    /* The server-side record is the source of truth.  A forged/foreign/
-     * expired blob validates to NULL ⇒ -EACCES (VFS_ERR_ACCESS). */
+    /* The server-side record is the source of truth.  A forged or
+     * foreign blob validates to NULL ⇒ -EACCES (VFS_ERR_ACCESS). */
     vfs_bookmark_ent_t *b = bookmark_validate(&blob);
     if (!b) {
         resp->ret = VFS_ERR_ACCESS;
@@ -1576,6 +2070,19 @@ static void DoResolveBookmark(int token, int msg_len, u64 subject_id) {
      * against the server record. */
     if (subject_id != b->subject_id) {
         resp->ret = VFS_ERR_ACCESS;
+        goto out;
+    }
+
+    /* Expiry enforcement (vfs.h:499-501: "Resolving an expired bookmark
+     * fails with VFS_ERR_STALE"): the deadline is checked BEFORE any item
+     * resolution or permission query, and an expired bookmark resolves
+     * to nothing.  The record is deliberately kept (bookmark_validate no
+     * longer drops it) so the holder can renew it with
+     * VFS_OP_REFRESH_BOOKMARK while its grant is still live. */
+    if (BookmarkExpired(b)) {
+        printf("vfs: bookmark expired (item %u): resolve refused as stale\n",
+               (unsigned)b->item_id);
+        resp->ret = VFS_ERR_STALE;
         goto out;
     }
 
@@ -1677,6 +2184,86 @@ out:
     (void)IpcReply(token, resp, (int)sizeof(*resp));
 }
 
+/*
+ * VFS_OP_REFRESH_BOOKMARK — extend a bookmark's lifetime (vfs.h:499).
+ *
+ * The blob is validated exactly like a resolve: the signature must match
+ * and every payload field must equal a live server-side record, and the
+ * caller must be that record's creator (a leaked blob cannot renew
+ * another subject's bookmark).  The renewal rule is:
+ *   - a bookmark that has NOT expired may always be renewed, and
+ *   - an EXPIRED one may be renewed only when its holder can still prove
+ *     the authorization behind it — the same live perm_check a resolve
+ *     would run, against the bookmark's own resource and granted bits
+ *     (vfs.h:501).  A bookmark whose grant was revoked therefore stays
+ *     dead; a merely time-expired capability can be picked up again by
+ *     its owner.
+ * Anything else is VFS_ERR_ACCESS.
+ *
+ * extend_ticks == 0 makes the bookmark permanent, > 0 sets
+ * now + extend_ticks.  The new deadline is written into BOTH the
+ * authoritative server record (so the next resolve re-validates the
+ * returned blob against it) and the blob handed back to the caller,
+ * which is rebuilt from the record so every field bookmark_validate
+ * compares is exactly what the record now holds.
+ */
+static void DoRefreshBookmark(int token, int msg_len, u64 caller_subject) {
+    vfs_resp_refresh_bookmark_t *resp = (vfs_resp_refresh_bookmark_t *)s_resp;
+    if (msg_len < (int)sizeof(vfs_req_refresh_bookmark_t)) {
+        resp->ret = ERR_INVAL;
+        goto out;
+    }
+    vfs_req_refresh_bookmark_t *req = (vfs_req_refresh_bookmark_t *)s_req;
+    if (req->bk_len < sizeof(vfs_bookmark_t) || req->bk_len > VFS_BOOKMARK_MAX) {
+        resp->ret = ERR_INVAL;
+        goto out;
+    }
+
+    vfs_bookmark_t blob;
+    memcpy(&blob, req->data, sizeof(blob));
+
+    /* The record is the source of truth: a forged, foreign or revoked
+     * blob does not validate ⇒ VFS_ERR_ACCESS (same verdict as a
+     * resolve).  An EXPIRED bookmark still validates — that is the whole
+     * point of this op. */
+    vfs_bookmark_ent_t *b = bookmark_validate(&blob);
+    if (!b) {
+        resp->ret = VFS_ERR_ACCESS;
+        goto out;
+    }
+    if (caller_subject != b->subject_id) {
+        resp->ret = VFS_ERR_ACCESS;
+        goto out;
+    }
+
+    vfs_resource_t res;
+    memset(&res, 0, sizeof(res));
+    res.vol = s_vols[b->vol_index].uuid;
+    res.id  = b->item_id;
+
+    if (BookmarkExpired(b)) {
+        /* Expired: renewal needs proof that the authorization is still
+         * live.  The query uses the RECORD's subject and granted bits,
+         * never the caller-held blob fields. */
+        int r = PermCheck(&res, b->access, "", b->subject_id, NULL);
+        if (r < 0) {
+            resp->ret = r; /* VFS_ERR_ACCESS when the grant is gone */
+            goto out;
+        }
+    }
+
+    b->expiry_ticks = (req->extend_ticks == 0) ? 0 : (u64)GetTime() + req->extend_ticks;
+    BookmarkFillBlob(b, &res, b->parent_id, &blob);
+
+    resp->bk_len       = (u32)sizeof(blob);
+    resp->expiry_ticks = b->expiry_ticks;
+    memcpy(resp->data, &blob, sizeof(blob));
+    resp->ret = 0;
+
+out:
+    (void)IpcReply(token, resp, (int)sizeof(*resp));
+}
+
 /* ====================================================================
  * VFS_OP_MOVE — move/rename an item (Phase 2)
  *
@@ -1705,6 +2292,14 @@ static void DoMove(int token, int msg_len, u64 caller_subject) {
     r = VfsParseUrl(req->dst_dir, d_mount, d_segs, &dnsegs);
     if (r < 0) {
         resp->ret = r;
+        goto out;
+    }
+
+    /* v1.0 namespace guard: an optional rename target must be a legal
+     * NAME before anything is resolved or mutated ("" keeps the current
+     * name, so it is not a name and is not validated as one). */
+    if (req->new_name[0] != 0 && !VfsNameValid(req->new_name)) {
+        resp->ret = ERR_INVAL;
         goto out;
     }
 
@@ -1750,6 +2345,16 @@ static void DoMove(int token, int msg_len, u64 caller_subject) {
     }
     if (dinfo.type != VFS_ITEM_DIR) {
         resp->ret = ERR_INVAL; /* dst must be a directory */
+        goto out;
+    }
+
+    /* v1.0 namespace guard: a directory must never end up inside its own
+     * subtree (moving X under a descendant of X would orphan the whole
+     * subtree in a cycle no path can reach).  The parent chain of the
+     * destination is walked here — before any permission query, and long
+     * before a driver is asked to mutate anything. */
+    if (VfsChainContains(dvi, sid, did)) {
+        resp->ret = ERR_INVAL;
         goto out;
     }
 
@@ -1831,6 +2436,9 @@ static void DoReadMap(int token, int msg_len, u64 caller_subject) {
         resp->ret = VFS_ERR_STALE;
         goto out;
     }
+    /* READ_MAP keeps its original, stricter rule: mapping the file's
+     * pages requires the READ bit (unlike DoRead, which accepts the WRITE
+     * a 抹位'd stdio "w" handle carries so a FILE can read itself back). */
     if (!(h->access & VFS_ACCESS_READ)) {
         resp->ret = VFS_ERR_PERM;
         goto out;
@@ -1910,6 +2518,12 @@ static void VfsHandleRequest(int token, u32 op, int msg_len, u64 caller_subject)
     case VFS_OP_WRITE:
         DoWrite(token, msg_len, caller_subject);
         break;
+    case VFS_OP_STAT_HANDLE:
+        DoStatHandle(token, msg_len, caller_subject);
+        break;
+    case VFS_OP_TRUNCATE:
+        DoTruncate(token, msg_len, caller_subject);
+        break;
     case VFS_OP_CLOSE:
         DoClose(token, msg_len, caller_subject);
         break;
@@ -1937,6 +2551,9 @@ static void VfsHandleRequest(int token, u32 op, int msg_len, u64 caller_subject)
     case VFS_OP_REVOKE_BOOKMARK:
         DoRevokeBookmark(token, msg_len, caller_subject);
         break;
+    case VFS_OP_REFRESH_BOOKMARK:
+        DoRefreshBookmark(token, msg_len, caller_subject);
+        break;
     case VFS_OP_MOVE:
         DoMove(token, msg_len, caller_subject);
         break;
@@ -1945,6 +2562,10 @@ static void VfsHandleRequest(int token, u32 op, int msg_len, u64 caller_subject)
         break;
     case VFS_OP_LIST_VOLUMES:
         DoListVolumes(token, msg_len);
+        break;
+    case VFS_OP_SYNC:
+        /* No capability needed: a flush cannot modify data. */
+        DoSync(token, msg_len);
         break;
     default: {
         i32 *resp = (i32 *)s_resp;

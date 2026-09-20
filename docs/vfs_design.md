@@ -1,5 +1,10 @@
 # OpSys VFS 服务设计文档（对象句柄 + 安全作用域书签）
 
+> **阅读提示**：本文是**设计基线文档**，记录做出决策时的思考与当时的现状快照。
+> 其中标注为"规划/未实现"的条目可能已在后续版本落地。判断某项功能的**当前状态**，
+> 请以代码、[../README.md](../README.md) 与 [architecture.md](architecture.md) 为准；
+> 逐提交的实际进展见 [CHANGELOG.md](CHANGELOG.md)，文档地图见 [README.md](README.md)。
+
 > 版本：v0.2（Phase 0 ✅ / Phase 1 ✅ / Phase 2 ✅）
 > 日期：2026-08-06
 > 状态：Phase 0 完成并验收 ✅；Phase 1（virtio-blk 真实磁盘持久化）完成并验收 ✅；
@@ -712,3 +717,83 @@ fs_mem_driver.c:41；无 `VFS_RAM_VOL_SIZE_MB` 宏），通过
   驱动进程对应；vfs_server 本身不需要块能力。
 - requirements.md §9「文档要求：ipc_protocols.md」→ 本文 §4 即为
   vfs 协议章节，可拆分归档。
+
+---
+
+## 十三、v1.0：对象模型补完与命名空间加固
+
+> 本节记录 2026-09 的 v1.0 批次。§8 的 Phase 0–2 已经交付，Phase 3（零拷贝/快照/CoW）只落地了只读零拷贝；
+> 这一批补的是**对象模型自身的完整性**与**命名空间的健壮性**，以及权限模型 P3/P4 需要的接口。
+
+### 13.1 按句柄取元数据：`VFS_OP_STAT_HANDLE`
+
+在此之前，"这个打开的文件多大、叫什么" 这个问题**只能靠 URL 再问一次** —— 而持有句柄的一方往往没有 URL：
+`libfs` 的 stdio 后端就因此长期让 `size()` 返回 0（`user/lib/libfs/stdio_vfs.c` 的注释记录了这一点），
+书签解析出来的句柄更是完全无路径可循。
+
+新 op 的语义：
+
+| 项 | 规定 |
+| --- | --- |
+| 入参 | `vfs_req_stat_handle_t { op; handle }` |
+| 出参 | `vfs_resp_stat_handle_t { ret; vfs_item_info_t item }` |
+| 授权 | 与 READ/WRITE 一样**每次调用都重跑该句柄主体的判权**（P1 复检模式），不是"开句柄时查一次" |
+| 失效 | 句柄不存在、条目已删除、授权已被撤销 → `VFS_ERR_STALE`（不是 `ERR_NOENT`） |
+| 枚举器 | 传枚举器句柄 → `ERR_INVAL`（它没有文件语义） |
+
+客户端侧对应 `FsStatHandle()`；`libfs` 的 stdio 后端用它实现了真正的 `size()`，于是 `fseek(f, 0, SEEK_END)`
+与 `ftell` 对文件流终于有了正确结果。
+
+### 13.2 按句柄截断：`VFS_OP_TRUNCATE`
+
+```
+VFS_OP_TRUNCATE { handle; size } → { ret; size }
+```
+
+* 缩小：释放尾部（驱动侧按既有能力实现，优先复用 `DRV_OP_WRITE` 的截断语义，而不是新增协议）；
+* 扩大：新范围**以零填充**；
+* 授权：按 WRITE 复检，只读句柄 → `VFS_ERR_PERM`，只读卷 → `VFS_ERR_READONLY`；
+* 失败不留半成品：任何错误路径下文件长度要么是旧值、要么是新值，不会出现"中间态"。
+
+客户端侧对应 `FsTruncate()`。
+
+### 13.3 书签生命周期闭环：过期 + 续期
+
+Phase 2 的书签里**一直有 `expiry_ticks` 字段**，但解析路径从未检查它 —— 也就是说"限时书签"从来没有真正限时过。
+v1.0 把它变成强制语义：
+
+| 行为 | 规定 |
+| --- | --- |
+| `VFS_OP_RESOLVE_BOOKMARK` | `expiry_ticks != 0 && now >= expiry_ticks` → `VFS_ERR_STALE`，**不再解析** |
+| `VFS_OP_REFRESH_BOOKMARK` | 入参 `{ blob; extend_ticks }`：`0` = 转为永久，`>0` = `now + extend_ticks`；返回**更新后的 blob** 与新的绝对截止时间 |
+| 续期条件 | 必须能证明持有者**仍然有该资源的授权**（重跑 perm_check），否则 `VFS_ERR_ACCESS`；已过期但授权仍在的书签允许续期 |
+
+客户端侧对应 `FsRefreshBookmark()`。这样"应用把书签长期保存、偶尔续期"成为一条完整闭环，
+而"授权撤销后书签失效"依旧由 §5.3 的单一事实源（perm-engine 的 grant）决定。
+
+### 13.4 命名空间加固
+
+| 加固点 | 规定 |
+| --- | --- |
+| **移动环检测** | `VFS_OP_MOVE` 拒绝把目录移进它自己的子树（沿 `parent_id` 链上溯），返回 `ERR_INVAL`。此前这个操作会让命名空间成环，之后所有按父链的遍历都会无限循环 |
+| **名称校验** | 服务端统一拒绝空名、`.`、``..``、含 `/` 或内嵌 NUL、超过上限的名字；驱动因此可以假设"收到的名字一定合法"（校验只做一次，不在每个驱动里重复） |
+| **失效句柄** | 条目被删除/移动后，指向它的句柄在 READ/WRITE/STAT_HANDLE/CLOSE 上返回 `VFS_ERR_STALE`；枚举器依赖的目录被删除时 `ENUM_NEXT` 同样返回 `VFS_ERR_STALE`。**统一错误码**让客户端能区分"从来没有过"（`ERR_NOENT`）与"曾经有但现在没了"（`VFS_ERR_STALE`） |
+| **配额** | 内存卷按条目数与单文件上限拒绝创建/写入（`VFS_ERR_NOSPC`），且失败必须回滚，不留半成品 item |
+
+### 13.5 与权限模型的接口
+
+这一批 op 全部沿用既有的"`vfs_server` 是唯一仲裁点"模式：客户端只与 vfs 对话，
+vfs 在**每一次**操作上重跑 `perm_check`（`VFS_OP_CHECK`），因此 [permission_model.md](permission_model.md) §13 的
+TTL 过期、作用域不匹配、后台拒绝、隔离期拒绝**立刻对已打开的句柄生效** ——
+不需要"关闭再打开"，也不需要 vfs 缓存授权结果。
+
+### 13.6 仍未完成（Phase 3 的其余部分）
+
+| 项 | 现状 |
+| --- | --- |
+| 书签 HMAC 签名 | blob 里的 `mac[16]` 仍是全零占位（§5.2 已声明） |
+| 写路径零拷贝 | 只读 `READ_MAP` 已实现，写侧仍是拷贝语义 |
+| 快照 / CoW | 未实现（`VFS_ACCESS_COW` 位已定义） |
+| 符号链接 | `VFS_ITEM_SYMLINK` 类型已定义但无创建/跟随路径 |
+| 配额策略 | 目前是"驱动内置上限"，不是按主体/卷的可配置配额 |
+

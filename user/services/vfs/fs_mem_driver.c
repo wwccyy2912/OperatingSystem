@@ -40,7 +40,7 @@
  *
  * ------------------------------------------------------------------
  * Structure (volumes): two heap-backed volumes with per-volume dense
- *   item tables — System (RO, kernel blobs exposed as /Kernel/*.elf
+ *   item tables — System (RO, kernel blobs exposed as /Kernel/<name>.elf
  *   via s_sys_blobs) and Users (32 MiB RW scratch); driver port
  *   "vfs.fs.mem", protocol drv_req_t/drv_resp_t.
  * How it works:
@@ -48,7 +48,10 @@
  *   System volume from blob.c entries, then MemMount()s System and
  *   Users (VFS_OP_MOUNT handshake); DRV_OP_* requests from the
  *   vfs_server dispatch to helpers such as MemCreate; itemID is the
- *   1-based table index, never reused after delete.
+ *   1-based table index, never reused after delete.  DRV_OP_WRITE with
+ *   len == 0 is the truncate form (MemTruncate): the offset field carries
+ *   the target length, growing zero-fills, and the per-file cap
+ *   (MEM_MAX_FILE) or the volume capacity answers VFS_ERR_NOSPC.
  * Purpose:
  *   In-RAM storage driver — the boot filesystem (kernel ELF blobs)
  *   plus a 32 MiB RW scratch volume for the running system.
@@ -72,6 +75,11 @@
 
 #define MEM_MAX_ITEMS   64                  /* item table per volume     */
 #define MEM_USERS_CAP   (32u * 1024u * 1024u) /* 32 MiB RAM write volume  */
+/* Per-file size cap (bytes): a single file may never exceed the writable
+ * volume's capacity.  Checked on every grow path (MemWrite / MemTruncate)
+ * before anything is allocated, so a runaway writer gets VFS_ERR_NOSPC
+ * instead of an allocation failure. */
+#define MEM_MAX_FILE    MEM_USERS_CAP
 #define MEM_MOUNT_WAIT  200                 /* × 1 tick port_get retries */
 
 /* Blob files exposed on /Kernel of the System volume (order = blob.c) */
@@ -104,6 +112,11 @@ typedef struct {
         u64           capacity;       /* volume capacity in bytes */
         u64           used;           /* sum of file sizes (capacity check) */
         vfs_item_id_t root;           /* volume root itemID (always 1) */
+        u64           uuid_hi;        /* UUID sent in the MOUNT handshake,
+                                       * recorded so DRV_OP_CTRL_INFO can
+                                       * report the same identity the
+                                       * vfs_server has for this volume */
+        u64           uuid_lo;
 } mem_vol_t;
 
 static mem_vol_t s_sys;           /* System volume (read-only blobs) */
@@ -232,19 +245,28 @@ static i32 MemCreateItem(mem_vol_t *vol, vfs_item_id_t parent,
         if (MemLookup(vol, parent, name, &dup) == 0)
                 return VFS_ERR_EXISTS;
 
+        /* Volume item cap: the per-volume item table (MEM_MAX_ITEMS) is
+         * full.  That is an out-of-space condition for the volume, not a
+         * failed allocation, so it reports VFS_ERR_NOSPC. */
         if (vol->item_count >= MEM_MAX_ITEMS)
-                return ERR_NOMEM;
+                return VFS_ERR_NOSPC;
 
-        int idx = vol->item_count++;
+        /* Publish the slot LAST: item_count is what makes an entry
+         * visible to mem_find/MemLookup, so building the record before
+         * the bump means no failure can ever leave a half-created item
+         * behind (nothing between here and the bump can fail, and no
+         * allocation happens at create time — the file starts empty). */
+        int idx = vol->item_count;
         mem_item_t *it = &vol->items[idx];
         memset(it, 0, sizeof(*it));
-        it->in_use = 1;
         it->type = type;
         it->parent = parent;
         strncpy(it->name, name, sizeof(it->name) - 1);
         it->name[sizeof(it->name) - 1] = '\0';
         it->created = (u64)GetTime();
         it->modified = it->created;
+        it->in_use = 1;
+        vol->item_count = idx + 1;
         *out_id = (vfs_item_id_t)(idx + 1);
         return 0;
 }
@@ -456,6 +478,11 @@ static int MemMount(int vfs_port, mem_vol_t *vol, u64 uuid_lo)
         strncpy(req.mount_name, vol->mount_name, sizeof(req.mount_name) - 1);
         req.uuid.hi = 0x6f707379732d7666ULL;        /* "opsys-vf" magic */
         req.uuid.lo = ((u64)(u32)GetTime() << 32) | uuid_lo;
+        /* Remember the identity this volume just registered with, so
+         * DRV_OP_CTRL_INFO reports the volume's real UUID (a RAM volume
+         * gets a fresh lo half per mount — it is not persistent). */
+        vol->uuid_hi = req.uuid.hi;
+        vol->uuid_lo = req.uuid.lo;
         req.root_item_id = vol->root;
         req.read_only = vol->read_only;
 
@@ -464,6 +491,167 @@ static int MemMount(int vfs_port, mem_vol_t *vol, u64 uuid_lo)
         if (ret < 0)
                 return ret;
         return resp.ret;
+}
+
+/* ====================================================================
+ * Maintenance plane (v0.9): SYNC / CHECK / INFO / RAW_READ
+ *
+ * A memory volume has no medium: SYNC is a documented no-op and a raw
+ * sector read is meaningless (there is no LBA space — ERR_INVAL rather
+ * than invented bytes).  CHECK / INFO are read-only statistics over the
+ * item table; neither writes a single byte of volume state.
+ *
+ * Gating: vfs.h:531 says the read-only CTRL diagnostics are gated on
+ * ATOM_SERVICE_MANAGE "inside the driver".  This driver cannot do that
+ * honestly — its serve loop uses IpcRecv (no caller subject, see
+ * docs/service_reference.md 9.3) and the driver itself does not hold
+ * that atom, so a CapHasAtom() query could only ever fail.  The two
+ * diagnostics are therefore served ungated: they are read-only, expose
+ * volume statistics only, and no in-tree component sends them to
+ * "vfs.fs.mem" (the user-service disk proxy talks to the virtio driver,
+ * where CHECK / INFO / RAW_READ ARE gated on the atom).
+ * ==================================================================== */
+
+/* Check-report error classes (drv_check_report_t.first_error). */
+#define MEM_CHK_OK     0
+#define MEM_CHK_ROOT   1 /* the root record is not a live directory    */
+#define MEM_CHK_PARENT 2 /* parent is not a live directory (orphan)    */
+#define MEM_CHK_TYPE   3 /* item type is neither file nor directory    */
+#define MEM_CHK_DATA   4 /* file claims bytes but owns no data buffer  */
+
+/* Bytes really owned by the volume's items.  Read from the item table
+ * rather than vol->used: vol->used only tracks writes that go through
+ * MemWrite, while the System volume is built at load time (MemSysLoad
+ * sets item sizes directly), so the table is the authority for both
+ * volumes.  Read-only. */
+static u64 MemBytesUsed(const mem_vol_t *vol)
+{
+        u64 used = 0;
+        for (int i = 0; i < vol->item_count; i++)
+                if (vol->items[i].in_use)
+                        used += vol->items[i].size;
+        return used;
+}
+
+/* Record one problem: bump the count and keep the FIRST one (class +
+ * human-readable phrase).  Read-only. */
+static void MemChkError(drv_check_report_t *rep, u32 cls, const char *what, int idx)
+{
+        rep->errors++;
+        if (rep->first_error != 0)
+                return;
+        rep->first_error = cls;
+        if (idx >= 0)
+                snprintf(rep->note, sizeof(rep->note), "%s (item %d)", what, idx + 1);
+        else
+                snprintf(rep->note, sizeof(rep->note), "%s", what);
+}
+
+/*
+ * DRV_OP_SYNC — documented no-op.
+ *
+ * The volume lives in heap pages (plus the shm pool); there is no
+ * medium and nothing is buffered, so the volume is always already
+ * "flushed".  Returning 0 rather than ERR_INVAL keeps "sync" / "power
+ * off" honest: the memory volume really is consistent, and reporting it
+ * as unsupported would make a successful sync look partial.
+ */
+static i32 MemCtrlSync(void)
+{
+        printf("fs_mem_driver: sync - memory volume, nothing to flush\n");
+        return 0;
+}
+
+/*
+ * DRV_OP_CTRL_INFO — volume detail.  Every field is taken from the live
+ * item tables (no device, no side effect).  "blocks" are 4 KB pages:
+ * that is the granularity RAM is actually committed in (the shm pool
+ * and the heap mapping), and persistent stays 0 because a reboot loses
+ * the volume (file header, "Caveats").
+ */
+static i32 MemCtrlInfo(mem_vol_t *vol, drv_info_t *info)
+{
+        memset(info, 0, sizeof(*info));
+        strncpy(info->driver, "mem", sizeof(info->driver) - 1);
+        strncpy(info->mount, vol->mount_name, sizeof(info->mount) - 1);
+        info->read_only = vol->read_only;
+        info->block_size = PAGE_SIZE;
+        info->total_blocks = (u32)(vol->capacity / PAGE_SIZE);
+        info->used_blocks = (u32)((MemBytesUsed(vol) + PAGE_SIZE - 1) / PAGE_SIZE);
+
+        u32 used_items = 0;
+        for (int i = 0; i < vol->item_count; i++)
+                if (vol->items[i].in_use)
+                        used_items++;
+        info->inode_total = MEM_MAX_ITEMS;
+        info->inode_used = used_items;
+        info->persistent = 0;                   /* RAM: gone after reboot */
+        info->uuid_hi = vol->uuid_hi;
+        info->uuid_lo = vol->uuid_lo;
+        return 0;
+}
+
+/*
+ * DRV_OP_CTRL_CHECK — read-only health statistics.
+ *
+ * There is no on-disk format to validate, so "consistency" here means
+ * the item graph holds together: the root record is a live directory,
+ * every other live item hangs off a live directory, the type is one of
+ * the two defined kinds, and a file that claims bytes owns a buffer.
+ * Nothing is repaired and nothing is written.
+ */
+static i32 MemCtrlCheck(mem_vol_t *vol, drv_check_report_t *rep)
+{
+        memset(rep, 0, sizeof(*rep));
+        rep->inodes_total = MEM_MAX_ITEMS;
+
+        mem_item_t *root = &vol->items[0];
+        if (!root->in_use || root->type != VFS_ITEM_DIR || root->parent != 0) {
+                MemChkError(rep, MEM_CHK_ROOT, "root item is not a live directory", -1);
+        } else {
+                /* No format signature exists: magic_ok reports that the
+                 * volume's own root record validated. */
+                rep->magic_ok = 1;
+        }
+
+        for (int i = 0; i < vol->item_count; i++) {
+                mem_item_t *it = &vol->items[i];
+                if (!it->in_use)
+                        continue;
+                rep->inodes_used++;
+                if (it->type == VFS_ITEM_FILE)
+                        rep->files++;
+                else if (it->type == VFS_ITEM_DIR)
+                        rep->dirs++;
+                else
+                        MemChkError(rep, MEM_CHK_TYPE, "unknown item type", i);
+
+                mem_item_t *parent = NULL;
+                if (it->parent >= 1 && it->parent <= (vfs_item_id_t)vol->item_count)
+                        parent = &vol->items[it->parent - 1];
+                if (parent && (!parent->in_use || parent->type != VFS_ITEM_DIR))
+                        parent = NULL;
+                if (i != 0 && !parent)
+                        MemChkError(rep, MEM_CHK_PARENT,
+                                        "parent is not a live directory", i);
+
+                if (it->type == VFS_ITEM_FILE && it->size > 0 && !it->data)
+                        MemChkError(rep, MEM_CHK_DATA,
+                                        "file has size but no buffer", i);
+        }
+
+        u64 bytes = MemBytesUsed(vol);
+        rep->used_blocks = (u32)((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+        u32 total_blocks = (u32)(vol->capacity / PAGE_SIZE);
+        rep->free_blocks = (total_blocks > rep->used_blocks)
+                                        ? total_blocks - rep->used_blocks : 0;
+
+        if (rep->errors == 0)
+                snprintf(rep->note, sizeof(rep->note),
+                                "clean: %u files, %u dirs, %u bytes used",
+                                (unsigned)rep->files, (unsigned)rep->dirs,
+                                (unsigned)bytes);
+        return 0;
 }
 
 /* ====================================================================
@@ -519,6 +707,91 @@ static i32 MemRead(mem_vol_t *vol, vfs_item_id_t id, u64 offset,
         return (i32)len;
 }
 
+/*
+ * Truncate / length change (DRV_OP_WRITE with len == 0).
+ *
+ * vfs.h:570 documents "len==0 && offset==0 = truncate (OPEN+TRUNCATE)".
+ * The same form with offset = N is the general truncate the vfs_server
+ * uses for VFS_OP_TRUNCATE (op 22): the target length rides in the
+ * existing offset field, so no new DRV_* opcode (and no vfs.h change) is
+ * needed, and offset == 0 keeps exactly its old meaning.  A zero-length
+ * VFS_OP_WRITE is answered by the server itself, so the two meanings can
+ * never collide.
+ *
+ * Shrinking releases the tail: a heap buffer is reallocated to the new
+ * length (best effort — the SIZE is authoritative, and a buffer that
+ * cannot shrink simply keeps its pages), a pool-backed buffer is left to
+ * the bump allocator (ItemFreeData) and only its size shrinks, and an
+ * empty file drops its buffer entirely.  Growing allocates the new
+ * length and zero-fills the added range, so the hole reads as NUL —
+ * exactly what a sparse write past EOF leaves behind.
+ *
+ * Returns 0, or VFS_ERR_NOSPC (per-file cap / volume capacity) or
+ * ERR_NOMEM (the allocator refused).
+ */
+static i32 MemTruncate(mem_vol_t *vol, mem_item_t *it, u64 newsize)
+{
+        if (newsize == it->size)
+                return 0;                       /* already that length */
+
+        if (newsize < it->size) {
+                u64 old = it->size;
+                if (newsize == 0) {
+                        /* Truncate to zero: release the whole buffer. */
+                        ItemFreeData(it->data);
+                        it->data = NULL;
+                } else if (it->data && !PoolContains(it->data)) {
+                        u8 *nd = realloc(it->data, (size_t)newsize);
+                        if (nd)
+                                it->data = nd;  /* best effort shrink */
+                }
+                it->size = newsize;
+                vol->used -= old - newsize;
+                it->modified = (u64)GetTime();
+                return 0;
+        }
+
+        /* Grow: the added range must read as zeros. */
+        if (newsize > MEM_MAX_FILE)
+                return VFS_ERR_NOSPC;           /* single-file limit */
+        if (newsize > vol->capacity ||
+                vol->used + (newsize - it->size) > vol->capacity)
+                return VFS_ERR_NOSPC;
+
+        if (!it->data) {
+                /* First allocation: prefer the zero-copy pool, heap as
+                 * the fallback.  The whole range is cleared because a
+                 * file with no buffer has no bytes to preserve. */
+                u8 *nd = pool_alloc((u32)newsize);
+                if (!nd)
+                        nd = malloc((size_t)newsize);
+                if (!nd)
+                        return ERR_NOMEM;
+                memset(nd, 0, (size_t)newsize);
+                it->data = nd;
+        } else if (PoolContains(it->data)) {
+                /* The pool bump allocator cannot grow a block in place:
+                 * migrate to the heap (the file then uses the chunked
+                 * read path). */
+                u8 *nd = malloc((size_t)newsize);
+                if (!nd)
+                        return ERR_NOMEM;
+                memcpy(nd, it->data, (size_t)it->size);
+                memset(nd + it->size, 0, (size_t)(newsize - it->size));
+                it->data = nd;
+        } else {
+                u8 *nd = realloc(it->data, (size_t)newsize);
+                if (!nd)
+                        return ERR_NOMEM;
+                memset(nd + it->size, 0, (size_t)(newsize - it->size));
+                it->data = nd;
+        }
+        vol->used += newsize - it->size;
+        it->size = newsize;
+        it->modified = (u64)GetTime();
+        return 0;
+}
+
 static i32 MemWrite(mem_vol_t *vol, vfs_item_id_t id, u64 offset,
                      u32 len, const u8 *in)
 {
@@ -530,19 +803,18 @@ static i32 MemWrite(mem_vol_t *vol, vfs_item_id_t id, u64 offset,
         if (it->type != VFS_ITEM_FILE)
                 return ERR_INVAL;
 
-        /* Truncate (OPEN+TRUNCATE): len==0 && offset==0 clears the file. */
-        if (len == 0) {
-                if (offset == 0 && it->size > 0) {
-                        ItemFreeData(it->data);
-                        it->data = NULL;
-                        vol->used -= it->size;
-                        it->size = 0;
-                        it->modified = (u64)GetTime();
-                }
-                return 0;
-        }
+        /* len == 0 is the truncate form (see MemTruncate): the offset
+         * field carries the target length, offset 0 being the documented
+         * OPEN+TRUNCATE clear. */
+        if (len == 0)
+                return MemTruncate(vol, it, offset);
 
         u64 need = offset + len;
+        /* Per-file cap first, then the volume capacity: a single file may
+         * never exceed MEM_MAX_FILE and the volume may never exceed its
+         * configured capacity (Users: 32 MiB).  Both report NOSPC. */
+        if (need > MEM_MAX_FILE)
+                return VFS_ERR_NOSPC;           /* single-file limit */
         if (need > vol->capacity)
                 return VFS_ERR_NOSPC;
         if (vol->used + (need - it->size) > vol->capacity)
@@ -613,6 +885,17 @@ static void DrvHandle(int token, drv_req_t *req)
         drv_resp_t *resp = (drv_resp_t *)s_resp;
         memset(resp, 0, sizeof(*resp));
 
+        /* v0.9 SYNC is dispatched before the volume lookup: it is legal
+         * in any state and for whichever volume index the vfs_server
+         * sends (the flush is driver-wide and, for RAM, a no-op). */
+        switch (req->op) {
+        case DRV_OP_SYNC:
+                resp->ret = MemCtrlSync();
+                goto out;
+        default:
+                break;
+        }
+
         mem_vol_t *vol = mem_vol_of(req->volume);
         if (!vol) {
                 resp->ret = ERR_INVAL;
@@ -658,6 +941,17 @@ static void DrvHandle(int token, drv_req_t *req)
                 resp->u.stat.used_bytes = vol->used;
                 resp->u.stat.read_only = vol->read_only;
                 resp->ret = 0;
+                break;
+        case DRV_OP_CTRL_CHECK:
+                resp->ret = MemCtrlCheck(vol, &resp->u.check);
+                break;
+        case DRV_OP_CTRL_INFO:
+                resp->ret = MemCtrlInfo(vol, &resp->u.info);
+                break;
+        case DRV_OP_CTRL_RAW_READ:
+                /* A RAM volume has no sectors and no LBA space: fail
+                 * honestly instead of fabricating bytes. */
+                resp->ret = ERR_INVAL;
                 break;
         case DRV_OP_PHYS_RANGE: {
                 /* Zero-copy backing range of a pool-resident file. */

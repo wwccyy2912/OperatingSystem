@@ -60,6 +60,9 @@ enum {
     NET_OP_TCP_SEND   = 14, /* { data }  send on the established conn */
     NET_OP_TCP_RECV   = 15, /* -> { data }  blocking recv */
     NET_OP_TCP_CLOSE  = 16, /* close the established connection */
+    /* ---- TCP client (v0.9) ---- */
+    NET_OP_TCP_CONNECT = 17, /* { ip[4]; port }  active open (SYN → ESTAB) */
+    NET_OP_GET_IP      = 18, /* -> { ip[4]; gw[4] }  current static config */
 };
 
 /* ---- request/response envelopes (fit the 4 KiB IPC limit) ---- */

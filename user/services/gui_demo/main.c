@@ -176,56 +176,63 @@ int main(void) {
     int     color_idx = 0;
 
     for (;;) {
-        gui_resp_poll_t ev;
-        int             n = 0;
-        if (GuiPoll(&ev, &n) < 0)
-            break;
-        for (int i = 0; i < n; i++) {
-            gui_event_t *e = &ev.events[i];
-            if (e->type == GUI_EV_KEY) {
-                /* 'q' quits the desktop from ANY focus state. */
-                u8 ch = (u8)e->code;
-                if (ch == 'q' || ch == 'Q' || ch == 27)
-                    goto done;
-                /* Other keys follow the FOCUSED window: only echo here
-                 * when the Keys window itself holds focus (the
-                 * compositor stamps each KEY event with the focus id).
-                 * Clicking another window moves focus, and keys stop
-                 * reaching this window. */
-                if (e->win != w1)
-                    continue;
-                if (ch == '\r' || ch == '\n') {
-                    lrow += 20;
-                    lpos = 0;
-                    if (lrow > WIN_H - 20) {
-                        GuiFill(w1, 0, 0, WIN_W, WIN_H, 0x00101018);
-                        lrow = 44;
-                    }
-                } else if (ch >= ' ' && ch < 0x7F) {
-                    if (lpos < (int)sizeof(line) - 2) {
-                        line[lpos++] = (char)ch;
-                        line[lpos]   = '\0';
-                        GuiText(w1, 4, lrow, line, 0x00FFFFFF, 0x00101018);
-                    }
+    gui_resp_poll_t ev;
+    int             n = 0;
+    if (GuiPoll(&ev, &n) < 0)
+        break;
+    for (int i = 0; i < n; i++) {
+        gui_event_t *e = &ev.events[i];
+        if (e->type == GUI_EV_CLOSE) {
+            /* Window closed by compositor title-bar close button */
+            if (e->win == w1) w1 = -1;
+            if (e->win == w2) w2 = -1;
+            if (e->win == w3) w3 = -1;
+            if (w1 < 0 && w2 < 0 && w3 < 0)
+                goto done;
+        } else if (e->type == GUI_EV_KEY) {
+            /* 'q' quits the desktop from ANY focus state. */
+            u8 ch = (u8)e->code;
+            if (ch == 'q' || ch == 'Q' || ch == 27)
+                goto done;
+            /* Other keys follow the FOCUSED window: only echo here
+             * when the Keys window itself holds focus (the compositor
+             * stamps each KEY event with the focus id). Clicking
+             * another window moves focus, and keys stop reaching this
+             * window. */
+            if (e->win != w1)
+                continue;
+            if (ch == '\r' || ch == '\n') {
+                lrow += 20;
+                lpos = 0;
+                if (lrow > WIN_H - 20) {
+                    GuiFill(w1, 0, 0, WIN_W, WIN_H, 0x00101018);
+                    lrow = 44;
                 }
-            } else if (e->type == GUI_EV_BUTTON && e->code == 1) {
-                /* Press: paint a square in the Canvas window. */
-                int cx = e->x - wx2 - 1;
-                int cy = e->y - wy2 - GUI_TITLE_H - 1;
-                if (cx >= 0 && cy >= 0 && cx + 12 <= WIN_W && cy + 12 <= WIN_H) {
-                    GuiFill(w2, cx, cy, 12, 12, s_colors[color_idx % 7]);
-                    color_idx++;
+            } else if (ch >= ' ' && ch < 0x7F) {
+                if (lpos < (int)sizeof(line) - 2) {
+                    line[lpos++] = (char)ch;
+                    line[lpos]   = '\0';
+                    GuiText(w1, 4, lrow, line, 0x00FFFFFF, 0x00101018);
                 }
-            } else if (e->type == GUI_EV_MOUSEMOVE) {
-                /* Info window: pointer position. */
-                char info[64];
-                snprintf(info, sizeof(info), "ptr %d,%d", e->x, e->y);
-                GuiFill(w3, 4, 4, 200, 20, 0x00101010);
-                GuiText(w3, 4, 4, info, 0x00FFFFFF, 0);
             }
+        } else if (e->type == GUI_EV_BUTTON && e->code == 1) {
+            /* Press: paint a square in the Canvas window. */
+            int cx = e->x - wx2 - 1;
+            int cy = e->y - wy2 - GUI_TITLE_H - 1;
+            if (cx >= 0 && cy >= 0 && cx + 12 <= WIN_W && cy + 12 <= WIN_H) {
+                GuiFill(w2, cx, cy, 12, 12, s_colors[color_idx % 7]);
+                color_idx++;
+            }
+        } else if (e->type == GUI_EV_MOUSEMOVE) {
+            /* Info window: pointer position. */
+            char info[64];
+            snprintf(info, sizeof(info), "ptr %d,%d", e->x, e->y);
+            GuiFill(w3, 4, 4, 200, 20, 0x00101010);
+            GuiText(w3, 4, 4, info, 0x00FFFFFF, 0);
         }
-        (void)Sleep(1);
     }
+    (void)Sleep(1);
+}
 
 done:
     GuiDestroy(w1);

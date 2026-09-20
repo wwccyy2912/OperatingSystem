@@ -119,4 +119,77 @@ int FsMoveItem(const char      *src,
  * the file is not pool-backed (fall back to FsRead()). */
 int FsReadMap(vfs_handle_t handle, void *map_virt, u32 *mapped_size);
 
+/* Flush every mounted volume to its backing store (VFS_OP_SYNC).
+ * Called before power-off so buffered driver metadata reaches the
+ * medium.  When out_volumes is non-NULL it receives the number of
+ * volumes that acknowledged the flush.  Returns 0, or a negative
+ * error (the vfs_server reports the first hard failure). */
+int FsSync(u32 *out_volumes);
+
+/* ====================================================================
+ * v1.0: object-model completion (design §3, vfs.h ops 21-23)
+ *
+ * Everything above asks a question about a URL.  These three ask it
+ * about an OPEN HANDLE instead — which is all a stdio FILE, a resolved
+ * bookmark or a zero-copy reader still holds.  Like every other handle
+ * operation they re-run the caller's authorization server-side, so a
+ * revoked grant surfaces as an error instead of silently succeeding.
+ * ==================================================================== */
+
+/**
+ * Metadata for an open handle (fstat by handle, VFS_OP_STAT_HANDLE).
+ *
+ * No URL and no re-resolve needed, so a program that only ever saw a
+ * handle can still answer "how big is this, and what is it called?".
+ *
+ * Returns 0 and fills *out_item on success.
+ * Errors: ERR_INVAL for a NULL out_item; VFS_ERR_STALE (-102) when the
+ * handle is no longer valid (item deleted, handle closed, access
+ * revoked); any negative port/IPC error is passed through unchanged.
+ */
+int FsStatHandle(vfs_handle_t handle, vfs_item_info_t *out_item);
+
+/**
+ * Set a file's length through its handle (VFS_OP_TRUNCATE).
+ *
+ * Shrinking releases the tail; growing fills the new range with zeros.
+ * The server re-checks the write side of the caller's authorization,
+ * exactly like FsWrite().
+ *
+ * Returns 0 on success; *out_size (optional) receives the resulting
+ * length (== size).
+ * Errors: VFS_ERR_STALE (-102) for a dead handle; VFS_ERR_PERM (-103)
+ * or VFS_ERR_READONLY (-100) when the caller may not write; VFS_ERR_NOSPC
+ * (-101) when the volume cannot grow the file; ERR_INVAL for a bad call.
+ */
+int FsTruncate(vfs_handle_t handle, u64 size, u64 *out_size);
+
+/**
+ * Extend a bookmark's lifetime (VFS_OP_REFRESH_BOOKMARK).
+ *
+ * An expired bookmark stops resolving (VFS_ERR_STALE); its holder can
+ * renew it here as long as the grant behind it is still live.  The
+ * server rewrites expiry_ticks inside the blob and hands the updated
+ * blob back, so the caller must replace its cached copy.
+ * extend_ticks: 0 = make it permanent, > 0 = now + extend_ticks.
+ *
+ * out_blob MUST provide VFS_BOOKMARK_MAX (256) bytes.  On success
+ * *out_bk_len holds the updated blob's real length and *out_expiry the
+ * new absolute deadline (0 = permanent); both are left untouched on
+ * error.
+ *
+ * Returns 0 on success.
+ * Errors: ERR_INVAL for a NULL blob/out_blob/out_bk_len or a bk_len
+ * outside [1, VFS_BOOKMARK_MAX]; VFS_ERR_STALE (-102) when the bookmark
+ * is unknown or was revoked; VFS_ERR_ACCESS (-105) when the grant
+ * behind it was dropped; ERR_FAULT if the server reports a blob larger
+ * than VFS_BOOKMARK_MAX.
+ */
+int FsRefreshBookmark(const u8 *blob,
+                      u32       bk_len,
+                      u64       extend_ticks,
+                      u8       *out_blob,
+                      u32      *out_bk_len,
+                      u64      *out_expiry);
+
 #endif /* LIBFS_FS_H */

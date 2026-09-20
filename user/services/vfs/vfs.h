@@ -176,6 +176,11 @@ enum {
     VFS_OP_WHOAMI           = 17, /* P1 地基: caller → kernel subject_id */
     VFS_OP_LIST_VOLUMES     = 18, /* enumerate mounted volumes (root "/" view) */
     VFS_OP_READ_MAP         = 19, /* Phase 3: zero-copy file read (map) */
+    VFS_OP_SYNC             = 20, /* v0.9: flush every mounted volume to its backing store */
+    /* ---- v1.0: object-model completion ---- */
+    VFS_OP_STAT_HANDLE      = 21, /* handle → vfs_item_info_t (fstat by handle) */
+    VFS_OP_TRUNCATE         = 22, /* handle + new size (shrink or grow with zeros) */
+    VFS_OP_REFRESH_BOOKMARK = 23, /* extend a bookmark's expiry from its blob */
 };
 
 #define PAGE_SIZE 4096u /* user-space view (kernel/types.h) */
@@ -437,6 +442,81 @@ typedef struct {
     vfs_vol_info_t vols[VFS_MAX_VOLS];
 } vfs_resp_list_volumes_t;
 
+/* VFS_OP_SYNC — flush every mounted volume to its backing store.
+ * Implemented by the vfs_server: it walks its mounted-volume table and
+ * forwards a DRV_OP_SYNC to each driver, so a caller can make sure that
+ * buffered driver state (superblock / inode-table / metadata) has
+ * reached the block device before powering the machine off.  Volumes
+ * whose driver does not implement SYNC count as "unsupported", not as
+ * failures.  Callers: the `sync` / `disk sync` / `power off` shell
+ * commands.  No capability is required — SYNC cannot modify data, it
+ * only pushes already-accepted writes towards the medium. */
+typedef struct {
+    u32 op; /* = VFS_OP_SYNC */
+} vfs_req_sync_t;
+
+typedef struct {
+    i32 ret;       /* OK, or the first hard error */
+    u32 volumes;   /* volumes that acknowledged the flush */
+    u32 failures;  /* volumes whose driver returned an error */
+} vfs_resp_sync_t;
+
+/* VFS_OP_STAT_HANDLE — metadata for an OPEN handle.
+ *
+ * Clients that only hold a handle (a stdio FILE, a bookmark resolution)
+ * could not answer "how big is this?" or "what is its name?" without
+ * re-resolving the URL, which they may not even have.  This op closes
+ * that hole: like every other handle operation it re-runs the caller's
+ * authorization, and it reports VFS_ERR_STALE for a handle whose item
+ * disappeared (or whose access was revoked) instead of failing with a
+ * misleading ERR_NOENT. */
+typedef struct {
+    u32          op; /* = VFS_OP_STAT_HANDLE */
+    vfs_handle_t handle;
+} vfs_req_stat_handle_t;
+
+typedef struct {
+    i32             ret;
+    vfs_item_info_t item;
+} vfs_resp_stat_handle_t;
+
+/* VFS_OP_TRUNCATE — set a file's length through its handle.
+ *
+ * Shrinking releases the tail; growing fills the new range with zeros
+ * (a driver that cannot extend returns VFS_ERR_NOSPC).  The write side
+ * of the authorization is re-checked, exactly like VFS_OP_WRITE. */
+typedef struct {
+    u32          op; /* = VFS_OP_TRUNCATE */
+    vfs_handle_t handle;
+    u64          size; /* new length in bytes */
+} vfs_req_truncate_t;
+
+typedef struct {
+    i32 ret;
+    u64 size; /* resulting length (== request on success) */
+} vfs_resp_truncate_t;
+
+/* VFS_OP_REFRESH_BOOKMARK — extend a bookmark's lifetime.
+ *
+ * Resolving an expired bookmark fails with VFS_ERR_STALE.  A holder that
+ * is still authorized (the grant behind the bookmark is still live) can
+ * renew it with this op, which rewrites expiry_ticks inside the blob and
+ * returns the updated blob so the client can cache it again.  extend
+ * semantics: 0 = make it permanent, >0 = now + extend_ticks. */
+typedef struct {
+    u32 op;      /* = VFS_OP_REFRESH_BOOKMARK */
+    u32 bk_len;  /* bytes valid in data[] */
+    u64 extend_ticks; /* 0 = permanent, else now + extend_ticks */
+    u8  data[VFS_BOOKMARK_MAX];
+} vfs_req_refresh_bookmark_t;
+
+typedef struct {
+    i32 ret;
+    u32 bk_len; /* updated blob length */
+    u64 expiry_ticks; /* the new absolute deadline (0 = permanent) */
+    u8  data[VFS_BOOKMARK_MAX];
+} vfs_resp_refresh_bookmark_t;
+
 /* VFS_OP_MOUNT — driver → vfs_server registration (design §7.2) */
 typedef struct {
     u32           op;
@@ -507,7 +587,53 @@ enum {
     DRV_OP_CTRL_UNMOUNT = 13, /* deregister the volume (UNMOUNT handshake) */
     DRV_OP_CTRL_FORMAT  = 14, /* wipe + re-format + re-mount (new UUID) */
     DRV_OP_CTRL_FILL    = 15, /* create fill.bin until NOSPC or budget   */
+    /* v0.9 maintenance plane.  SYNC is also legal on a MOUNTED volume
+     * (the vfs_server sends it on behalf of `sync`); CHECK / INFO /
+     * RAW_READ are read-only diagnostics and are gated on
+     * ATOM_SERVICE_MANAGE inside the driver, exactly like CTRL_*. */
+    DRV_OP_SYNC      = 16, /* flush driver state to the medium (any state)  */
+    DRV_OP_CTRL_CHECK = 17, /* read-only consistency scan → drv_check_report_t */
+    DRV_OP_CTRL_INFO  = 18, /* volume detail → drv_info_t                    */
+    DRV_OP_CTRL_RAW_READ = 19, /* raw sector read: offset = lba, len = bytes
+                                * (≤ DRV_RAW_MAX); data[] + ctrl.bytes carry
+                                * the result.  Admin/debug only.          */
 };
+
+/* Largest raw sector read the driver will serve in one request
+ * (keeps drv_resp_t inside the 4096-byte IPC limit). */
+#define DRV_RAW_MAX 1024
+
+/* Result of a read-only consistency scan (DRV_OP_CTRL_CHECK).
+ * The driver walks its own metadata and reports what it found; nothing
+ * is modified, so a check is always safe to run on a live volume. */
+typedef struct {
+    u32  magic_ok;      /* 1 = the format signature validated */
+    u32  inodes_total;  /* capacity of the inode table        */
+    u32  inodes_used;   /* in-use slots                       */
+    u32  files;         /* live regular files                 */
+    u32  dirs;          /* live directories                   */
+    u32  used_blocks;   /* data/allocation blocks in use      */
+    u32  free_blocks;   /* blocks still allocatable           */
+    u32  errors;        /* number of problems detected        */
+    u32  first_error;   /* error class of the first problem (0 = none) */
+    char note[64];      /* human-readable summary / first problem */
+} drv_check_report_t;
+
+/* Volume detail (DRV_OP_CTRL_INFO).  Fields a driver cannot supply
+ * stay zero, and persistent=0 marks a memory-backed volume. */
+typedef struct {
+    char driver[DRV_NAME_MAX]; /* driver_name from the MOUNT handshake */
+    char mount[64];            /* mount_name ("Disk" / "System")       */
+    u32  read_only;
+    u32  block_size;    /* bytes per allocation block / sector */
+    u32  total_blocks;
+    u32  used_blocks;
+    u32  inode_total;
+    u32  inode_used;
+    u32  persistent;    /* 1 = survives a reboot */
+    u64  uuid_hi;       /* volume UUID (0 when the driver has none) */
+    u64  uuid_lo;
+} drv_info_t;
 
 typedef struct {
     u32           op;
@@ -545,6 +671,8 @@ typedef struct {
         struct {
             u64 bytes; /* CTRL_FILL: bytes written to fill.bin */
         } ctrl;                   /* CTRL_* */
+        drv_check_report_t check; /* CTRL_CHECK */
+        drv_info_t         info;  /* CTRL_INFO  */
         u8 data[DRV_MAX_PAYLOAD]; /* READ payload */
     } u;
 } drv_resp_t;

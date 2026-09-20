@@ -665,7 +665,17 @@ static void DoCreate(int token, int msg_len, u64 caller) {
     }
     gui_req_t  *req  = (gui_req_t *)s_req;
     gui_req_create_t *c = (gui_req_create_t *)req->data;
-    if (c->w <= 0 || c->h <= 0 || c->w > 1024 || c->h > 768) {
+    /*
+     * The requested size is the CONTENT area.  Leave room for the
+     * compositor's border and title bar, otherwise a 1024x768 content
+     * window on a 1024x768 framebuffer becomes larger than the screen
+     * and DoMove() can calculate a negative maximum coordinate.
+     */
+    int max_w = (int)s_fb.w - 2 * GUI_BORDER;
+    int max_h = (int)s_fb.h - 2 * GUI_BORDER - GUI_TITLE_H;
+    if (max_w < 16 || max_h < 16 ||
+        c->w < 16 || c->h < 16 ||
+        c->w > max_w || c->h > max_h) {
         (void)IpcReply(token, resp, (int)sizeof(*resp));
         return;
     }
@@ -784,6 +794,7 @@ static void DoDestroy(int token, int msg_len, u64 caller) {
     int dx = w->x, dy = w->y;
     int dw = w->w + 2 * GUI_BORDER;
     int dh = w->h + 2 * GUI_BORDER + GUI_TITLE_H;
+    int closed_id = w->id;
     free(w->buf.buf);
     memset(w, 0, sizeof(*w));
     if (s_focus_id == id)
@@ -792,6 +803,7 @@ static void DoDestroy(int token, int msg_len, u64 caller) {
         (void)MutexUnlock(s_lock);
 
     resp->ret = 0;
+    EvPush(GUI_EV_CLOSE, 0, 0, 0, closed_id);
     GuiDirtyAdd(dx, dy, dw, dh);
     if (GuiWinCount() == 0) {
         /* Last window destroyed: hand the screen back to the shell
@@ -931,6 +943,15 @@ static void DoFocus(int token, int msg_len, u64 caller) {
         (void)IpcReply(token, resp, (int)sizeof(*resp));
         return;
     }
+    /* A minimized window is not visible and must not receive keyboard
+     * focus.  Restore it through the taskbar first. */              // <-- 新增注释
+    if (w->hidden) {                                                // <-- 新增
+        if (s_lock >= 0)
+            (void)MutexUnlock(s_lock);
+        resp->ret = -2; /* ERR_INVAL */
+        (void)IpcReply(token, resp, (int)sizeof(*resp));
+        return;
+    }                                                               // <-- 新增结束
     int old_focus = s_focus_id;
     s_focus_id    = id;
     if (s_lock >= 0)

@@ -1,5 +1,10 @@
 # OpSys 基于属性的动态权限模型（Attribute-Based Dynamic Permission Model）
 
+> **阅读提示**：本文是**设计基线文档**，记录做出决策时的思考与当时的现状快照。
+> 其中标注为"规划/未实现"的条目可能已在后续版本落地。判断某项功能的**当前状态**，
+> 请以代码、[../README.md](../README.md) 与 [architecture.md](architecture.md) 为准；
+> 逐提交的实际进展见 [CHANGELOG.md](CHANGELOG.md)，文档地图见 [README.md](README.md)。
+
 > 版本：v0.4（P0 + P1 + P2 已落地）
 > 日期：2026-08-13
 > 状态：**P0 地基 ✅（31/31 测试通过）** —— **P1 perm-engine ✅（回归 31/31 + P1 10/10）** —— **P2 接入 ✅（回归 31/31 + P1 10/10 + P2 Gate 3/3 + P2 VFS 4/4）**；P3（上下文/频率/路径约束）、P4（持久化/审计/开发者/恢复模式）待启动（P3/P4 协议接口已预留，见 §十）；含原设计五层模型 + 架构修正补充（补充一 ~ 补充八）
@@ -469,3 +474,104 @@ syscall 门控依赖 P0 的 cap 扩展。
 
 验证：guest 登录后 `exec`/`kill` 被 shell 拦截（Policy 层）；guest 的 VFS
 读被能力层拒绝（Capability 层）。环境变量仅影响 PS1 等偏好。
+
+---
+
+## 十三、v1.0 落地：P3/P4 从"预留"变为"生效"
+
+> 本节记录 2026-09 的 v1.0 批次：§十 路线图里 P3（上下文/频率/路径约束）与 P4（持久化/审计）原本只有协议占位，
+> 现在**决策路径真正使用了它们**。所有改动都在用户态（`user/services/perm/`），内核没有新增系统调用。
+
+### 13.1 授权生命周期：TTL + scope + 来源
+
+`perm_grant_t` 从"永久且无作用域"扩展为带生命周期的授权：
+
+| 字段 | 语义 |
+| --- | --- |
+| `expiry_ticks` | 绝对 tick 截止时间；`0` = 永久。**惰性过期**：`grant_find()` 命中时若已过期，就地清槽、记一条 `PERM_EV_EXPIRE` 审计，并视同不存在 |
+| `scope_hash` | 作用域约束。请求 `scope_hash == 0`（不限）接受任意授权；请求带作用域时要求与授权完全一致，否则该授权不覆盖本次请求（`PERM_DEC_SCOPE_MISMATCH`），继续走角色链 |
+| `source` | 授权来源：`PERM_SRC_POWERBOX`（用户点了面板）/ `PERM_SRC_DIRECT`（管理面或测试直接签发）/ `PERM_SRC_POLICY`（从策略快照恢复） |
+
+**Powerbox 现在可以发"限时授权"**：`PERM_OP_ANSWER` 新增 `ttl_ticks` 与 `scope_hash`，界面层可以提供"仅本次/限时"的选项；
+`ttl_ticks == 0` 保持原来的永久语义（既有行为不变）。
+
+### 13.2 上下文绑定（P3）
+
+`PERM_OP_CONTEXT` 记录每个主体的前台/后台状态，**并且这条状态现在参与决策**：
+
+- 主体被登记为**后台**时，走到"默认拒绝"分支**不会创建 Powerbox 查询、也不会推送 UI 提示**，
+  直接返回 `VFS_ERR_ACCESS` 并置 `PERM_DEC_BACKGROUND`。
+  这解决了 §2.8`UI 聚合` 里最实际的一个问题：后台应用无法用询问面板骚扰用户。
+- **未登记的主体一律按前台处理** —— 这一条是有意为之的兼容性设计：P1/P2 的既有语义（默认拒绝 → 询问）
+  对所有未声明上下文的主体完全不变。
+- `PERM_OP_CONTEXT` 只读模式（`list=1`）与新增的 `PERM_OP_CTX_QUERY` 提供上下文表的查询能力；
+  写模式要求调用者持 `ATOM_SERVICE_MANAGE`（管理面），并记录 `PERM_EV_CONTEXT` 审计。
+
+### 13.3 频率阈值与隔离（P3）
+
+频率计数器从"只统计"升级为**策略输入**：
+
+```text
+每次判定        → 命中 hits++ / 拒绝 denies++
+滚动窗口        → 距 window_start 超过 PERM_DENY_WINDOW_TICKS(1000) 清零 denies
+denies ≥ 阈值   → 主体进入隔离：quarantine_until = now + PERM_QUARANTINE_TICKS(3000)
+隔离期内        → 一律拒绝、不弹窗、审计标记 PERM_DEC_QUARANTINED
+到期或手动释放  → 恢复正常判定（PERM_OP_FREQ 的 clear_quarantine=1）
+```
+
+阈值为 `PERM_DENY_THRESHOLD = 8`（见 `user/services/perm/perm.h`）。这是一条**抗骚扰/抗探测**策略：
+一个不断被拒绝的应用会在 30 秒内连"询问用户"的资格都没有；管理员可以通过
+`PERM_OP_FREQ`（`clear_quarantine=1`）或 shell 的 `perm freq release <subject>` 手动解除。
+
+### 13.4 审计全覆盖（P4）
+
+`perm_audit_ent_t` 新增 `event` 字段，审计不再只覆盖 CHECK：
+
+| 事件 | 触发点 |
+| --- | --- |
+| `PERM_EV_CHECK_ALLOW` / `CHECK_DENY` | 每一次授权判定（含角色链拒绝与默认拒绝） |
+| `PERM_EV_POWERBOX` | 默认拒绝并创建了询问（真正的"询问用户"事件） |
+| `PERM_EV_ANSWER` | 用户对询问的裁决 |
+| `PERM_EV_GRANT` / `REVOKE` | 授权签发 / 撤销 |
+| `PERM_EV_ROLE_SET` | 角色热更新 |
+| `PERM_EV_CONTEXT` | 前台/后台切换 |
+| `PERM_EV_QUARANTINE` | 隔离进入/解除 |
+| `PERM_EV_EXPIRE` | 授权因 TTL 到期被回收 |
+| `PERM_EV_POLICY_SAVE` / `POLICY_LOAD` | 策略快照导出/导入 |
+
+`PERM_OP_AUDIT` 支持按 `subject_id`、`verdict_filter`（全部/仅授权/仅拒绝）、`since_tick`、`max_entries` 过滤，
+返回顺序为**最旧在前**。审计环仍是 `PERM_AUDIT_MAX = 64` 条（受 4096 字节报文上限约束，条目变长后已重新核算）。
+
+### 13.5 策略持久化（P4）
+
+快照格式升级到 v2（grant 记录携带 `expiry_ticks`/`scope_hash`/`source`），并新增
+`include_expired` 开关：默认只导出**仍然有效**的授权，同时把已过期的槽位真正清掉。
+读取端兼容 v1 快照（旧布局按新字段为 0 解析），因此旧文件不会让服务拒绝启动。
+
+导入仍是**全有或全无 + 热更新**：校验失败完全不动当前策略；成功后对每条记录先按 atom 撤销再签发，
+来源标记为 `PERM_SRC_POLICY`，并记录一条 `PERM_EV_POLICY_LOAD` 审计。
+
+> **存储位置与权限**：快照文件（默认 `/Volumes/Disk/perm.policy`）的读写由**管理员会话**驱动
+> （shell 的 `perm save` / `perm load`）。perm 服务自身不持有文件权限，这符合"策略引擎不做 I/O"的分工；
+> 开机自动加载因此不是默认行为（见 §11 风险与未决问题的更新）。
+
+### 13.6 与 VFS 的配合
+
+权限模型的行为变化只有在 VFS 真正按资源查询时才有意义，因此本轮同时补完了 VFS 的对象模型：
+按句柄取元数据（`VFS_OP_STAT_HANDLE`）、按句柄截断（`VFS_OP_TRUNCATE`）、
+书签**过期强制执行**与续期（`VFS_OP_REFRESH_BOOKMARK`）、移动环检测、保留名与超长名校验、
+以及失效句柄统一返回 `VFS_ERR_STALE`。详见 [vfs_design.md](vfs_design.md) 的 v1.0 小节。
+
+### 13.7 网络原子门控（补齐 §11 记录的缺口）
+
+`ATOM_NET_CONNECT` / `ATOM_NET_BIND` 此前"已定义但无人使用"。现在 `net` 服务在分派前对调用者做门控：
+
+| 类别 | 需要的能力 |
+| --- | --- |
+| 出站（原始帧发送、ping、UDP 发送、TCP 连接/发送/接收/关闭、设置地址） | `ATOM_NET_CONNECT` |
+| 本地端点（绑定 UDP、监听/接受 TCP、接收 UDP、收取原始帧） | `ATOM_NET_BIND` |
+| 诊断（取 MAC、查地址、统计） | 无（不泄露任何线上拿不到的信息） |
+
+`user` 服务在 OWNER/ADMIN 登录时随 `ATOM_SYS_SHUTDOWN` 一起签发这两个原子，登出时一并收回 —— 于是
+"网络访问"和其它敏感操作一样，成为**账户状态决定的能力**，而未登录的进程默认无网络权限。
+

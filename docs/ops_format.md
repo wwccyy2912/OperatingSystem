@@ -6,6 +6,12 @@
 
 版本：v1.0（2026-08）
 
+> **阅读提示**：本文是**设计基线文档**，记录做出决策时的思考与当时的现状快照。
+> 其中标注为"规划/未实现"的条目可能已在后续版本落地。判断某项功能的**当前状态**，
+> 请以代码、[../README.md](../README.md) 与 [architecture.md](architecture.md) 为准；
+> 逐提交的实际进展见 [CHANGELOG.md](CHANGELOG.md)，文档地图见 [README.md](README.md)。
+
+
 ## 1. 目标
 
 - 定义 `.ops` 应用包二进制格式（v1 简化版：单 ELF payload，不做 squashfs/压缩）。

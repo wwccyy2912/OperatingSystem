@@ -97,7 +97,52 @@ enum {
     PERM_OP_POLICY_LOAD = 12, /* P2: P4 预留 — 导入策略二进制快照             */
     PERM_OP_AUDIT       = 13, /* P2: P3 预留 — 导出审计环形缓冲区               */
     PERM_OP_SET_QUIET   = 14, /* management: suppress UI_SHOW pushes (tests)  */
+    PERM_OP_CTX_QUERY   = 15, /* v1.0: read the foreground/background table    */
 };
+
+/* ---- v1.0: decision flags carried in perm_resp_check_t.flags ----
+ * They let the caller (and the acceptance tests) see *why* a verdict
+ * came out the way it did without parsing log text. */
+#define PERM_DEC_GRANT_BEAT    (1u << 0) /* an explicit grant covered the request */
+#define PERM_DEC_ROLE_CHAIN    (1u << 1) /* a (role, atom) rule decided it        */
+#define PERM_DEC_DEFAULT_DENY  (1u << 2) /* nothing matched → Powerbox created    */
+#define PERM_DEC_BACKGROUND    (1u << 3) /* denied because the subject is background */
+#define PERM_DEC_QUARANTINED   (1u << 4) /* denied because the subject is quarantined */
+#define PERM_DEC_SCOPE_MISMATCH (1u << 5) /* a grant existed but its scope differed */
+#define PERM_DEC_EXPIRED       (1u << 6) /* a grant existed but had expired       */
+
+/* ---- v1.0: audit event codes (perm_audit_ent_t.event) ---- */
+enum {
+    PERM_EV_CHECK_ALLOW = 1,
+    PERM_EV_CHECK_DENY  = 2, /* role-chain deny or default deny            */
+    PERM_EV_POWERBOX    = 3, /* default deny that raised a UI query        */
+    PERM_EV_ANSWER      = 4,
+    PERM_EV_GRANT       = 5,
+    PERM_EV_REVOKE      = 6,
+    PERM_EV_ROLE_SET    = 7,
+    PERM_EV_CONTEXT     = 8,
+    PERM_EV_QUARANTINE  = 9, /* a subject entered (or left) quarantine     */
+    PERM_EV_POLICY_LOAD = 10,
+    PERM_EV_POLICY_SAVE = 11,
+    PERM_EV_EXPIRE      = 12, /* a grant was reaped because its TTL passed  */
+};
+
+/* ---- v1.0: grant provenance ---- */
+enum {
+    PERM_SRC_POWERBOX = 0, /* user answered the panel                    */
+    PERM_SRC_DIRECT   = 1, /* PERM_OP_GRANT (tests / management seeding) */
+    PERM_SRC_POLICY   = 2, /* restored from a policy snapshot            */
+};
+
+/* ---- v1.0: frequency / quarantine policy ----
+ * DoCheck counts every decision per subject; DENY_THRESHOLD denials make
+ * the subject QUIET for QUARANTINE_TICKS: further requests are refused
+ * without a Powerbox prompt (a background/rogue app cannot spam the user
+ * with panels).  The window is rolling: a subject that behaves for one
+ * WINDOW_TICKS gets its denial count reset. */
+#define PERM_DENY_THRESHOLD   8
+#define PERM_QUARANTINE_TICKS 3000 /* 30 s at the 100 Hz kernel tick */
+#define PERM_DENY_WINDOW_TICKS 1000
 
 /* PERM_OP_SET_QUIET — management-only: when quiet=1 the perm-manager
  * creates/answers Powerbox queries WITHOUT pushing UI_SHOW to term.
@@ -140,6 +185,7 @@ typedef struct {
 
 typedef struct {
     i32 ret;      /* 0 = granted; VFS_ERR_ACCESS = denied */
+    u32 flags;    /* v1.0: PERM_DEC_* — why this verdict was reached */
     u32 query_id; /* pending query (valid when ret < 0) */
     u32 granted;  /* P2: 实际被批准的 VFS_ACCESS_* 位掩码
                    * （能力化抹位）：= grant 覆盖的位，
@@ -159,7 +205,10 @@ typedef struct {
 typedef struct {
     u32 op; /* = PERM_OP_ANSWER */
     u32 query_id;
-    i32 allow; /* 1 = 允许, 0 = 拒绝 */
+    i32 allow;         /* 1 = 允许, 0 = 拒绝 */
+    u64 ttl_ticks;     /* v1.0: 0 = 永久授权；>0 = 从现在起 N tick 后过期
+                        * （Powerbox 的"临时授权"：界面可提供 1 次/短时选项） */
+    u32 scope_hash;    /* v1.0: 0 = 不限作用域；否则只对该 scope 生效 */
 } perm_req_answer_t;
 
 typedef struct {
@@ -220,12 +269,17 @@ typedef struct {
     u32            op; /* = PERM_OP_GRANT */
     vfs_resource_t resource;
     u32            access;
-    u64            subject_id; /* P1: 目标主体（0 = 任意发起者） */
-    u32            atom;       /* P1: 授权时签发的权限 atom */
+    u64            subject_id;   /* P1: 目标主体（0 = 任意发起者） */
+    u32            atom;         /* P1: 授权时签发的权限 atom */
+    u64            expiry_ticks; /* v1.0: 绝对 tick 截止；0 = 永久 */
+    u32            scope_hash;   /* v1.0: 0 = 不限作用域 */
+    u32            source;       /* v1.0: PERM_SRC_*（缺省 0 = POWERBOX） */
 } perm_req_grant_t;
 
 typedef struct {
     i32 ret;
+    u64 expiry_ticks; /* v1.0: 生效的截止 tick（0 = 永久） */
+    u32 scope_hash;   /* v1.0: 生效的 scope（0 = 不限）    */
 } perm_resp_grant_t;
 
 /* ====================================================================
@@ -306,13 +360,34 @@ typedef struct {
 
 typedef struct {
     u32 op;         /* = PERM_OP_CONTEXT */
-    u64 subject_id; /* 目标主体 */
+    u64 subject_id; /* 目标主体（0 = 查询全部，见下） */
     u32 foreground; /* 1 = 前台, 0 = 后台 */
+    u32 list;       /* v1.0: 1 = 只查询（不改状态），响应填 entries[] */
 } perm_req_context_t;
 
+#define PERM_CTX_LIST_MAX 16
+
 typedef struct {
-    i32 ret;
+    i32    ret;
+    u32    count; /* list=1 时返回的条目数 */
+    struct {
+        u64 subject_id;
+        u32 foreground;
+        u32 quarantined;
+    } entries[PERM_CTX_LIST_MAX];
 } perm_resp_context_t;
+
+/* ====================================================================
+ * v1.0: PERM_OP_CTX_QUERY — read the foreground/background table
+ *
+ * A dedicated read-only op (the CONTEXT op above also serves list=1, but
+ * a separate op keeps "notify" and "inspect" callers from having to know
+ * about each other's flags).  Response is the same perm_resp_context_t.
+ * ==================================================================== */
+
+typedef struct {
+    u32 op; /* = PERM_OP_CTX_QUERY */
+} perm_req_ctx_query_t;
 
 /* ====================================================================
  * P2: P3 预留 — PERM_OP_FREQ — 授权命中频率计数器
@@ -325,16 +400,21 @@ typedef struct {
 #define PERM_FREQ_MAX 32
 
 typedef struct {
-    u32 op;         /* = PERM_OP_FREQ */
-    u64 subject_id; /* 0 = 全部主体 */
-    u32 atom;       /* 0 = 全部 atom */
-    u32 reset;      /* 1 = 查询后清零计数 */
+    u32 op;               /* = PERM_OP_FREQ */
+    u64 subject_id;       /* 0 = 全部主体 */
+    u32 atom;             /* 0 = 全部 atom */
+    u32 reset;            /* 1 = 查询后清零计数 */
+    u32 clear_quarantine; /* v1.0: 1 = 解除该主体（subject_id 非 0 时）或
+                           * 全部主体（subject_id == 0）的隔离状态 */
 } perm_req_freq_t;
 
 typedef struct {
     i32 ret;
-    u32 count; /* 命中总数（reset=1 时返回清零前的值） */
-    u32 slots; /* 占用的计数器槽位数 */
+    u32 count;             /* 命中总数（reset=1 时返回清零前的值） */
+    u32 slots;             /* 占用的计数器槽位数 */
+    u32 denies;            /* v1.0: 同一 (subject, atom) 的拒绝次数 */
+    u32 quarantined;       /* v1.0: 1 = 该主体当前处于隔离期 */
+    u32 quarantine_ticks;  /* v1.0: 隔离剩余 tick（0 = 未隔离） */
 } perm_resp_freq_t;
 
 /* ====================================================================
@@ -354,6 +434,8 @@ typedef struct {
 typedef struct {
     u32 op;                    /* = PERM_OP_POLICY_SAVE / PERM_OP_POLICY_LOAD */
     u32 size;                  /* LOAD: 快照字节数（SAVE 忽略，置 0） */
+    u32 include_expired;       /* v1.0: SAVE 时 1 = 连过期 grant 一起导出
+                                * （默认 0：只导出仍然有效的授权） */
     u8  data[PERM_POLICY_MAX]; /* LOAD: 待导入快照（SAVE 忽略） */
 } perm_req_policy_t;
 
@@ -377,12 +459,19 @@ typedef struct {
     u64            tick;       /* 内核 tick */
     u64            subject_id; /* 发起主体 */
     u32            atom;       /* 命中的权限 atom（拒绝时为 0） */
-    u32            verdict;    /* 0 = granted, 1 = denied */
+    u32            verdict;    /* PERM_VERDICT_ALLOW (=1) / PERM_VERDICT_DENY (=0)
+                                * — the same enum the rule table uses, NOT a
+                                * standalone 0/1 convention. */
+    u32            event;      /* v1.0: PERM_EV_*（这条记录是什么事件） */
     vfs_resource_t resource;
 } perm_audit_ent_t;
 
 typedef struct {
-    u32 op; /* = PERM_OP_AUDIT */
+    u32 op;            /* = PERM_OP_AUDIT */
+    u64 subject_id;    /* v1.0: 0 = 不过滤主体 */
+    u32 verdict_filter;/* v1.0: 0 = 全部, 1 = 只看 granted, 2 = 只看 denied */
+    u64 since_tick;    /* v1.0: 0 = 不限起始时间 */
+    u32 max_entries;   /* v1.0: 0 = PERM_AUDIT_MAX */
 } perm_req_audit_t;
 
 typedef struct {

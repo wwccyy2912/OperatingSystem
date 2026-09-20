@@ -120,6 +120,11 @@ USER_C := \
     user/services/init/main.c \
     user/services/manager/manager.c \
     user/services/shell/shell.c \
+    user/services/shell/cmd_fs.c \
+    user/services/shell/cmd_disk.c \
+    user/services/shell/cmd_power.c \
+    user/services/shell/cmd_net.c \
+    user/services/shell/cmd_perm.c \
     user/services/serial/serial.c \
     user/services/keyboard/keyboard.c \
     user/services/term/term.c \
@@ -145,6 +150,8 @@ USER_C := \
     user/services/gui_demo/main.c \
     user/services/net/main.c \
     user/services/net/proto.c \
+    user/lib/libc/stdio_file.c \
+    user/lib/libfs/stdio_vfs.c \
     user/lib/libtui/tui.c \
     user/lib/libgui/gui.c \
     user/lib/libwm/wm.c \
@@ -330,7 +337,9 @@ run: iso
 		-serial stdio \
 		-d int,cpu_reset,guest_errors \
 		-drive file=disk.img,if=none,id=vd,cache=writethrough \
-		-device virtio-blk-pci,drive=vd,disable-modern=on
+		-device virtio-blk-pci,drive=vd,disable-modern=on \
+		-netdev user,id=n0 \
+		-device pcnet,netdev=n0
 
 debug: iso
 	@echo ">>> GDB stub listening on port 1234"
@@ -342,7 +351,9 @@ debug: iso
 		-serial mon:stdio \
 		-s -S \
 		-drive file=disk.img,if=none,id=vd,cache=writethrough \
-		-device virtio-blk-pci,drive=vd,disable-modern=on
+		-device virtio-blk-pci,drive=vd,disable-modern=on \
+		-netdev user,id=n0 \
+		-device pcnet,netdev=n0
 
 # --- Cleanup ------------------------------------------------------------------
 clean:

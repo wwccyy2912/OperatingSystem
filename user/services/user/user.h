@@ -38,6 +38,10 @@
 
 #include <stdint.h>
 
+/* Service-supervision protocol (svc_req_t / svc_resp_t) — shared with
+ * the manager's control port so the proxy can forward it unchanged. */
+#include "../manager/manager.h"
+
 #define USER_NAME_MAX   32
 #define USER_PW_MAX     64
 #define USER_MAX_ACCOUNTS 16
@@ -63,6 +67,20 @@ enum {
     USER_OP_DISK_UNMOUNT = 16, /* admin proxy: unmount the Disk volume */
     USER_OP_DISK_FORMAT = 17, /* admin proxy: wipe + re-format Disk   */
     USER_OP_DISK_FILL  = 18, /* admin proxy: fill Disk until NOSPC/budget */
+    USER_OP_DISK_SYNC     = 19, /* admin proxy: flush the volume to the medium */
+    USER_OP_DISK_CHECK    = 20, /* admin proxy: read-only consistency scan     */
+    USER_OP_DISK_INFO     = 21, /* admin proxy: volume detail                  */
+    USER_OP_DISK_RAW_READ = 22, /* admin proxy: raw sectors (debug)            */
+    /* v0.9: admin proxy to the service manager's control port.  The
+     * shell holds no ATOM_SERVICE_MANAGE, so it cannot command the
+     * manager directly; it asks this service, which re-checks that the
+     * human behind the request is OWNER/ADMIN and then forwards the
+     * request verbatim (request svc_req_t, reply svc_resp_t). */
+    USER_OP_SVC_LIST    = 23,
+    USER_OP_SVC_STATUS  = 24,
+    USER_OP_SVC_START   = 25,
+    USER_OP_SVC_STOP    = 26,
+    USER_OP_SVC_RESTART = 27,
 };
 
 /* Account lockout policy: failed logins before auto-lock. */
@@ -141,18 +159,61 @@ typedef struct {
  * ATOM_SERVICE_MANAGE, which the user service holds; the user service
  * re-checks the caller is OWNER/ADMIN, exactly like KILL/POLICY_SET. */
 typedef struct {
-    uint32_t op;      /* USER_OP_DISK_* */
+    uint32_t op;         /* USER_OP_DISK_* */
     char     volume[64]; /* mount name("Disk") */
-    uint32_t size;    /* FILL: byte budget (0 = fill until NOSPC) */
+    uint32_t size;       /* FILL: byte budget (0 = fill until NOSPC) */
+    uint64_t lba;        /* RAW_READ: first sector */
+    uint32_t length;     /* RAW_READ: bytes to read (<= USER_DISK_RAW_MAX) */
 } user_req_disk_t;
 
+/* Largest raw read the proxy will forward in one reply. */
+#define USER_DISK_RAW_MAX 1024
+
 typedef struct {
-    int32_t ret;
-    uint64_t bytes;   /* FILL: bytes written to fill.bin */
+    int32_t  ret;
+    uint64_t bytes;   /* FILL: bytes written to fill.bin;
+                       * RAW_READ: bytes actually returned in raw[] */
     char     detail[64];
+    /* DISK_CHECK (mirrors drv_check_report_t) */
+    uint32_t check_magic_ok;
+    uint32_t check_inodes_total;
+    uint32_t check_inodes_used;
+    uint32_t check_files;
+    uint32_t check_dirs;
+    uint32_t check_used_blocks;
+    uint32_t check_free_blocks;
+    uint32_t check_errors;
+    uint32_t check_first_error;
+    char     check_note[64];
+    /* DISK_INFO (mirrors drv_info_t) */
+    char     info_driver[64];
+    char     info_mount[64];
+    uint32_t info_read_only;
+    uint32_t info_block_size;
+    uint32_t info_total_blocks;
+    uint32_t info_used_blocks;
+    uint32_t info_inode_total;
+    uint32_t info_inode_used;
+    uint32_t info_persistent;
+    uint64_t info_uuid_hi;
+    uint64_t info_uuid_lo;
+    /* DISK_RAW_READ payload */
+    uint8_t  raw[USER_DISK_RAW_MAX];
 } user_resp_disk_t;
+
+/* SVC_*: admin proxy to the manager's control port.  The request
+ * carries the manager's own SVC_OP_* opcode plus an optional service
+ * name; the reply is a svc_resp_t verbatim (user/services/manager/
+ * manager.h), so the proxy adds no protocol of its own. */
+typedef struct {
+    uint32_t op; /* SVC_OP_* */
+    char     name[SVC_NAME_MAX];
+} user_req_svc_t;
 
 /* Compile-time guard: every message fits the 4096-byte IPC limit. */
 #define USER_IPC_MAX 4096
+_Static_assert(sizeof(svc_resp_t) <= USER_IPC_MAX, "svc_resp_t exceeds the IPC limit");
+_Static_assert(sizeof(user_req_svc_t) <= USER_IPC_MAX, "user_req_svc_t exceeds the IPC limit");
+_Static_assert(sizeof(user_resp_disk_t) <= USER_IPC_MAX, "user_resp_disk_t exceeds the IPC limit");
 
 #endif /* USER_H */

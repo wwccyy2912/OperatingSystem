@@ -19,7 +19,10 @@
  *
  * ------------------------------------------------------------------
  * Structure (string):
- *   mem and str families (length, copy, compare, search, tokenize).
+ *   mem and str families (length, copy, compare, search, tokenize) plus
+ *   the bounded/BSD/GNU extensions (strnlen/strndup/strlcpy/strlcat/
+ *   strsep/memmem) and the "C"-locale collation entry points
+ *   (strcoll/strxfrm).
  * How it works:
  *   Byte-wise loops (word-at-a-time only where alignment is proven);
  *   all functions are NUL-termination aware per C semantics.
@@ -251,6 +254,31 @@ char *strerror(int errnum) {
     return (char *)"Unknown error";
 }
 
+/**
+ * @brief strerror_r, GNU flavour: message text for @p errnum.
+ *
+ * The GNU signature returns char * (the XSI one returns int); the
+ * string is either the caller's @p buf or strerror()'s static table
+ * entry, so the result must never be freed.  @p buf is always
+ * NUL-terminated when it is used, truncated to @p buflen - 1 bytes.
+ *
+ * @param errnum  Error number; unknown values give "Unknown error".
+ * @param buf     Caller buffer, or NULL to use the static string.
+ * @param buflen  Size of @p buf in bytes (0 = use the static string).
+ * @return Pointer to the message (never NULL).
+ */
+char *strerror_r(int errnum, char *buf, size_t buflen) {
+    const char *msg = strerror(errnum);
+    if (!buf || buflen == 0)
+        return (char *)msg;
+    size_t len = strlen(msg);
+    if (len > buflen - 1)
+        len = buflen - 1;
+    memcpy(buf, msg, len);
+    buf[len] = '\0';
+    return buf;
+}
+
 /* Thread-unsafe strtok (uses internal state) */
 static char *s_strtok_save = NULL;
 
@@ -280,6 +308,147 @@ char *strtok_r(char *str, const char *delim, char **saveptr) {
         *saveptr = NULL;
     }
     return str;
+}
+
+/* ====================================================================
+ * Bounded / BSD / GNU extensions
+ *
+ * strnlen/strndup bound the read, strlcpy/strlcat bound the write and
+ * report the untruncated length (so callers can detect truncation),
+ * strsep splits destructively on a byte set, memmem searches a binary
+ * buffer.  All of them require non-NULL arguments exactly as the BSD /
+ * GNU documentation specifies; the NULL cases that are cheap to check
+ * (strndup, strsep, strlcpy/strlcat) fail safe rather than crash.
+ * ==================================================================== */
+
+/**
+ * @brief Length of @p s, at most @p maxlen bytes.
+ * @return Number of bytes before the NUL, capped at @p maxlen.
+ */
+size_t strnlen(const char *s, size_t maxlen) {
+    size_t n = 0;
+    while (n < maxlen && s[n] != '\0')
+        n++;
+    return n;
+}
+
+/**
+ * @brief Duplicate at most @p n bytes of @p s into malloc()'ed memory.
+ * @return New NUL-terminated string, or NULL for NULL @p s or a failed
+ *         allocation (errno is set by malloc in that case).
+ */
+char *strndup(const char *s, size_t n) {
+    if (!s)
+        return NULL;
+    size_t len  = strnlen(s, n);
+    char  *copy = (char *)malloc(len + 1);
+    if (!copy)
+        return NULL;
+    memcpy(copy, s, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+/**
+ * @brief BSD strsep: split @p *stringp at the first byte of @p delim.
+ *
+ * The delimiter is replaced by NUL and @p *stringp advances past it.
+ * Unlike strtok_r an empty token is returned for adjacent delimiters,
+ * and the caller's pointer is set to NULL once the string is consumed.
+ *
+ * @return Pointer to the token, or NULL when @p *stringp is NULL.
+ */
+char *strsep(char **stringp, const char *delim) {
+    if (!stringp || !*stringp || !delim)
+        return NULL;
+    char *start = *stringp;
+    char *end   = start + strcspn(start, delim);
+    if (*end != '\0') {
+        *end     = '\0';
+        *stringp = end + 1;
+    } else {
+        *stringp = NULL;
+    }
+    return start;
+}
+
+/**
+ * @brief BSD strlcpy: copy @p src into @p dest, never writing more than
+ *        @p size bytes (including the NUL).
+ * @return strlen(src); >= @p size means the copy was truncated.
+ */
+size_t strlcpy(char *dest, const char *src, size_t size) {
+    if (!src) {
+        if (dest && size > 0)
+            dest[0] = '\0';
+        return 0;
+    }
+    size_t srclen = strlen(src);
+    if (dest && size > 0) {
+        size_t n = srclen < size - 1 ? srclen : size - 1;
+        memcpy(dest, src, n);
+        dest[n] = '\0';
+    }
+    return srclen;
+}
+
+/**
+ * @brief BSD strlcat: append @p src to the NUL-terminated @p dest
+ *        without ever writing more than @p size bytes.
+ *
+ * @p dest is scanned for its NUL only within @p size bytes, so a
+ * caller whose buffer lost its terminator still cannot be overrun.
+ *
+ * @return strlen(dest) + strlen(src) for the untruncated result;
+ *         >= @p size means the append was truncated.
+ */
+size_t strlcat(char *dest, const char *src, size_t size) {
+    if (!dest || !src)
+        return 0;
+    size_t dlen = 0;
+    while (dlen < size && dest[dlen] != '\0')
+        dlen++;
+    if (dlen == size)
+        return size + strlen(src); /* no terminator in range: nothing to append to */
+    size_t slen  = strlen(src);
+    size_t avail = size - dlen - 1;
+    size_t n     = slen < avail ? slen : avail;
+    memcpy(dest + dlen, src, n);
+    dest[dlen + n] = '\0';
+    return dlen + slen;
+}
+
+/**
+ * @brief Collate two strings (C11 §7.24.4.3).
+ *
+ * Only the "C" locale exists in v0.9, so this is byte comparison —
+ * identical to strcmp() but locale-dependent by contract.
+ */
+int strcoll(const char *a, const char *b) {
+    return strcmp(a, b);
+}
+
+/**
+ * @brief Transform a string for collation (C11 §7.24.4.5).
+ *
+ * The "C" locale transformation is the identity, so this is a bounded
+ * copy: at most @p n bytes total including the terminating NUL.
+ *
+ * @return strlen(src); >= @p n means @p dest was truncated.
+ */
+size_t strxfrm(char *dest, const char *src, size_t n) {
+    if (!src) {
+        if (dest && n > 0)
+            dest[0] = '\0';
+        return 0;
+    }
+    size_t len = strlen(src);
+    if (dest && n > 0) {
+        size_t c = len < n - 1 ? len : n - 1;
+        memcpy(dest, src, c);
+        dest[c] = '\0';
+    }
+    return len;
 }
 
 /* ====================================================================
@@ -347,6 +516,27 @@ void *memchr(const void *s, int c, size_t n) {
     for (size_t i = 0; i < n; i++) {
         if (p[i] == ch)
             return (void *)(p + i);
+    }
+    return NULL;
+}
+
+/**
+ * @brief GNU memmem: first occurrence of @p needlelen bytes inside a
+ *        @p haystacklen-byte buffer (the buffer need not be NUL-safe).
+ *
+ * @return Pointer to the match, NULL when absent.  An empty needle
+ *         matches at the start, exactly like strstr().
+ */
+void *memmem(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
+    const unsigned char *h = (const unsigned char *)haystack;
+    const unsigned char *n = (const unsigned char *)needle;
+    if (needlelen == 0)
+        return (void *)haystack;
+    if (!h || !n || haystacklen < needlelen)
+        return NULL;
+    for (size_t i = 0; i + needlelen <= haystacklen; i++) {
+        if (h[i] == n[0] && memcmp(h + i, n, needlelen) == 0)
+            return (void *)(h + i);
     }
     return NULL;
 }

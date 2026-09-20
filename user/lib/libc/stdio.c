@@ -38,11 +38,16 @@
  *   Debug/console output for user services (the term screen is a
  *   separate service channel).
  * Caveats:
- *   No FILE streams; %f unsupported; output is rate-limited by the
- *   kernel token bucket, so hot loops can drop bytes.
+ *   This translation unit owns the formatter and the console shortcuts
+ *   only — FILE streams live in stdio_file.c; %f and wide/Unicode
+ *   alignment are unsupported (an unknown conversion is echoed
+ *   literally); output is rate-limited by the kernel token bucket and
+ *   capped at DEBUG_LOG_MAX (512) bytes per call, so hot loops can drop
+ *   bytes.
  * ------------------------------------------------------------------
  */
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -194,6 +199,9 @@ static void FormatNumber(
 static int FormatString(char *buf, int bufsize, const char *fmt, va_list args) {
     int pos = 0;
 
+    if (!fmt)
+        return -1;
+
     while (*fmt) {
         if (*fmt != '%') {
             EmitChar(buf, bufsize, &pos, *fmt);
@@ -207,6 +215,12 @@ static int FormatString(char *buf, int bufsize, const char *fmt, va_list args) {
             EmitChar(buf, bufsize, &pos, '%');
             fmt++;
             continue;
+        }
+        if (*fmt == '\0') {
+            /* Trailing '%': emit it and stop — the old code used to push
+             * a NUL byte into the output here. */
+            EmitChar(buf, bufsize, &pos, '%');
+            break;
         }
 
         struct fmt_spec s = {0};
@@ -466,8 +480,12 @@ int sprintf(char *buf, const char *fmt, ...) {
 }
 
 int vprintf(const char *fmt, va_list ap) {
+    /* 512 matches the kernel's DEBUG_LOG_MAX, so a longer render would
+     * only be truncated by the syscall anyway. */
     char buf[512];
-    int  len = vsnprintf(buf, sizeof(buf), fmt, ap);
+    if (!fmt)
+        return -1;
+    int len = vsnprintf(buf, sizeof(buf), fmt, ap);
     if (len > 0)
         DebugLog(buf);
     return len;
@@ -481,19 +499,10 @@ int printf(const char *fmt, ...) {
     return r;
 }
 
-int vfprintf(void *stream, const char *fmt, va_list ap) {
-    (void)stream;
-    return vprintf(fmt, ap);
-}
-
-int fprintf(void *stream, const char *fmt, ...) {
-    (void)stream;
-    va_list ap;
-    va_start(ap, fmt);
-    int r = vprintf(fmt, ap);
-    va_end(ap);
-    return r;
-}
+/* fprintf / vfprintf live in stdio_file.c: they need the FILE type and
+ * the buffered backend, while this translation unit only owns the
+ * formatted-output engine (vsnprintf) and the debug-log console
+ * shortcuts (printf / puts / putchar / getchar). */
 
 int puts(const char *str) {
     if (!str)
@@ -509,5 +518,14 @@ int putchar(int c) {
 }
 
 int getchar(void) {
-    return DebugGetchar();
+    /* DebugGetchar() hands back a negative ERR_* code (ERR_NOCAP for a
+     * process without the COM1 IO-port capability) which is an error,
+     * not a character: report it as EOF with errno set, like the FILE
+     * console path in stdio_file.c does. */
+    int c = DebugGetchar();
+    if (c < 0) {
+        errno = (c == ERR_NOCAP) ? EACCES : EIO;
+        return EOF;
+    }
+    return c;
 }

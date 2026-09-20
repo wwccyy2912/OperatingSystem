@@ -120,4 +120,41 @@ int System(const char *string);
  * by over-allocating and adjusting. */
 void *aligned_alloc(size_t alignment, size_t size);
 
+/* POSIX: allocate `size` bytes at `alignment` (a power of two and a
+ * multiple of sizeof(void *)); the pointer is written to *memptr.
+ * Returns 0 on success, EINVAL for a bad alignment, ENOMEM on failure
+ * (note: unlike malloc it reports errors through the return value, not
+ * errno).  Implemented by the runtime heap (user/runtime/malloc.c). */
+int posix_memalign(void **memptr, size_t alignment, size_t size);
+
+/* ====================================================================
+ * Integer division (C11 7.22.6)
+ * ==================================================================== */
+
+typedef struct { int quot; int rem; } div_t;
+typedef struct { long quot; long rem; } ldiv_t;
+typedef struct { long long quot; long long rem; } lldiv_t;
+
+div_t   div(int numer, int denom);
+ldiv_t  ldiv(long numer, long denom);
+lldiv_t lldiv(long long numer, long long denom);
+
+/* ====================================================================
+ * Floating-point / string conversion (C11 7.22.1.3) — parsing only,
+ * the libc has no floating-point printf.
+ * ==================================================================== */
+
+double      atof(const char *s);
+double      strtod(const char *s, char **endptr);
+float       strtof(const char *s, char **endptr);
+long double strtold(const char *s, char **endptr);
+
+/* ====================================================================
+ * Multibyte / wide conversion (C11 7.22.8) — UTF-8 is the only
+ * supported multibyte encoding.
+ * ==================================================================== */
+
+size_t mbstowcs(wchar_t *dest, const char *src, size_t n);
+size_t wcstombs(char *dest, const wchar_t *src, size_t n);
+
 #endif /* LIBC_STDLIB_H */

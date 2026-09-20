@@ -178,6 +178,10 @@ int IoWrite16(unsigned short port, unsigned short val);
 /* --- System power --- */
 int sys_reboot(void);
 int sys_shutdown(void);
+/* Halt: park the CPU with interrupts disabled (no reset, no ACPI).
+ * Gated on ATOM_SYS_SHUTDOWN like reboot/shutdown; does not return on
+ * success, or returns ERR_NOCAP / ERR_FAULT. */
+int sys_halt(void);
 int sys_panic(void); /* TEMP test hook: trigger a kernel panic */
 
 /* --- Init protocol --- */

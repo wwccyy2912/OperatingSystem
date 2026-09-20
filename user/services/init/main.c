@@ -1627,6 +1627,19 @@ static void TestP2NotifyForeign(void) {
     P2_PASS();
 }
 
+/* ---- P2 test 6: halt gate (ATOM_SYS_SHUTDOWN, v0.9) ---- */
+
+static void TestP2HaltUnauthorized(void) {
+    P2_TEST("halt unauthorized -> ERR_NOCAP");
+    /* Like reboot, but stronger: a misplaced gate would park the CPU
+     * inside the syscall and this line would never print.  init holds
+     * no ATOM_SYS_SHUTDOWN capability, so the gate must refuse. */
+    int ret = sys_halt();
+    printf("(ret=%d) ", ret);
+    P2_ASSERT(ret == ERR_NOCAP, "unauthorized halt accepted");
+    P2_PASS();
+}
+
 /* ---- P2 test 5: console input is COM1-driver only ---- */
 
 static void TestP2DebugGetcharGate(void) {
@@ -1646,6 +1659,7 @@ static void RunP2GateTests(void) {
     TestP2SetTimeUnauthorized();
     TestP2SetTimeAuthorized();
     TestP2RebootUnauthorized();
+    TestP2HaltUnauthorized();
     TestP2NotifyForeign();
     TestP2DebugGetcharGate();
     printf("=== P2 Gate: %d/%d passed ===\n", p2_pass, p2_run);
@@ -2481,6 +2495,576 @@ static void RunZeroCopyTests(void) {
     printf("=== P5 Zero-Copy Read: %d/%d passed ===\n", p5_pass, p5_run);
 }
 
+/* ====================================================================
+ * P6: permission model P3/P4 + VFS object model (v1.0)
+ *
+ * P1 covered the role/grant core, P2 the kernel-side gates.  This suite
+ * exercises what v1.0 made real:
+ *   - grant lifecycle   : TTL expiry and scope matching
+ *   - context binding   : a background subject is refused WITHOUT a
+ *                         Powerbox prompt (no panel spam)
+ *   - frequency policy  : repeated denials quarantine the subject
+ *   - audit trail       : every decision/state change is recorded
+ *   - policy snapshot   : save → load round-trip
+ *   - VFS object model  : fstat-by-handle, truncate, bookmark expiry +
+ *                         renewal, move-cycle guard, name validation
+ *
+ * The probe access is VFS_ACCESS_EXEC on the P1 resource: AtomFromAccess()
+ * maps it to ATOM_NONE, and no seeded rule mentions ATOM_NONE, so it
+ * always falls through to the default-deny branch — which is exactly what
+ * a "does the Powerbox fire?" test needs, independently of any role.
+ * ==================================================================== */
+
+static int p6_run  = 0;
+static int p6_pass = 0;
+
+#define P6_TEST(name)                  \
+    do {                               \
+        printf("  P6: %s ... ", name); \
+        p6_run++;                      \
+    } while (0)
+
+#define P6_PASS()         \
+    do {                  \
+        p6_pass++;        \
+        printf("PASS\n"); \
+    } while (0)
+
+#define P6_ASSERT(cond, msg)       \
+    do {                           \
+        if (!(cond)) {             \
+            printf("FAIL: %s\n", msg); \
+            return;                \
+        }                          \
+    } while (0)
+
+/* ---- plumbing ------------------------------------------------------ */
+
+static int P6PermPort(void) {
+    for (int i = 0; i < 200; i++) {
+        int p = PortGet("perm");
+        if (p >= 0)
+            return p;
+        Sleep(10);
+    }
+    return -1;
+}
+
+/* One request/reply against the live perm engine.  The opcode travels
+ * inside the request record (every perm_req_* starts with `u32 op`), so
+ * this helper does not need it as a separate argument. */
+static int P6PermCall(u32 op, const void *req, int req_len, void *resp, int resp_len) {
+    (void)op;
+    int port = P6PermPort();
+    if (port < 0)
+        return -1;
+    int rl = resp_len;
+    int r  = IpcCall(port, req, req_len, resp, &rl);
+    if (r < 0)
+        return r;
+    return 0;
+}
+
+/* Direct CHECK against g_p1_res (the System/Kernel/init.elf resource the
+ * P1 suite resolved).  Returns resp.ret; *flags / *query carry the
+ * decision flags and the Powerbox query id. */
+static int P6Check(u64 subject, u32 access, u64 scope, u32 *flags, u32 *query) {
+    static perm_req_check_t req; /* carries a 1 KB URL field */
+    memset(&req, 0, sizeof(req));
+    req.op         = PERM_OP_CHECK;
+    req.resource   = g_p1_res;
+    req.access     = access;
+    req.scope_hash = scope;
+    req.subject_id = subject;
+    strncpy(req.url, P1_ITEM_PATH, sizeof(req.url) - 1);
+
+    perm_resp_check_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int r = P6PermCall(PERM_OP_CHECK, &req, (int)sizeof(req), &resp, (int)sizeof(resp));
+    if (r < 0)
+        return r;
+    if (flags)
+        *flags = resp.flags;
+    if (query)
+        *query = resp.query_id;
+    return resp.ret;
+}
+
+/* Seed one grant through the management path (init holds the atom). */
+static int P6Grant(u64 subject, u32 access, u64 expiry_ticks, u32 scope_hash) {
+    static perm_req_grant_t req;
+    memset(&req, 0, sizeof(req));
+    req.op           = PERM_OP_GRANT;
+    req.resource     = g_p1_res;
+    req.access       = access;
+    req.subject_id   = subject;
+    req.atom         = ATOM_DATA_DOCS_READ;
+    req.expiry_ticks = expiry_ticks;
+    req.scope_hash   = scope_hash;
+    req.source       = PERM_SRC_DIRECT;
+
+    perm_resp_grant_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int r = P6PermCall(PERM_OP_GRANT, &req, (int)sizeof(req), &resp, (int)sizeof(resp));
+    if (r < 0)
+        return r;
+    return resp.ret;
+}
+
+/* ---- P6.1: grant TTL ---------------------------------------------- */
+
+static void TestP6GrantTtl(void) {
+    P6_TEST("grant TTL: an expired grant stops authorizing");
+    u64 me = GetSubject();
+
+    /* Drop any leftover grant from an earlier run of the suite. */
+    (void)P6Check(me, VFS_ACCESS_EXEC, 0, NULL, NULL);
+
+    u64 ttl = 60; /* ticks (600 ms at 100 Hz) */
+    P6_ASSERT(P6Grant(me, VFS_ACCESS_EXEC, (u64)GetTime() + ttl, 0) == 0, "grant failed");
+
+    u32 flags = 0;
+    int r = P6Check(me, VFS_ACCESS_EXEC, 0, &flags, NULL);
+    P6_ASSERT(r == 0, "fresh grant did not authorize");
+    P6_ASSERT((flags & PERM_DEC_GRANT_BEAT) != 0, "grant beat flag missing");
+
+    Sleep((int)ttl + 30);
+    flags = 0;
+    r     = P6Check(me, VFS_ACCESS_EXEC, 0, &flags, NULL);
+    P6_ASSERT(r != 0, "expired grant still authorized");
+    P6_PASS();
+}
+
+/* ---- P6.2: scope matching ----------------------------------------- */
+
+static void TestP6ScopeMatch(void) {
+    P6_TEST("grant scope: only the granted scope authorizes");
+    u64 me = GetSubject();
+
+    P6_ASSERT(P6Grant(me, VFS_ACCESS_EXEC, 0, 0xA1B2C3D4u) == 0, "scoped grant failed");
+
+    u32 flags = 0;
+    int r = P6Check(me, VFS_ACCESS_EXEC, 0xA1B2C3D4u, &flags, NULL);
+    P6_ASSERT(r == 0, "matching scope did not authorize");
+    P6_ASSERT((flags & PERM_DEC_GRANT_BEAT) != 0, "grant beat flag missing");
+
+    /* A different scope must NOT be covered by the same grant. */
+    r = P6Check(me, VFS_ACCESS_EXEC, 0x5E5E5E5Eu, &flags, NULL);
+    P6_ASSERT(r != 0, "different scope was authorized by the same grant");
+    P6_ASSERT((flags & PERM_DEC_SCOPE_MISMATCH) != 0, "scope mismatch flag missing");
+    P6_PASS();
+}
+
+/* ---- P6.3: context-aware decisions -------------------------------- */
+
+static void TestP6ContextDeny(void) {
+    P6_TEST("context: background subject is denied without a prompt");
+    u64 me = GetSubject();
+
+    /* Clear the scope grant from P6.2 so the request falls through to
+     * the default-deny branch.  The revoke is deliberately limited to
+     * THIS resource: an all-resources revoke would also drop the grants
+     * the later VFS tests rely on (they open/write files through the
+     * normal role chain). */
+    static perm_req_revoke_t rv;
+    memset(&rv, 0, sizeof(rv));
+    rv.op         = PERM_OP_REVOKE;
+    rv.subject_id = me;
+    rv.resource   = g_p1_res;
+    static perm_resp_revoke_t rvr;
+    (void)P6PermCall(PERM_OP_REVOKE, &rv, (int)sizeof(rv), &rvr, (int)sizeof(rvr));
+
+    /* Background: refused, and NO Powerbox query is created. */
+    static perm_req_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.op         = PERM_OP_CONTEXT;
+    ctx.subject_id = me;
+    ctx.foreground = 0;
+    static perm_resp_context_t ctxr; /* 16 entries — keep off the 4 KiB boot stack */
+    memset(&ctxr, 0, sizeof(ctxr));
+    P6_ASSERT(P6PermCall(PERM_OP_CONTEXT, &ctx, (int)sizeof(ctx), &ctxr, (int)sizeof(ctxr)) == 0 &&
+                  ctxr.ret == 0,
+              "context set failed");
+
+    u32 flags = 0, query = 0;
+    int r = P6Check(me, VFS_ACCESS_EXEC, 0, &flags, &query);
+    P6_ASSERT(r != 0, "background subject was authorized");
+    P6_ASSERT((flags & PERM_DEC_BACKGROUND) != 0, "background flag missing");
+    P6_ASSERT(query == 0, "background denial raised a Powerbox query");
+
+    /* Foreground: the same request now raises a pending query. */
+    ctx.foreground = 1;
+    memset(&ctxr, 0, sizeof(ctxr));
+    P6_ASSERT(P6PermCall(PERM_OP_CONTEXT, &ctx, (int)sizeof(ctx), &ctxr, (int)sizeof(ctxr)) == 0,
+              "context restore failed");
+    r = P6Check(me, VFS_ACCESS_EXEC, 0, &flags, &query);
+    P6_ASSERT(r != 0, "foreground default-deny should still refuse");
+    P6_ASSERT((flags & PERM_DEC_BACKGROUND) == 0, "foreground flagged as background");
+    P6_ASSERT(query != 0, "foreground denial did not create a Powerbox query");
+    P6_PASS();
+}
+
+/* ---- P6.4: frequency policy / quarantine -------------------------- */
+
+static void TestP6Quarantine(void) {
+    P6_TEST("frequency: repeated denials quarantine the subject");
+    u64 me = GetSubject();
+
+    /* Hammer the default-deny path (quiet mode is on: no panels). */
+    for (int i = 0; i < PERM_DENY_THRESHOLD + 2; i++)
+        (void)P6Check(me, VFS_ACCESS_EXEC, 0, NULL, NULL);
+
+    static perm_req_freq_t fq;
+    memset(&fq, 0, sizeof(fq));
+    fq.op         = PERM_OP_FREQ;
+    fq.subject_id = me;
+    static perm_resp_freq_t fqr;
+    memset(&fqr, 0, sizeof(fqr));
+    P6_ASSERT(P6PermCall(PERM_OP_FREQ, &fq, (int)sizeof(fq), &fqr, (int)sizeof(fqr)) == 0 &&
+                  fqr.ret == 0,
+              "freq query failed");
+    P6_ASSERT(fqr.quarantined == 1, "subject was not quarantined after the threshold");
+
+    u32 flags = 0, query = 0xFFFFFFFFu;
+    int r = P6Check(me, VFS_ACCESS_EXEC, 0, &flags, &query);
+    P6_ASSERT(r != 0, "quarantined subject was authorized");
+    P6_ASSERT((flags & PERM_DEC_QUARANTINED) != 0, "quarantine flag missing");
+    P6_ASSERT(query == 0, "quarantined denial raised a Powerbox query");
+
+    /* Manual release must restore normal behaviour. */
+    memset(&fq, 0, sizeof(fq));
+    fq.op               = PERM_OP_FREQ;
+    fq.subject_id       = me;
+    fq.clear_quarantine = 1;
+    memset(&fqr, 0, sizeof(fqr));
+    P6_ASSERT(P6PermCall(PERM_OP_FREQ, &fq, (int)sizeof(fq), &fqr, (int)sizeof(fqr)) == 0,
+              "quarantine release failed");
+
+    flags = 0;
+    r     = P6Check(me, VFS_ACCESS_EXEC, 0, &flags, &query);
+    P6_ASSERT((flags & PERM_DEC_QUARANTINED) == 0, "still quarantined after release");
+    P6_PASS();
+}
+
+/* ---- P6.5: audit trail -------------------------------------------- */
+
+static void TestP6Audit(void) {
+    P6_TEST("audit: decisions and state changes are recorded");
+    perm_req_audit_t req;
+    memset(&req, 0, sizeof(req));
+    req.op = PERM_OP_AUDIT;
+
+    /* perm_resp_audit_t is ~3.6 KB (64 entries).  A user thread only
+     * has USER_STACK_PAGES = 4 pages (16 KiB), which is why every large
+     * protocol record in this file is static — a stack copy here used to
+     * overflow and take init down with a user-mode #PF. */
+    static perm_resp_audit_t resp;
+    memset(&resp, 0, sizeof(resp));
+    P6_ASSERT(P6PermCall(PERM_OP_AUDIT, &req, (int)sizeof(req), &resp, (int)sizeof(resp)) == 0 &&
+                  resp.ret == 0,
+              "audit export failed");
+    P6_ASSERT(resp.count > 0, "audit ring is empty");
+
+    int seen_context = 0, seen_quarantine = 0, seen_allow = 0;
+    for (u32 i = 0; i < resp.count; i++) {
+        if (resp.entries[i].event == PERM_EV_CONTEXT)
+            seen_context = 1;
+        if (resp.entries[i].event == PERM_EV_QUARANTINE)
+            seen_quarantine = 1;
+        if (resp.entries[i].event == PERM_EV_CHECK_ALLOW)
+            seen_allow = 1;
+    }
+    P6_ASSERT(seen_context, "no PERM_EV_CONTEXT entry");
+    P6_ASSERT(seen_quarantine, "no PERM_EV_QUARANTINE entry");
+    P6_ASSERT(seen_allow, "no PERM_EV_CHECK_ALLOW entry");
+    P6_PASS();
+}
+
+/* ---- P6.6: policy snapshot round-trip ----------------------------- */
+
+static void TestP6PolicyRoundTrip(void) {
+    P6_TEST("policy: save → load round-trip (roles + rules survive)");
+    static perm_req_policy_t  save_req;
+    static perm_resp_policy_t save_resp;
+    memset(&save_req, 0, sizeof(save_req));
+    save_req.op              = PERM_OP_POLICY_SAVE;
+    save_req.include_expired = 0;
+    memset(&save_resp, 0, sizeof(save_resp));
+    P6_ASSERT(P6PermCall(PERM_OP_POLICY_SAVE, &save_req, (int)sizeof(save_req), &save_resp,
+                          (int)sizeof(save_resp)) == 0 &&
+                  save_resp.ret == 0,
+              "policy save failed");
+    P6_ASSERT(save_resp.size > 16, "policy snapshot is empty");
+
+    static perm_req_policy_t load_req;
+    static perm_resp_policy_t load_resp;
+    memset(&load_req, 0, sizeof(load_req));
+    load_req.op   = PERM_OP_POLICY_LOAD;
+    load_req.size = save_resp.size;
+    memcpy(load_req.data, save_resp.data, save_resp.size);
+    memset(&load_resp, 0, sizeof(load_resp));
+    P6_ASSERT(P6PermCall(PERM_OP_POLICY_LOAD, &load_req, (int)sizeof(load_req), &load_resp,
+                          (int)sizeof(load_resp)) == 0 &&
+                  load_resp.ret == 0,
+              "policy load rejected its own snapshot");
+
+    /* A snapshot restores roles and grants — the rule table is static
+     * policy and must survive untouched.  Assert both, because a load
+     * that loses the caller's role turns every later VFS operation into
+     * a default deny (which is exactly the failure this assertion was
+     * written to catch). */
+    static perm_req_dump_t dreq;
+    static perm_resp_dump_t dresp;
+    memset(&dreq, 0, sizeof(dreq));
+    dreq.op = PERM_OP_DUMP;
+    memset(&dresp, 0, sizeof(dresp));
+    P6_ASSERT(P6PermCall(PERM_OP_DUMP, &dreq, (int)sizeof(dreq), &dresp, (int)sizeof(dresp)) == 0 &&
+                  dresp.ret == 0,
+              "dump after load failed");
+    printf("(roles=%u rules=%u grants=%u) ", dresp.role_count, dresp.rule_count, dresp.grant_count);
+    P6_ASSERT(dresp.rule_count > 0, "policy load wiped the rule table");
+    P6_ASSERT(dresp.role_count > 0, "policy load lost every role");
+
+    /* The caller's own role must still authorize an ordinary read. */
+    u32 flags = 0;
+    int r = P6Check(GetSubject(), VFS_ACCESS_READ, 0, &flags, NULL);
+    if (r != 0) {
+        printf("\n    policy dump after load:\n");
+        for (u32 i = 0; i < 8 && dresp.lines[i][0]; i++)
+            printf("      | %s\n", dresp.lines[i]);
+        printf("    check(ret=%d flags=0x%x)\n", r, flags);
+    }
+    P6_ASSERT(r == 0, "OWNER lost READ authorization across policy load");
+    P6_PASS();
+}
+
+/* ---- P6.7: VFS fstat-by-handle ------------------------------------ */
+
+static void TestP6VfsStatHandle(void) {
+    P6_TEST("vfs: fstat by handle matches the path metadata");
+    static vfs_item_info_t via_path; /* ~300 B each: static, boot stack is 4 KiB */
+    P6_ASSERT(FsGetItem("/" P1_ITEM_PATH, &via_path) == 0, "FsGetItem failed");
+
+    vfs_handle_t h = 0;
+    P6_ASSERT(FsOpenItem("/" P1_ITEM_PATH, VFS_OPEN_READONLY, VFS_ACCESS_READ, &h) == 0,
+              "FsOpenItem failed");
+
+    static vfs_item_info_t via_handle;
+    memset(&via_handle, 0, sizeof(via_handle));
+    int r = FsStatHandle(h, &via_handle);
+    P6_ASSERT(r == 0, "FsStatHandle failed");
+    P6_ASSERT(via_handle.size == via_path.size, "handle size != path size");
+    P6_ASSERT(via_handle.item_id == via_path.item_id, "handle itemID != path itemID");
+    P6_ASSERT(strcmp(via_handle.name, via_path.name) == 0, "handle name mismatch");
+    (void)FsClose(h);
+    P6_PASS();
+}
+
+/* ---- P6.8: VFS truncate ------------------------------------------- */
+
+static void TestP6VfsTruncate(void) {
+    P6_TEST("vfs: truncate shrinks and re-grows with zeros");
+    const char *url = "/Volumes/Users/_p6_trunc.txt";
+
+    vfs_handle_t h = 0;
+    /* READ|WRITE on purpose: the test reads the grown range back, and a
+     * handle must carry the right it actually exercises. */
+    int r = FsOpenItem(url, VFS_OPEN_CREATE | VFS_OPEN_TRUNCATE,
+                        VFS_ACCESS_READ | VFS_ACCESS_WRITE, &h);
+    P6_ASSERT(r == 0, "create failed");
+
+    const char *payload = "0123456789";
+    P6_ASSERT(FsWrite(h, 0, payload, 10) == 0, "write failed");
+
+    u64 size = 0;
+    P6_ASSERT(FsTruncate(h, 4, &size) == 0 && size == 4, "shrink failed");
+
+    static vfs_item_info_t info;
+    memset(&info, 0, sizeof(info));
+    P6_ASSERT(FsStatHandle(h, &info) == 0 && info.size == 4, "size after shrink != 4");
+
+    P6_ASSERT(FsTruncate(h, 12, &size) == 0 && size == 12, "grow failed");
+    memset(&info, 0, sizeof(info));
+    P6_ASSERT(FsStatHandle(h, &info) == 0 && info.size == 12, "size after grow != 12");
+
+    /* The grown range must read back as zeros. */
+    u8  tail[8];
+    u32 got = 0;
+    memset(tail, 0xAA, sizeof(tail));
+    P6_ASSERT(FsRead(h, 4, tail, sizeof(tail), &got) == 0 && got == 8, "read of grown range failed");
+    for (u32 i = 0; i < got; i++)
+        P6_ASSERT(tail[i] == 0, "grown range is not zero-filled");
+
+    (void)FsClose(h);
+    (void)FsDeleteItem(url, 1);
+    P6_PASS();
+}
+
+/* ---- P6.9: bookmark expiry + renewal ------------------------------ */
+
+static void TestP6BookmarkExpiry(void) {
+    P6_TEST("vfs: an expired bookmark is stale, refresh revives it");
+
+    static vfs_req_create_bookmark_t req; /* ~1 KB: static (4 KiB boot stack) */
+    memset(&req, 0, sizeof(req));
+    req.op         = VFS_OP_CREATE_BOOKMARK;
+    req.access     = VFS_ACCESS_READ;
+    req.expiry_ticks = (u64)GetTime() + 40; /* 400 ms */
+    strncpy(req.path, P1_ITEM_PATH, sizeof(req.path) - 1);
+
+    int vfs_port = P1PortGet("vfs");
+    P6_ASSERT(vfs_port > 0, "vfs port unavailable");
+
+    static vfs_resp_create_bookmark_t cr; /* ~260 B: keep off the 16 KiB stack */
+    memset(&cr, 0, sizeof(cr));
+    int rl = (int)sizeof(cr);
+    P6_ASSERT(IpcCall(vfs_port, &req, (int)sizeof(req), &cr, &rl) == 0 && cr.ret == 0,
+              "create bookmark failed");
+
+    /* Resolve before the deadline: fine. */
+    static vfs_req_resolve_bookmark_t rq;
+    memset(&rq, 0, sizeof(rq));
+    rq.op     = VFS_OP_RESOLVE_BOOKMARK;
+    rq.bk_len = cr.bk_len;
+    memcpy(rq.data, cr.data, cr.bk_len);
+    static vfs_resp_resolve_bookmark_t rr; /* ~300 B: static, see above */
+    memset(&rr, 0, sizeof(rr));
+    int rl2 = (int)sizeof(rr);
+    P6_ASSERT(IpcCall(vfs_port, &rq, (int)sizeof(rq), &rr, &rl2) == 0 && rr.ret == 0,
+              "fresh bookmark failed to resolve");
+    (void)FsClose(rr.handle);
+
+    Sleep(60); /* past the deadline */
+
+    memset(&rr, 0, sizeof(rr));
+    rl2 = (int)sizeof(rr);
+    P6_ASSERT(IpcCall(vfs_port, &rq, (int)sizeof(rq), &rr, &rl2) == 0, "resolve call failed");
+    P6_ASSERT(rr.ret == VFS_ERR_STALE, "expired bookmark was not reported stale");
+
+    /* Renew it (forever) and resolve again. */
+    static u8 new_blob[VFS_BOOKMARK_MAX];
+    u32       new_len = 0;
+    u64 new_exp = 1;
+    P6_ASSERT(FsRefreshBookmark(cr.data, cr.bk_len, 0, new_blob, &new_len, &new_exp) == 0,
+              "refresh failed");
+    P6_ASSERT(new_len > 0, "refresh returned an empty blob");
+    P6_ASSERT(new_exp == 0, "refresh did not make the bookmark permanent");
+
+    memset(&rq, 0, sizeof(rq));
+    rq.op     = VFS_OP_RESOLVE_BOOKMARK;
+    rq.bk_len = new_len;
+    memcpy(rq.data, new_blob, new_len);
+    memset(&rr, 0, sizeof(rr));
+    rl2 = (int)sizeof(rr);
+    P6_ASSERT(IpcCall(vfs_port, &rq, (int)sizeof(rq), &rr, &rl2) == 0 && rr.ret == 0,
+              "refreshed bookmark failed to resolve");
+    (void)FsClose(rr.handle);
+    P6_PASS();
+}
+
+/* ---- P6.10: namespace guards -------------------------------------- */
+
+static void TestP6NamespaceGuards(void) {
+    P6_TEST("vfs: move-cycle guard and name validation");
+    P6_ASSERT(FsCreateDir("/Volumes/Users/_p6a") == 0, "mkdir _p6a failed");
+    P6_ASSERT(FsCreateDir("/Volumes/Users/_p6a/_p6b") == 0, "mkdir _p6b failed");
+
+    /* Moving _p6a into its own child must be refused. */
+    int vfs_port = P1PortGet("vfs");
+    P6_ASSERT(vfs_port > 0, "vfs port unavailable");
+
+    static vfs_req_move_t mv; /* carries two 1 KB path fields */
+    memset(&mv, 0, sizeof(mv));
+    mv.op = VFS_OP_MOVE;
+    strncpy(mv.src, "/Volumes/Users/_p6a", sizeof(mv.src) - 1);
+    strncpy(mv.dst_dir, "/Volumes/Users/_p6a/_p6b", sizeof(mv.dst_dir) - 1);
+    strncpy(mv.new_name, "_p6a", sizeof(mv.new_name) - 1);
+    static vfs_resp_move_t mvr;
+    memset(&mvr, 0, sizeof(mvr));
+    int rl = (int)sizeof(mvr);
+    P6_ASSERT(IpcCall(vfs_port, &mv, (int)sizeof(mv), &mvr, &rl) == 0, "move call failed");
+    P6_ASSERT(mvr.ret == ERR_INVAL, "move into own subtree was accepted");
+
+    /* Reserved names must be rejected by CREATE_DIR. */
+    static vfs_req_create_dir_t cd; /* 1 KB path field */
+    memset(&cd, 0, sizeof(cd));
+    cd.op = VFS_OP_CREATE_DIR;
+    strncpy(cd.path, "/Volumes/Users/..", sizeof(cd.path) - 1);
+    static vfs_resp_create_dir_t cdr;
+    memset(&cdr, 0, sizeof(cdr));
+    rl = (int)sizeof(cdr);
+    P6_ASSERT(IpcCall(vfs_port, &cd, (int)sizeof(cd), &cdr, &rl) == 0, "mkdir call failed");
+    P6_ASSERT(cdr.ret == ERR_INVAL, "reserved name '..' was accepted");
+
+    (void)FsDeleteItem("/Volumes/Users/_p6a", 1);
+    P6_PASS();
+}
+
+/* ---- P6 cleanup --------------------------------------------------- */
+
+/* Drain every pending Powerbox query this suite raised.
+ *
+ * P6's default-deny probes deliberately CREATE queries (that is how the
+ * context test proves the foreground path still prompts).  P1 runs right
+ * after this suite and asserts that a chain-deny raises NO prompt — a
+ * leftover pending query would look exactly like a leak, so the table is
+ * emptied before we hand the boot sequence on.  Answering with allow=0
+ * marks each query DENIED and creates no grant. */
+static void P6DrainQueries(void) {
+    static perm_req_query_t  q;  /* carries a 1 KB URL field */
+    static perm_resp_query_t qr;
+    static perm_req_answer_t a;
+    static perm_resp_answer_t ar;
+
+    for (int i = 0; i < 8; i++) {
+        memset(&q, 0, sizeof(q));
+        q.op       = PERM_OP_QUERY;
+        q.query_id = 0; /* first pending */
+        memset(&qr, 0, sizeof(qr));
+        if (P6PermCall(PERM_OP_QUERY, &q, (int)sizeof(q), &qr, (int)sizeof(qr)) < 0)
+            return;
+        if (qr.ret != 0)
+            return; /* ERR_NOENT: nothing left pending */
+
+        memset(&a, 0, sizeof(a));
+        a.op       = PERM_OP_ANSWER;
+        a.query_id = qr.query_id;
+        a.allow    = 0;
+        memset(&ar, 0, sizeof(ar));
+        (void)P6PermCall(PERM_OP_ANSWER, &a, (int)sizeof(a), &ar, (int)sizeof(ar));
+    }
+}
+
+/* ---- P6 runner ---------------------------------------------------- */
+
+static void RunPermissionsP3P4Tests(void) {
+    printf("\n=== P6 Permission P3/P4 + VFS object model ===\n");
+
+    /* This suite runs while init is still OWNER (before P1's role
+     * hot-reload test demotes it to GUEST for the rest of boot), so the
+     * VFS half can exercise the ordinary role-chain path.  Resolve the
+     * shared resource first: g_p1_res is filled by P1WaitReady(), which
+     * performs one authorized CREATE_BOOKMARK and remembers the
+     * (volume UUID, itemID) pair every grant below keys on. */
+    int vfs_port = P1PortGet("vfs");
+    if (vfs_port < 0 || P1WaitReady(vfs_port) < 0) {
+        printf("  P6: SKIPPED (vfs/perm not ready)\n");
+        return;
+    }
+    TestP6GrantTtl();
+    TestP6ScopeMatch();
+    TestP6ContextDeny();
+    TestP6Quarantine();
+    TestP6Audit();
+    TestP6PolicyRoundTrip();
+    TestP6VfsStatHandle();
+    TestP6VfsTruncate();
+    TestP6BookmarkExpiry();
+    TestP6NamespaceGuards();
+    P6DrainQueries(); /* leave no pending prompt for P1 to trip over */
+    printf("=== P6 Permission/VFS: %d/%d passed ===\n", p6_pass, p6_run);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Boot selftest fail-fast (v0.5: startup/self-check optimization)   */
 /* ------------------------------------------------------------------ */
@@ -2528,6 +3112,16 @@ int main(void) {
     }
     printf("init: service manager PID=%d\n", mgr_pid);
 
+    /* P6 (v1.0) runs FIRST, while this process is still seeded OWNER:
+     * it covers the permission model's P3/P4 layers and the completed
+     * VFS object model, both of which need a subject that the ordinary
+     * role chain authorizes.  P1's role hot-reload test deliberately
+     * demotes init to GUEST afterwards (and asserts it can no longer
+     * promote itself), so anything needing OWNER must run before it. */
+    RunPermissionsP3P4Tests();
+    if (p6_pass != p6_run)
+        BootSelftestFail("P6 permission/VFS", p6_pass, p6_run);
+
     /* P1: permission engine tests.  The manager's spawned vfs_server +
      * perm-manager boot in parallel — every test polls for its ports,
      * so there is no startup race.  These run in THIS thread (subject
@@ -2572,6 +3166,7 @@ int main(void) {
     RunZeroCopyTests();
     if (p5_pass != p5_run)
         BootSelftestFail("P5 zero-copy read", p5_pass, p5_run);
+
 
     /* Classic syscall suite (ran before the manager spawn). */
     if (tests_pass != tests_run)

@@ -31,6 +31,8 @@
  *        -> build vfs_req_* in static s_req -> IpcCall(s_vfs_port)
  *        -> parse vfs_resp_* from static s_resp -> return to app
  *   FsRead/FsWrite: transparent chunked loop (VFS_MAX_READ/WRITE)
+ *   URL ops (FsGetItem/FsOpenItem/FsMoveItem/...) vs handle ops
+ *   (FsRead/FsWrite/FsStatHandle/FsTruncate) — the latter need no path
  *
  * How it works:
  *   FsPort() lazily resolves and caches the "vfs" port; each op packs
@@ -39,13 +41,20 @@
  *
  * Purpose:
  *   User-space filesystem API: open/read/write/close, directory enum,
- *   volumes, bookmarks and whoami, all over the vfs.h wire protocol.
+ *   volumes, bookmarks and whoami — plus the v1.0 handle-scoped set
+ *   (fstat-by-handle, truncate, bookmark renewal), all over the vfs.h
+ *   wire protocol.
  *
  * Caveats:
  *   Single-threaded only: s_req/s_resp are shared statics, so
  *   concurrent callers clobber each other (Phase 0 limitation).
  *   Names are bounded 255-byte fields (UTF-8-safe truncation); short
  *   reads mean EOF and short writes are reported as NOSPC.
+ *   The handle-scoped ops (FsStatHandle/FsTruncate/FsRefreshBookmark)
+ *   need a vfs_server that implements VFS_OP_STAT_HANDLE/TRUNCATE/
+ *   REFRESH_BOOKMARK; a server that predates them answers ERR_INVAL
+ *   (its default branch), so a caller that also holds a URL should fall
+ *   back to the URL-based call.
  * ------------------------------------------------------------------
  */
 
@@ -419,6 +428,35 @@ int FsListVolumes(vfs_vol_info_t *out_vols, u32 *out_count) {
 }
 
 /* ====================================================================
+ * Sync (VFS_OP_SYNC) — flush every mounted volume to its medium
+ * ==================================================================== */
+
+/* The vfs_server walks its mount table and forwards a driver-level
+ * SYNC to each volume, so this costs one IPC round trip regardless of
+ * how many volumes are mounted.  `sync` and `power off` call it before
+ * a power transition; a driver that buffers metadata cannot lose it.
+ * Returns 0 with *out_volumes (may be NULL) set to the number of
+ * volumes that acknowledged the flush. */
+int FsSync(u32 *out_volumes) {
+    int port = FsPort();
+    if (port < 0)
+        return port;
+
+    vfs_req_sync_t *req = (vfs_req_sync_t *)s_req;
+    memset(req, 0, sizeof(*req));
+    req->op = VFS_OP_SYNC;
+
+    vfs_resp_sync_t *resp     = (vfs_resp_sync_t *)s_resp;
+    int              resp_len = (int)sizeof(*resp);
+    int              r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
+    if (r < 0)
+        return r;
+    if (out_volumes)
+        *out_volumes = resp->volumes;
+    return resp->ret;
+}
+
+/* ====================================================================
  * Phase 2: security-scoped bookmarks + move (design §5, §8)
  * ==================================================================== */
 
@@ -559,5 +597,103 @@ int FsReadMap(vfs_handle_t handle, void *map_virt, u32 *mapped_size) {
         return resp->ret;
     if (mapped_size)
         *mapped_size = (u32)resp->ret;
+    return 0;
+}
+
+/* ====================================================================
+ * v1.0: handle-scoped metadata, length and bookmark lifetime
+ *
+ * The three ops that let a handle-only caller (a stdio FILE, a resolved
+ * bookmark, a zero-copy reader) work without a URL: fstat by handle,
+ * truncate by handle and bookmark renewal.  Each is one ipc_call and
+ * passes the server's negative error code straight through — a stale
+ * handle must reach the caller as VFS_ERR_STALE (-102), never be
+ * smoothed over into ERR_NOENT or 0.
+ * ==================================================================== */
+
+int FsStatHandle(vfs_handle_t handle, vfs_item_info_t *out_item) {
+    if (!out_item)
+        return ERR_INVAL;
+    int port = FsPort();
+    if (port < 0)
+        return port;
+
+    vfs_req_stat_handle_t *req = (vfs_req_stat_handle_t *)s_req;
+    memset(req, 0, sizeof(*req));
+    req->op     = VFS_OP_STAT_HANDLE;
+    req->handle = handle;
+
+    vfs_resp_stat_handle_t *resp     = (vfs_resp_stat_handle_t *)s_resp;
+    int                     resp_len = (int)sizeof(*resp);
+    int                     r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
+    if (r < 0)
+        return r;
+    if (resp->ret < 0)
+        return resp->ret;
+    *out_item = resp->item;
+    return 0;
+}
+
+int FsTruncate(vfs_handle_t handle, u64 size, u64 *out_size) {
+    int port = FsPort();
+    if (port < 0)
+        return port;
+
+    vfs_req_truncate_t *req = (vfs_req_truncate_t *)s_req;
+    memset(req, 0, sizeof(*req));
+    req->op     = VFS_OP_TRUNCATE;
+    req->handle = handle;
+    req->size   = size;
+
+    vfs_resp_truncate_t *resp     = (vfs_resp_truncate_t *)s_resp;
+    int                  resp_len = (int)sizeof(*resp);
+    int                  r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
+    if (r < 0)
+        return r;
+    if (resp->ret < 0)
+        return resp->ret;
+    if (out_size)
+        *out_size = resp->size;
+    return 0;
+}
+
+/* Refresh (renew) a bookmark: the server rewrites expiry_ticks inside
+ * the blob and returns the updated blob, because the client cannot
+ * recompute it (the record lives server-side, design §5.2).  out_blob
+ * is a VFS_BOOKMARK_MAX-byte buffer; *out_bk_len / *out_expiry are only
+ * written once the server has accepted the refresh, so a failed call
+ * never leaves the caller with a half-updated bookmark. */
+int FsRefreshBookmark(const u8 *blob,
+                      u32       bk_len,
+                      u64       extend_ticks,
+                      u8       *out_blob,
+                      u32      *out_bk_len,
+                      u64      *out_expiry) {
+    if (!blob || !out_blob || !out_bk_len || bk_len == 0 || bk_len > VFS_BOOKMARK_MAX)
+        return ERR_INVAL;
+    int port = FsPort();
+    if (port < 0)
+        return port;
+
+    vfs_req_refresh_bookmark_t *req = (vfs_req_refresh_bookmark_t *)s_req;
+    memset(req, 0, sizeof(*req));
+    req->op           = VFS_OP_REFRESH_BOOKMARK;
+    req->bk_len       = bk_len;
+    req->extend_ticks = extend_ticks;
+    memcpy(req->data, blob, bk_len);
+
+    vfs_resp_refresh_bookmark_t *resp     = (vfs_resp_refresh_bookmark_t *)s_resp;
+    int                          resp_len = (int)sizeof(*resp);
+    int                          r        = IpcCall(port, req, (int)sizeof(*req), resp, &resp_len);
+    if (r < 0)
+        return r;
+    if (resp->ret < 0)
+        return resp->ret;
+    if (resp->bk_len > VFS_BOOKMARK_MAX)
+        return ERR_FAULT; /* defensive: server blew the wire limit */
+    memcpy(out_blob, resp->data, resp->bk_len);
+    *out_bk_len = resp->bk_len;
+    if (out_expiry)
+        *out_expiry = resp->expiry_ticks;
     return 0;
 }

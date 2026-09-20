@@ -98,7 +98,10 @@
  * ------------------------------------------------------------------
  */
 
+#include "../lib/libc/stdio.h"   /* snprintf (control-plane detail strings) */
+#include "../lib/libc/string.h"  /* strcmp / strncpy / memset               */
 #include "../lib/libos/syscalls.h"
+#include "manager.h" /* SVC_OP_* control-plane protocol */
 #include <stdarg.h>
 #include <stddef.h> /* NULL */
 #include <stdint.h>
@@ -126,26 +129,29 @@ typedef struct {
     const char *name;
     int         pid; /* -1 = not yet spawned */
     int         restart_count;
-    int         restartable; /* 1 = monitor loop + auto-restart policy     */
+    int         restartable; /* s_services[] "may be restarted" flag       */
+    int         monitored;   /* 1 = a monitor thread actually watches it   */
+    int         stop_requested; /* admin STOP: suppress the restart policy */
 } service_t;
 
 static service_t s_services[] = {
-    {"serial", -1, 0, 0},   /* IRQ-lifecycle: future work */
-    {"term", -1, 0, 0},     /* owns the framebuffer      */
-    {"keyboard", -1, 0, 0}, /* owns IRQ1 + PS/2 ports    */
-    {"flaky", -1, 0, 1},
-    {"vfs", -1, 0, 0},                  /* VFS namespace server     */
-    {"fs_mem_driver", -1, 0, 0},        /* in-memory storage driver */
-    {"fs_virtio_blk_driver", -1, 0, 0}, /* block-device storage driver */
-    {"perm", -1, 0, 1},                 /* Powerbox auth manager    */
-    {"device_mgr", -1, 0, 1},           /* PCI device manager       */
-    {"pkg", -1, 0, 1},                  /* .ops app container manager */
-    {"shell", -1, 0, 1},
-    {"user", -1, 0, 1}, /* user account service (login/passwd/stop guard) */
-    {"wm", -1, 0, 1},   /* window manager (v0.4 desktop: registry+compositor) */
-    {"policy", -1, 0, 1}, /* command policy service (v0.5, before shell)    */
-    {"gui", -1, 0, 1},  /* pixel compositor (idle until GUI_OP_ACTIVATE)  */
-    {"net", -1, 0, 0},  /* PCnet-Fast III Ethernet driver (own PCI device) */
+    /* name, pid, restart_count, restartable, monitored, stop_requested */
+    {"serial", -1, 0, 0, 0, 0},   /* IRQ-lifecycle: future work */
+    {"term", -1, 0, 0, 0, 0},     /* owns the framebuffer      */
+    {"keyboard", -1, 0, 0, 0, 0}, /* owns IRQ1 + PS/2 ports    */
+    {"flaky", -1, 0, 1, 0, 0},
+    {"vfs", -1, 0, 0, 0, 0},                  /* VFS namespace server     */
+    {"fs_mem_driver", -1, 0, 0, 0, 0},        /* in-memory storage driver */
+    {"fs_virtio_blk_driver", -1, 0, 0, 0, 0}, /* block-device storage driver */
+    {"perm", -1, 0, 1, 0, 0},                 /* Powerbox auth manager    */
+    {"device_mgr", -1, 0, 1, 0, 0},           /* PCI device manager       */
+    {"pkg", -1, 0, 1, 0, 0},                  /* .ops app container manager */
+    {"shell", -1, 0, 1, 0, 0},
+    {"user", -1, 0, 1, 0, 0},   /* user account service (login/passwd/stop guard) */
+    {"wm", -1, 0, 1, 0, 0},     /* window manager (v0.4 desktop: registry+compositor) */
+    {"policy", -1, 0, 1, 0, 0}, /* command policy service (v0.5, before shell)    */
+    {"gui", -1, 0, 1, 0, 0},    /* pixel compositor (idle until GUI_OP_ACTIVATE)  */
+    {"net", -1, 0, 0, 0, 0},    /* PCnet-Fast III Ethernet driver (own PCI device) */
 };
 
 /* Restartable services (production hardening): crash → auto-restart up
@@ -426,6 +432,207 @@ static int SpawnService(service_t *svc, int quiet) {
 }
 
 /* ====================================================================
+ * Control plane ("manager" port) — SVC_OP_* (v0.9)
+ *
+ * The shell's `svc` command family reaches this port through the `user`
+ * service admin proxy (the shell itself holds no ATOM_SERVICE_MANAGE).
+ * The gate below therefore checks that the CALLER is management-plane —
+ * which is exactly the user service after it has re-verified that the
+ * human behind the request is OWNER/ADMIN.  Trust flows through the
+ * same boundary the disk control plane and /kill already use.
+ * ==================================================================== */
+
+#define SVC_PROC_SCAN 40 /* processes scanned for the liveness check */
+
+/* Is PID still alive?  Cheap scan of the kernel process table. */
+static int SvcProcAlive(int pid) {
+    static proc_info_t list[SVC_PROC_SCAN];
+    int                n = ProcessList(list, SVC_PROC_SCAN);
+    if (n <= 0)
+        return 0;
+    for (int i = 0; i < n; i++)
+        if ((int)list[i].pid == pid)
+            return 1;
+    return 0;
+}
+
+static service_t *SvcFind(const char *name) {
+    for (u32 i = 0; i < sizeof(s_services) / sizeof(s_services[0]); i++)
+        if (strcmp(s_services[i].name, name) == 0)
+            return &s_services[i];
+    return NULL;
+}
+
+static void SvcFillEntry(service_t *svc, svc_entry_t *e) {
+    memset(e, 0, sizeof(*e));
+    strncpy(e->name, svc->name, SVC_NAME_MAX - 1);
+    e->pid        = svc->pid;
+    e->alive      = (svc->pid > 0 && SvcProcAlive(svc->pid)) ? 1u : 0u;
+    e->monitored  = svc->monitored ? 1u : 0u;
+    e->restarts   = (u32)svc->restart_count;
+    e->running    = (svc->pid > 0) ? 1u : 0u;
+}
+
+/* Handle one control request.  Returns nothing; fills *resp. */
+static void SvcDispatch(const svc_req_t *req, svc_resp_t *resp, const char *caller) {
+    if (req->op == SVC_OP_LIST) {
+        u32 n = 0;
+        for (u32 i = 0; i < sizeof(s_services) / sizeof(s_services[0]); i++) {
+            if (n >= SVC_MAX_ENTRIES)
+                break;
+            SvcFillEntry(&s_services[i], &resp->entries[n++]);
+        }
+        resp->count = n;
+        snprintf(resp->detail, sizeof(resp->detail), "%d service(s)", (int)n);
+        ManagerPrintf("manager: svc list by %s\n", caller);
+        return;
+    }
+
+    service_t *svc = SvcFind(req->name);
+    if (!svc) {
+        resp->ret = ERR_NOENT;
+        snprintf(resp->detail, sizeof(resp->detail), "no such service");
+        return;
+    }
+
+    switch (req->op) {
+    case SVC_OP_STATUS:
+        SvcFillEntry(svc, &resp->entries[0]);
+        resp->count = 1;
+        snprintf(resp->detail, sizeof(resp->detail),
+                  "%s pid=%d %s", svc->name, svc->pid,
+                  resp->entries[0].alive ? "alive" : "not running");
+        break;
+
+    case SVC_OP_STOP: {
+        if (svc->pid <= 0 || !SvcProcAlive(svc->pid)) {
+            resp->ret = ERR_NOENT;
+            snprintf(resp->detail, sizeof(resp->detail), "%s is not running", svc->name);
+            break;
+        }
+        if (strcmp(svc->name, "manager") == 0 || strcmp(svc->name, "init") == 0) {
+            resp->ret = ERR_DENIED;
+            snprintf(resp->detail, sizeof(resp->detail), "%s cannot be stopped", svc->name);
+            break;
+        }
+        int pid = svc->pid;
+        /* Suppress the restart policy BEFORE the kill: a monitor thread
+         * may already be blocked in ProcessWait() on this pid. */
+        svc->stop_requested = 1;
+        int r = Kill(pid, SIGKILL);
+        if (r < 0) {
+            svc->stop_requested = 0;
+            resp->ret = r;
+            snprintf(resp->detail, sizeof(resp->detail), "kill(%d) failed", pid);
+            break;
+        }
+        ManagerPrintf("manager: svc stop %s (pid %d) by %s\n", svc->name, pid, caller);
+        snprintf(resp->detail, sizeof(resp->detail), "%s stopped (pid %d)", svc->name, pid);
+        break;
+    }
+
+    case SVC_OP_START: {
+        if (svc->pid > 0 && SvcProcAlive(svc->pid)) {
+            resp->ret = ERR_BUSY;
+            snprintf(resp->detail, sizeof(resp->detail), "%s is already running", svc->name);
+            break;
+        }
+        svc->stop_requested = 0;
+        int r = SpawnService(svc, 0);
+        if (r < 0) {
+            resp->ret = r;
+            snprintf(resp->detail, sizeof(resp->detail), "spawn failed");
+            break;
+        }
+        SvcFillEntry(svc, &resp->entries[0]);
+        resp->count = 1;
+        snprintf(resp->detail, sizeof(resp->detail), "%s started (pid %d)", svc->name, svc->pid);
+        break;
+    }
+
+    case SVC_OP_RESTART: {
+        if (svc->pid > 0 && SvcProcAlive(svc->pid)) {
+            svc->stop_requested = 1;
+            (void)Kill(svc->pid, SIGKILL);
+            /* Give the process a moment to be reaped so ProcessCreate
+             * cannot collide with the dying instance's ports/names. */
+            Sleep(2);
+        }
+        svc->stop_requested = 0;
+        svc->restart_count  = 0;
+        int r = SpawnService(svc, 0);
+        if (r < 0) {
+            resp->ret = r;
+            snprintf(resp->detail, sizeof(resp->detail), "restart failed");
+            break;
+        }
+        SvcFillEntry(svc, &resp->entries[0]);
+        resp->count = 1;
+        snprintf(resp->detail, sizeof(resp->detail), "%s restarted (pid %d)", svc->name, svc->pid);
+        break;
+    }
+
+    default:
+        resp->ret = ERR_INVAL;
+        snprintf(resp->detail, sizeof(resp->detail), "unknown SVC op %d", (int)req->op);
+        break;
+    }
+}
+
+/* Control-plane port id (-1 until the thread below has registered it).
+ * main() reports it once the serial service is up, because the thread
+ * itself starts before any service exists and its own log lines would
+ * be dropped (ManagerPrintf is a no-op until "serial" resolves). */
+static int s_control_port = -1;
+
+/* Control-loop thread: one IPC port, request/reply, blocking recv. */
+static void ManagerControlLoop(void *arg) {
+    (void)arg;
+
+    int port = IpcPortCreate();
+    if (port < 0) {
+        ManagerPrintf("manager: control IpcPortCreate failed (%d)\n", port);
+        return;
+    }
+    int r = PortRegister(MANAGER_PORT_NAME, port);
+    if (r < 0) {
+        ManagerPrintf("manager: PortRegister('%s') failed (%d)\n", MANAGER_PORT_NAME, r);
+        return;
+    }
+    s_control_port = port;
+
+    static svc_req_t  req;
+    static svc_resp_t resp;
+
+    for (;;) {
+        int      len  = (int)sizeof(req);
+        int      tok  = 0;
+        uint64_t subj = 0;
+        int      rc   = IpcRecvFrom(port, &req, &len, &tok, &subj);
+        if (rc < 0)
+            continue;
+
+        memset(&resp, 0, sizeof(resp));
+
+        /* Gate: management plane only (see the block comment above). */
+        if (CapHasAtom(subj, ATOM_SERVICE_MANAGE) != 1) {
+            resp.ret = ERR_NOCAP;
+            snprintf(resp.detail, sizeof(resp.detail), "caller is not management-plane");
+            (void)IpcReply(tok, &resp, (int)sizeof(resp));
+            continue;
+        }
+        if (len < (int)sizeof(uint32_t)) {
+            resp.ret = ERR_INVAL;
+            (void)IpcReply(tok, &resp, (int)sizeof(resp));
+            continue;
+        }
+
+        SvcDispatch(&req, &resp, "admin-proxy");
+        (void)IpcReply(tok, &resp, (int)sizeof(resp));
+    }
+}
+
+/* ====================================================================
  * Flaky monitor (restart policy)
  * ==================================================================== */
 
@@ -448,6 +655,15 @@ static void ServiceMonitor(void *arg) {
              * this monitor registered its wait.  Treat it like an exit
              * and apply the restart policy. */
             ManagerPrintf("manager: %s wait failed (%d), restarting\n", svc->name, ret);
+        }
+        /* Admin STOP (SVC_OP_STOP) sets stop_requested before killing
+         * the process: the exit above is intentional, so the restart
+         * policy must not resurrect it. */
+        if (svc->stop_requested) {
+            ManagerPrintf("manager: %s stopped by admin (no restart)\n", svc->name);
+            svc->pid            = -1;
+            svc->stop_requested = 0;
+            break;
         }
         if (svc->restart_count >= MAX_RESTARTS) {
             ManagerPrintf("manager: %s marked FAILED\n", svc->name);
@@ -472,6 +688,7 @@ static void ServiceMonitor(void *arg) {
 static void StartServiceMonitors(void) {
     static const int s_restartable[] = {SVC_PERM, SVC_PKG, SVC_DEVICE_MGR, SVC_SHELL, SVC_USER};
     for (u32 i = 0; i < sizeof(s_restartable) / sizeof(s_restartable[0]); i++) {
+        s_services[s_restartable[i]].monitored = 1;
         int tid = ThreadCreate(ServiceMonitor, (void *)&s_services[s_restartable[i]], 10);
         if (tid < 0)
             ManagerPrintf("manager: monitor(%s) thread_create failed (%d)\n",
@@ -489,6 +706,15 @@ static void StartServiceMonitors(void) {
  * ==================================================================== */
 
 int main(void) {
+    /* ---- 0. Management control plane (v0.9) ----
+     * Start the "manager" port and its server thread FIRST: the port is
+     * then resolvable no matter how the boot sequence ends, and the
+     * thread only blocks in IpcRecvFrom() until an administrator asks
+     * for `svc list|status|start|stop|restart` — it never writes to the
+     * serial log on its own, so it cannot disturb the boot transcript. */
+    if (ThreadCreate(ManagerControlLoop, NULL, 10) < 0)
+        ManagerPrintf("manager: control thread_create failed\n");
+
     /* ---- 1. Serial service first, then resolve its port ----
      * All manager logging goes through the serial service (WRITE op),
      * so every log is deferred until the port resolves.  Only a
@@ -661,6 +887,13 @@ int main(void) {
 
     ManagerWrite("manager: starting shell\n");
     (void)SpawnService(&s_services[SVC_SHELL], 1);
+
+    /* The control plane was registered in step 0; report it now that
+     * the serial service can carry the line. */
+    if (s_control_port > 0)
+        ManagerPrintf("manager: control port %d registered as '%s'\n",
+                       s_control_port,
+                       MANAGER_PORT_NAME);
 
     /* ---- 7. Service monitors (crash recovery) ----
      * One monitor thread per restartable service; the main thread

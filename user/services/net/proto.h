@@ -12,13 +12,15 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * General Public License for more details: <https://www.gnu.org/licenses/>.
  *
- * proto.h - Minimal L3/L4 protocol stack (ARP + IPv4 + ICMP + UDP)
+ * proto.h - Minimal L3/L4 protocol stack (ARP + IPv4 + ICMP + UDP + TCP)
  * Copyright (c) 2026 OpSys Project
  *
  * Built on top of the PCnet raw-frame driver: eth frames in -> parsed
- * and dispatched (ARP / ICMP / UDP); IP datagrams out -> ARP-resolved
- * and wrapped.  All functions are called from the net service thread
- * (single-threaded; no locks inside).
+ * and dispatched (ARP / ICMP / UDP / TCP); IP datagrams out -> ARP-
+ * resolved and wrapped.  TCP carries one connection at a time, opened
+ * passively (ProtoTcpListen / ProtoTcpAccept) or actively
+ * (ProtoTcpConnect).  All functions are called from the net service
+ * thread (single-threaded; no locks inside).
  */
 
 #ifndef USER_SERVICES_NET_PROTO_H
@@ -55,11 +57,21 @@ int ProtoUdpSendto(const u8 dst_ip[4], u16 sport, u16 dport,
  * negative error (ERR_AGAIN when nothing queued). */
 int ProtoUdpRecv(u8 src[4], u16 *sport, u16 *dport, u8 *data, u32 max);
 
-#endif /* USER_SERVICES_NET_PROTO_H */
+/* Report the current static IPv4 address and default gateway (reads back
+ * what ProtoInit() / NET_OP_SET_IP stored; either out-pointer may be
+ * NULL). */
+void ProtoGetIp(u8 ip[4], u8 gw[4]);
 
 /* ---- TCP (phase 5, single-connection) ---- */
 int ProtoTcpListen(u16 port);
 int ProtoTcpAccept(u8 peer[4], u16 *peer_port); /* blocking ~6 s */
+/* Active open (client side): SYN -> SYN|ACK -> ESTAB with a local port
+ * from the ephemeral range.  Returns 0 when established, ERR_AGAIN on
+ * timeout, ERR_DENIED when the peer refuses (RST), another negative
+ * error otherwise; the connection state is reset to CLOSED on failure. */
+int ProtoTcpConnect(const u8 dst_ip[4], u16 dst_port); /* blocking ~6 s */
 int ProtoTcpSend(const u8 *data, u32 len);
 int ProtoTcpRecv(u8 *data, u32 max, u16 *peer_port); /* blocking */
 int ProtoTcpClose(void);
+
+#endif /* USER_SERVICES_NET_PROTO_H */

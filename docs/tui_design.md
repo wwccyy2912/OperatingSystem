@@ -1,5 +1,10 @@
 # OpSys TUI (Text User Interface) 设计文档
 
+> **阅读提示**：本文是**设计基线文档**，记录做出决策时的思考与当时的现状快照。
+> 其中标注为"规划/未实现"的条目可能已在后续版本落地。判断某项功能的**当前状态**，
+> 请以代码、[../README.md](../README.md) 与 [architecture.md](architecture.md) 为准；
+> 逐提交的实际进展见 [CHANGELOG.md](CHANGELOG.md)，文档地图见 [README.md](README.md)。
+
 > 版本：v1.2  
 > 日期：2026-08-22  
 > 状态：term 服务侧（term.c，TERM_OP_* 协议）已实现并接入构建；客户端库 user/lib/libtui/tui.c 已接入（shell 的 login/stop 交互组件、window_demo 等使用）；v1.1 交互组件（输入行/密码行/确认框）与 v1.2 区域快照/恢复已实现并通过 verify_users.py 验证  
